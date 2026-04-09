@@ -1,0 +1,13 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8888:8888"
+    volumes:
+      # .env is read by the app itself (load_dotenv_values), not by Docker
+      - ./.env:/app/.env:ro
+      # Persist the Spotify OAuth token between restarts
+      - ./spotify_cache:/app/.cache
+    environment:
+      SPOTIFY_CACHE_PATH: /app/.cache/spotify.cache

@@ -34,6 +34,47 @@ Este script:
 - Instala las dependencias necesarias
 - Ejecuta el programa
 
+## 🧪 POC: setlist.fm URL -> Spotify Playlist
+
+Esta prueba de concepto está encapsulada en `poc_setlistfm.py` y **no reemplaza** el flujo actual de `main.py`.
+
+### Variables necesarias
+
+Además de las credenciales de Spotify, agrega tu token de setlist.fm:
+
+```bash
+export SETLISTFM_TOKEN="tu_token_setlistfm"
+```
+
+También funciona si está en `.env` como:
+
+```bash
+SETLISTFM_TOKEN="tu_token_setlistfm"
+```
+
+### Ejecutar la POC
+
+```bash
+source .env
+python poc_setlistfm.py
+```
+
+Luego pega una URL de setlist.fm, por ejemplo:
+
+```text
+https://www.setlist.fm/setlist/men-i-trust/2026/hipodromo-de-san-isidro-alternative-stage-san-isidro-argentina-6b410e0a.html
+```
+
+La POC:
+- Lee la setlist desde la API oficial de setlist.fm
+- Busca cada canción en Spotify manteniendo el orden
+- Crea una playlist nueva y muestra resumen de canciones no encontradas
+
+### Nota de uso de API
+
+- El uso de la API de setlist.fm es para proyectos no comerciales según sus términos.
+- Muestra atribución de fuente al final de la ejecución.
+
 ## 📋 Configuración Manual
 
 Si prefieres configurar manualmente:
