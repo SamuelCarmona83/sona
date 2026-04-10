@@ -11,3 +11,4 @@ services:
       - ./spotify_cache:/app/.cache
     environment:
       SPOTIFY_CACHE_PATH: /app/.cache/spotify.cache
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}

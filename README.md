@@ -1,190 +1,151 @@
-# 🎵 Spoty Scanner
+# 🎵 Spoty Scanner - Discord Music Bot
 
-Un generador automático de playlists con la discografía completa de artistas de Spotify.
+A Discord music bot that plays songs from Spotify links and searches. It intelligently matches YouTube videos, uses LLM-based tie-breaking, and optimizes API costs.
 
-## 🎯 Características
+## ✨ Features
 
-- ✅ Crea playlists con toda la discografía de un artista
-- 🎛️ Configurable: álbumes, singles, compilaciones
-- 🔄 Elimina duplicados automáticamente
-- 📊 Maneja paginación de la API de Spotify
-- 🚫 Respeta los límites de rate limiting
-- 🔒 Gestión segura de credenciales
+- **🎶 Spotify Integration** — Play individual tracks, entire albums, or playlists from Spotify URLs
+- **🔍 Smart Search** — Heuristic-based ranking + LLM tie-breaking to find best YouTube matches
+- **⚡ Optimized** — Search caching and limited LLM calls reduce API costs by 70%
+- **📝 Dynamic Queue** — Queue tracks from albums/playlists, play first track immediately
+- **🔊 Voice Channel Status** — Bot shows what's playing in Discord's voice channel status
+- **🎯 Text Search** — Search by song/artist name with Spotify refinement
 
-## 🚀 Inicio Rápido
+## 🚀 Quick Start
 
-### 1. Configurar credenciales de Spotify
+### 1. Setup (First Time)
 
 ```bash
 ./setup.sh
 ```
 
-Este script te guiará para:
-- Obtener credenciales en https://developer.spotify.com/dashboard
-- Configurar las variables de entorno necesarias
+This guides you through:
+- Getting Spotify credentials from [Spotify Developer Dashboard](https://developer.spotify.com/dashboard)
+- Setting up environment variables
 
-### 2. Ejecutar el programa
+### 2. Run the Bot
 
 ```bash
 ./run.sh
 ```
 
-Este script:
-- Crea y activa el entorno virtual automáticamente
-- Instala las dependencias necesarias
-- Ejecuta el programa
+This automatically:
+- Creates/activates the Python virtual environment
+- Installs dependencies
+- Starts the bot
 
-## 🧪 POC: setlist.fm URL -> Spotify Playlist
+### 3. Use in Discord
 
-Esta prueba de concepto está encapsulada en `poc_setlistfm.py` y **no reemplaza** el flujo actual de `main.py`.
+1. Add the bot to your server (get invite from your bot page in Spotify Dashboard)
+2. Join a voice channel
+3. Use commands in the allowed text channel:
 
-### Variables necesarias
+```
+!play "artist - song name"         # Search and play
+!play <spotify_url>                # Play from Spotify URL (track, album, or playlist)
+!skip                              # Skip current song
+!pause                             # Pause playback
+!resume                            # Resume playback
+!queue                             # Show queue
+!np                                # Now playing
+!stop                              # Stop and clear queue
+!leave                             # Disconnect bot
+```
 
-Además de las credenciales de Spotify, agrega tu token de setlist.fm:
+## 🔧 Environment Setup
 
+### Automatic (Recommended)
 ```bash
-export SETLISTFM_TOKEN="tu_token_setlistfm"
+./setup.sh
 ```
 
-También funciona si está en `.env` como:
-
-```bash
-SETLISTFM_TOKEN="tu_token_setlistfm"
-```
-
-### Ejecutar la POC
-
-```bash
-source .env
-python poc_setlistfm.py
-```
-
-Luego pega una URL de setlist.fm, por ejemplo:
-
-```text
-https://www.setlist.fm/setlist/men-i-trust/2026/hipodromo-de-san-isidro-alternative-stage-san-isidro-argentina-6b410e0a.html
-```
-
-La POC:
-- Lee la setlist desde la API oficial de setlist.fm
-- Busca cada canción en Spotify manteniendo el orden
-- Crea una playlist nueva y muestra resumen de canciones no encontradas
-
-### Nota de uso de API
-
-- El uso de la API de setlist.fm es para proyectos no comerciales según sus términos.
-- Muestra atribución de fuente al final de la ejecución.
-
-## 📋 Configuración Manual
-
-Si prefieres configurar manualmente:
-
-### 1. Crear entorno virtual
+### Manual
 ```bash
 python3 -m venv venv
 source venv/bin/activate
-```
-
-### 2. Instalar dependencias
-```bash
 pip install -r requirements.txt
-```
 
-### 3. Configurar variables de entorno
-```bash
-export SPOTIFY_CLIENT_ID="tu_client_id"
-export SPOTIFY_CLIENT_SECRET="tu_client_secret"
+export BOT_TOKEN="your_discord_bot_token"
+export SPOTIFY_CLIENT_ID="your_client_id"
+export SPOTIFY_CLIENT_SECRET="your_client_secret"
 export SPOTIFY_REDIRECT_URI="http://localhost:8888/callback"
+export ALLOWED_CHANNEL_ID="discord_channel_id"
+export VOICE_CHANNEL_ID="voice_channel_id"
 ```
 
-### 4. Ejecutar
-```bash
-python main.py
-```
+## 📊 Optimizations
 
-## 🎨 Configuración del Artista
+The bot includes 4 cost-reduction strategies:
 
-El programa está preconfigurado para procesar el artista con ID: `3wtMPMvPtiFylbnNXF6CAj`
+1. **Search Cache** — Identical queries reuse cached YouTube results
+2. **Increased LLM Margin** — LLM only called when candidates have <4.5 point spread (was 3.0)
+3. **Limited LLM Tracks** — For albums/playlists, LLM only used on first 3 tracks
+4. **Aggressive Heuristics** — Unwanted variants (live, remix, cover) score more harshly
 
-Para cambiar el artista, edita la variable `artist_id` en `main.py`:
+**Result**: 10-track album: ~10 API calls → ~3 calls (70% reduction)
+
+## 🎯 Settings
+
+Edit these constants in `bot.py` to customize behavior:
 
 ```python
-# ID del artista específico
-artist_id = "TU_ARTIST_ID_AQUI"
+ALLOWED_CHANNEL_ID = 1163479541029810226  # Only this channel can use commands
+VOICE_CHANNEL_ID = 1397428777876721716    # Connect to this voice channel on startup
+MIN_SEARCH_SCORE = 6.0                    # Minimum quality threshold for YouTube matches
+LLM_SCORE_MARGIN = 4.5                    # How close scores need to be for LLM tie-break
+LLM_ENABLED_FOR_ALBUM_TRACKS = 3          # Use LLM for first N tracks in bulk operations
 ```
 
-Puedes obtener el ID del artista desde la URL de Spotify:
-- URL: `https://open.spotify.com/artist/3wtMPMvPtiFylbnNXF6CAj`
-- ID: `3wtMPMvPtiFylbnNXF6CAj`
-
-## 🔧 Opciones de Configuración
-
-El programa te permite elegir qué incluir:
-
-1. **Solo álbumes** - Solo álbumes de estudio
-2. **Álbumes + Singles** - Álbumes y singles (recomendado)
-3. **Todo** - Álbumes, singles y compilaciones
-
-## 📁 Estructura del Proyecto
+## 📁 Project Structure
 
 ```
 spoty-scanner/
-├── main.py           # Programa principal
-├── requirements.txt  # Dependencias de Python
-├── setup.sh         # Script de configuración
-├── run.sh           # Script de ejecución
-└── README.md        # Esta documentación
+├── bot.py                    # Main Discord music bot
+├── poc_setlistfm.py         # Setlist.fm playlist generator (legacy)
+├── main.py                  # Artist discography generator (legacy)
+├── requirements.txt         # Python dependencies
+├── setup.sh                 # Auto-setup script
+├── run.sh                   # Auto-run script
+└── README.md               # This file
 ```
 
-## 🔐 Obtener Credenciales de Spotify
+## 🔐 Getting Spotify Credentials
 
-1. Ve a [Spotify Developer Dashboard](https://developer.spotify.com/dashboard)
-2. Inicia sesión con tu cuenta de Spotify
-3. Crea una nueva aplicación
-4. Ve a Settings de tu aplicación
-5. Copia el **Client ID** y **Client Secret**
-6. En **Redirect URIs** añade: `http://localhost:8888/callback`
+1. Go to [Spotify Developer Dashboard](https://developer.spotify.com/dashboard)
+2. Sign in with your Spotify account
+3. Create a new app
+4. Copy **Client ID** and **Client Secret**
+5. Add Redirect URI: `http://localhost:8888/callback`
 
-## ⚠️ Limitaciones
+## 🤖 Getting Discord Bot Token
 
-- **Límite de playlist**: Spotify permite máximo 10,000 canciones por playlist
-- **Rate limiting**: El programa incluye pausas para respetar los límites de la API
-- **Autenticación**: La primera vez se abrirá un navegador para autorizar la aplicación
+1. Go to [Discord Developer Portal](https://discord.com/developers/applications)
+2. Create a new application
+3. Go to "Bot" tab → "Add Bot"
+4. Copy the token (under "TOKEN")
+5. Set `Privileged Gateway Intents`: Message Content Intent + Voice States Intent
+6. In OAuth2 → URL Generator, select scopes: `bot` and permissions: `Send Messages`, `Connect to Voice`, `Speak`, `Use Voice Activity`
 
-## 🐛 Solución de Problemas
+## ⚠️ Limits
 
-### Error de credenciales
-```
-❌ Faltan credenciales de Spotify!
-```
-**Solución**: Ejecuta `./setup.sh` para configurar las credenciales.
+- **YouTube throttling** — Stagger searches for large playlists (100+ tracks)
+- **Spotify API** — Standard rate limits apply
+- **LLM costs** — Reduced by 70% via optimizations, but still ~$0.01 per album with LLM enabled
 
-### Error de Redirect URI
-```
-INVALID_CLIENT: Invalid redirect URI
-```
-**Solución**: Verifica que hayas añadido `http://localhost:8888/callback` en tu app de Spotify.
+## 🐛 Troubleshooting
 
-### Error de permisos
-```
-Insufficient client scope
-```
-**Solución**: El programa solicita automáticamente los permisos necesarios en la primera ejecución.
+| Issue | Solution |
+|-------|----------|
+| Bot won't start | Run `./setup.sh` to verify all credentials |
+| Commands not working | Verify `ALLOWED_CHANNEL_ID` matches your Discord channel |
+| No audio in voice | Check bot has "Speak" permission in voice channel |
+| YouTube search failing | Bot will fall back to searching for each track individually |
+| "No reliable candidate" warning | Lower `MIN_SEARCH_SCORE` or check if track exists on YouTube |
 
-## 📝 Licencia
+## 📝 License
 
-Este proyecto es de código abierto y está disponible bajo la licencia MIT.
-
-## 🤝 Contribuciones
-
-Las contribuciones son bienvenidas. Por favor:
-
-1. Fork el proyecto
-2. Crea una rama para tu feature
-3. Commit tus cambios
-4. Push a la rama
-5. Abre un Pull Request
+MIT License — Feel free to use and modify.
 
 ---
 
-**¡Disfruta creando tus playlists de discografía completa! 🎶**
+**Now playing: Your Spotify library on Discord! 🎶**
