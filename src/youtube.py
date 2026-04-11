@@ -86,6 +86,10 @@ async def _search_youtube_candidates(query: str) -> list[dict]:
             for entry in info["entries"]:
                 if not entry or not entry.get("url"):
                     continue
+                # Skip entries marked as unavailable by yt-dlp
+                if entry.get("availability") in ("needs_auth", "subscriber_only", "premium_only", "unavailable"):
+                    logger.info(f"_search_candidates: omitiendo video no disponible '{entry.get('id')}' ({entry.get('availability')})")
+                    continue
                 candidates.append({
                     "title": entry.get("title", query),
                     "url": entry["url"],

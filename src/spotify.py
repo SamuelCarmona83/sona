@@ -91,7 +91,7 @@ async def _get_tracks_from_spotify_url(url: str) -> list[str] | None:
             offset = 0
             limit = 50
             while True:
-                result = await asyncio.to_thread(lambda: sp.playlist_items(resource_id, offset=offset, limit=limit))
+                result = await asyncio.to_thread(lambda: sp.playlist_items(resource_id, offset=offset, limit=limit, market="from_token"))
                 playlist_name = result.get("name", "Playlist")
                 items = result.get("items", [])
                 if not items:

@@ -8,7 +8,7 @@ from discord.ext import commands
 
 from src.config import ALLOWED_CHANNEL_ID, ADMIN_USER_ID, LLM_ENABLED_FOR_ALBUM_TRACKS, sp
 from src.bot_instance import bot
-from src.playback import queues, now_playing_info, play_next
+from src.playback import queues, now_playing_info, play_next, update_player_embed, _paused
 from src.spotify import (
     _is_spotify_url,
     _get_tracks_from_spotify_url,
@@ -73,13 +73,18 @@ async def play(ctx: commands.Context, *, query: str):
         return
 
     voice_channel = ctx.author.voice.channel
-    msg = await ctx.send(f"\U0001f50d Buscando **{query}**...")
+    msg = await ctx.send(f"\U0001f50d Buscando **{query}**...", delete_after=30)
 
     # Check if query is a Spotify URL (album/playlist/track)
     if _is_spotify_url(query):
         yt_queries = await _get_tracks_from_spotify_url(query)
         if not yt_queries:
-            await msg.edit(content=f"No se pudo procesar la URL de Spotify.")
+            await msg.edit(content="No se pudo procesar la URL de Spotify.")
+            await asyncio.sleep(5)
+            try:
+                await msg.delete()
+            except Exception:
+                pass
             return
     else:
         # Regular text search; refine with Spotify
@@ -114,6 +119,11 @@ async def play(ctx: commands.Context, *, query: str):
         await msg.edit(content=f"No se encontro nada para: **{query}**")
         return
 
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
     # Add all tracks to queue
     for track in tracks_to_queue:
         queues[ctx.guild.id].append(track)
@@ -121,15 +131,9 @@ async def play(ctx: commands.Context, *, query: str):
     # Start playing if not already playing
     if vc.is_playing() or vc.is_paused():
         added_count = len(tracks_to_queue)
-        if added_count == 1:
-            await msg.edit(content=f"\u2795 Anadido a la cola: **{tracks_to_queue[0]['title']}**")
-        else:
-            await msg.edit(content=f"\u2795 Anadidas {added_count} canciones a la cola.")
+        label = tracks_to_queue[0]['title'] if added_count == 1 else f"{added_count} canciones"
+        await ctx.send(f"\u2795 {label} anadida(s) a la cola.", delete_after=8)
     else:
-        if len(tracks_to_queue) == 1:
-            await msg.edit(content=f"\u2705 Listo!")
-        else:
-            await msg.edit(content=f"\u2705 Anadidas {len(tracks_to_queue)} canciones a la cola!")
         await play_next(ctx.guild, vc, ctx.channel)
 
 
@@ -137,10 +141,13 @@ async def play(ctx: commands.Context, *, query: str):
 async def skip(ctx: commands.Context):
     vc = ctx.guild.voice_client
     if not vc or not (vc.is_playing() or vc.is_paused()):
-        await ctx.send("No hay nada reproduciendose.")
+        await ctx.send("No hay nada reproduciendose.", delete_after=5)
         return
     vc.stop()
-    await ctx.send("\u23ed\ufe0f Saltando...")
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
 
 
 @bot.command(name="pause", help="Pausa la reproduccion.")
@@ -148,9 +155,14 @@ async def pause(ctx: commands.Context):
     vc = ctx.guild.voice_client
     if vc and vc.is_playing():
         vc.pause()
-        await ctx.send("\u23f8\ufe0f Pausa.")
+        _paused[ctx.guild.id] = True
+        await update_player_embed(ctx.guild, ctx.channel)
     else:
-        await ctx.send("No hay nada reproduciendose.")
+        await ctx.send("No hay nada reproduciendose.", delete_after=5)
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
 
 
 @bot.command(name="resume", help="Reanuda la reproduccion.")
@@ -158,32 +170,44 @@ async def resume(ctx: commands.Context):
     vc = ctx.guild.voice_client
     if vc and vc.is_paused():
         vc.resume()
-        await ctx.send("\u25b6\ufe0f Reanudando.")
+        _paused[ctx.guild.id] = False
+        await update_player_embed(ctx.guild, ctx.channel)
     else:
-        await ctx.send("No hay nada en pausa.")
+        await ctx.send("No hay nada en pausa.", delete_after=5)
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
 
 
 @bot.command(name="stop", help="Detiene la reproduccion y limpia la cola.")
 async def stop(ctx: commands.Context):
     queues[ctx.guild.id] = collections.deque()
     now_playing_info[ctx.guild.id] = None
+    _paused[ctx.guild.id] = False
     vc = ctx.guild.voice_client
     if vc:
         vc.stop()
         await vc.disconnect()
-    await ctx.send("\u23f9\ufe0f Reproduccion detenida.")
+    await update_player_embed(ctx.guild, ctx.channel)
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
 
 
 @bot.command(name="leave", help="Desconecta el bot del canal de voz.")
 async def leave(ctx: commands.Context):
     queues[ctx.guild.id] = collections.deque()
     now_playing_info[ctx.guild.id] = None
+    _paused[ctx.guild.id] = False
     vc = ctx.guild.voice_client
     if vc:
         await vc.disconnect()
-        await ctx.send("\U0001f44b Hasta luego!")
-    else:
-        await ctx.send("No estoy en ningun canal de voz.")
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
 
 
 @bot.command(name="queue", help="Muestra la cola de reproduccion.")
@@ -200,7 +224,7 @@ async def queue_cmd(ctx: commands.Context):
         lines.append(f"{i}. {track['title']}")
     if len(q) > 10:
         lines.append(f"... y {len(q) - 10} mas")
-    await ctx.send("\n".join(lines))
+    await ctx.send("\n".join(lines), delete_after=20)
 
 
 @bot.command(name="np", help="Muestra la cancion que se esta reproduciendo ahora.")
@@ -209,7 +233,7 @@ async def now_playing_cmd(ctx: commands.Context):
     if not current:
         await ctx.send("No hay nada reproduciendose.")
         return
-    await ctx.send(f"\U0001f3b5 **{current['title']}** — pedido por {current['requester']}")
+    await ctx.send(f"\U0001f3b5 **{current['title']}** — pedido por {current['requester']}", delete_after=15)
 
 
 @bot.command(name="search", help="Busca canciones en Spotify. Uso: !search <busqueda>")
@@ -250,22 +274,38 @@ async def playlist_cmd(ctx: commands.Context, *, url: str):
     playlist_id = match.group(1) if match else url.strip()
 
     try:
-        # Fetch all tracks (Spotify paginates at 100)
+        # Fetch all tracks (Spotify paginates at 50 for playlist_items)
         def _fetch_all_tracks(pid):
             tracks = []
-            result = sp.playlist_tracks(pid, fields="items(track(name,artists)),next", limit=100)
-            while result:
-                for item in result.get("items", []):
+            offset = 0
+            limit = 50
+            while True:
+                result = sp.playlist_items(pid, offset=offset, limit=limit, market="from_token")
+                items = result.get("items", [])
+                if not items:
+                    break
+                for item in items:
                     t = item.get("track")
                     if t and t.get("name"):
                         artists = ", ".join(a["name"] for a in t.get("artists", []))
                         tracks.append(f"{artists} - {t['name']}")
-                result = sp.next(result) if result.get("next") else None
+                offset += limit
             return tracks
 
         track_queries = await asyncio.to_thread(_fetch_all_tracks, playlist_id)
     except Exception as e:
-        await msg.edit(content=f"Error cargando la playlist: `{e}`")
+        err = str(e)
+        if "404" in err:
+            await msg.edit(
+                content=(
+                    "\u274c No se pudo acceder a esta playlist.\n"
+                    "Las playlists editoriales de Spotify (Daily Mix, Top 50, etc.) "
+                    "no son accesibles por bots de terceros \u2014 solo funcionan playlists propias o compartidas.\n"
+                    f"-# `{err}`"
+                )
+            )
+        else:
+            await msg.edit(content=f"\u274c Error cargando la playlist: `{err}`")
         return
 
     if not track_queries:
