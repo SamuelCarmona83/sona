@@ -11,6 +11,8 @@ A Discord music bot that plays songs from Spotify links and searches. It intelli
 - **🔊 Voice Channel Status** — Bot shows what's playing in Discord's voice channel status
 - **🎯 Text Search** — Search by song/artist name with Spotify refinement
 
+![Bot Interface](assets/image.png)
+
 ## 🚀 Quick Start
 
 ### 1. Setup (First Time)

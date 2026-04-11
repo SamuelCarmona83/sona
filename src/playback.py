@@ -1,6 +1,7 @@
 import asyncio
 import collections
 import logging
+import random
 
 import discord
 
@@ -33,8 +34,17 @@ def _build_embed(guild_id: int) -> discord.Embed:
         return embed
     paused = _paused.get(guild_id, False)
     embed = discord.Embed(title=track["title"], color=0x1DB954)
+    embed.add_field(name="Artista", value=track.get("artist", "Unknown"), inline=True)
+    duration = track.get("duration", 0)
+    duration_str = f"{duration // 60}:{duration % 60:02d}" if duration else "--:--"
+    embed.add_field(name="Duracion", value=duration_str, inline=True)
     embed.add_field(name="Pedido por", value=track["requester"], inline=True)
     embed.add_field(name="En cola", value=str(len(q)), inline=True)
+    if len(q) > 0:
+        next_track = list(q)[0]
+        embed.add_field(name="Siguiente", value=next_track.get("title", "?")[:100], inline=False)
+    if track.get("thumbnail"):
+        embed.set_thumbnail(url=track["thumbnail"])
     embed.set_footer(text="\u23f8 En pausa" if paused else "\u25b6 Reproduciendo")
     return embed
 
@@ -81,6 +91,36 @@ class PlayerView(discord.ui.View):
             await vc.disconnect()
         await interaction.response.defer()
         await update_player_embed(interaction.guild, interaction.channel)
+
+    @discord.ui.button(label="\U0001f500 Shuffle", style=discord.ButtonStyle.secondary, row=1)
+    async def shuffle_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        gid = interaction.guild.id
+        q = queues.get(gid)
+        if q and len(q) > 1:
+            items = list(q)
+            random.shuffle(items)
+            queues[gid] = collections.deque(items)
+        await interaction.response.defer()
+        await update_player_embed(interaction.guild, interaction.channel)
+
+    @discord.ui.button(label="\U0001f4dc Cola", style=discord.ButtonStyle.secondary, row=1)
+    async def queue_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        gid = interaction.guild.id
+        q = queues.get(gid, collections.deque())
+        if not q:
+            await interaction.response.send_message("La cola esta vacia.", ephemeral=True)
+            return
+        lines = []
+        for i, track in enumerate(list(q)[:15], 1):
+            lines.append(f"`{i}.` {track.get('title', '?')}")
+        if len(q) > 15:
+            lines.append(f"... y {len(q) - 15} mas")
+        embed = discord.Embed(
+            title=f"Cola de reproduccion ({len(q)} canciones)",
+            description="\n".join(lines),
+            color=0x1DB954
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 async def update_player_embed(guild: discord.Guild, channel):
@@ -212,4 +252,8 @@ async def _update_status(guild: discord.Guild, title: str | None):
         await bot.http.request(route, json={"status": status_text})
         logger.info("_update_status: estado del canal actualizado correctamente")
     except Exception as e:
-        logger.error(f"_update_status: error al actualizar estado del canal de voz: {e}", exc_info=True)
+        # 403 Forbidden is common if bot lacks permissions; log as warning instead of error
+        if "403" in str(e):
+            logger.warning(f"_update_status: permisos insuficientes para actualizar estado del canal")
+        else:
+            logger.error(f"_update_status: error al actualizar estado del canal de voz: {e}", exc_info=True)

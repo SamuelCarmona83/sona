@@ -97,6 +97,7 @@ async def _search_youtube_candidates(query: str) -> list[dict]:
                     "uploader": entry.get("uploader") or "",
                     "channel": entry.get("channel") or "",
                     "webpage_url": entry.get("webpage_url") or "",
+                    "thumbnail": entry.get("thumbnail") or "",
                     "acodec": entry.get("acodec") or "?",
                     "abr": entry.get("abr") or 0,
                 })

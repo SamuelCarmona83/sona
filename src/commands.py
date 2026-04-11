@@ -8,6 +8,8 @@ from discord.ext import commands
 
 from src.config import ALLOWED_CHANNEL_ID, ADMIN_USER_ID, LLM_ENABLED_FOR_ALBUM_TRACKS, sp
 from src.bot_instance import bot
+import random
+
 from src.playback import queues, now_playing_info, play_next, update_player_embed, _paused
 from src.spotify import (
     _is_spotify_url,
@@ -16,8 +18,16 @@ from src.spotify import (
     _ensure_auth,
 )
 from src.youtube import search_youtube
+from src.scoring import _split_query_parts
 
 logger = logging.getLogger(__name__)
+
+def error_embed(title: str, description: str = "", details: str = "") -> discord.Embed:
+    """Create a formatted error embed."""
+    embed = discord.Embed(title=f"❌ {title}", description=description, color=0xFF5555)
+    if details:
+        embed.add_field(name="Detalles", value=f"`{details[:1024]}`", inline=False)
+    return embed
 
 @bot.check
 async def only_allowed_channel(ctx: commands.Context) -> bool:
@@ -107,11 +117,15 @@ async def play(ctx: commands.Context, *, query: str):
         enable_llm = (idx < LLM_ENABLED_FOR_ALBUM_TRACKS) if len(yt_queries) > 1 else True
         yt_info = await search_youtube(yt_query, enable_llm=enable_llm)
         if yt_info:
+            artist, title = _split_query_parts(yt_query)
             track = {
-                "title":    yt_info["title"],
-                "yt_query": yt_query,
-                "url":      yt_info["url"],
-                "requester": ctx.author.display_name,
+                "title":     yt_info["title"],
+                "yt_query":  yt_query,
+                "url":       yt_info["url"],
+                "requester":  ctx.author.display_name,
+                "artist":     artist or "Unknown",
+                "duration":   yt_info.get("duration") or 0,
+                "thumbnail":  yt_info.get("thumbnail") or "",
             }
             tracks_to_queue.append(track)
 
@@ -156,6 +170,9 @@ async def pause(ctx: commands.Context):
     if vc and vc.is_playing():
         vc.pause()
         _paused[ctx.guild.id] = True
+        # Update voice channel status to show paused state
+        from src.playback import _update_status
+        await _update_status(ctx.guild, "⏸ Paused")
         await update_player_embed(ctx.guild, ctx.channel)
     else:
         await ctx.send("No hay nada reproduciendose.", delete_after=5)
@@ -171,6 +188,11 @@ async def resume(ctx: commands.Context):
     if vc and vc.is_paused():
         vc.resume()
         _paused[ctx.guild.id] = False
+        # Update voice channel status with now playing track
+        from src.playback import _update_status
+        now_playing = now_playing_info.get(ctx.guild.id)
+        if now_playing:
+            await _update_status(ctx.guild, now_playing.get("title"))
         await update_player_embed(ctx.guild, ctx.channel)
     else:
         await ctx.send("No hay nada en pausa.", delete_after=5)
@@ -257,6 +279,116 @@ async def search(ctx: commands.Context, *, query: str):
     await ctx.send(embed=embed)
 
 
+@bot.command(name="move", help="Mueve una cancion en la cola. Uso: !move <pos_actual> <pos_nueva>")
+async def move_cmd(ctx: commands.Context, current_pos: int, new_pos: int):
+    q = queues.get(ctx.guild.id)
+    if not q:
+        await ctx.send("La cola esta vacia.", delete_after=5)
+        return
+    if current_pos < 1 or current_pos > len(q) or new_pos < 1 or new_pos > len(q):
+        await ctx.send(f"Posiciones invalidas. La cola tiene {len(q)} canciones.", delete_after=5)
+        return
+    items = list(q)
+    track = items.pop(current_pos - 1)
+    items.insert(new_pos - 1, track)
+    queues[ctx.guild.id] = collections.deque(items)
+    await ctx.send(f"**{track.get('title', '?')}** movida a posicion {new_pos}.", delete_after=8)
+    await update_player_embed(ctx.guild, ctx.channel)
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
+
+
+@bot.command(name="remove", help="Elimina una cancion de la cola. Uso: !remove <posicion>")
+async def remove_cmd(ctx: commands.Context, pos: int):
+    q = queues.get(ctx.guild.id)
+    if not q:
+        await ctx.send("La cola esta vacia.", delete_after=5)
+        return
+    if pos < 1 or pos > len(q):
+        await ctx.send(f"Posicion invalida. La cola tiene {len(q)} canciones.", delete_after=5)
+        return
+    items = list(q)
+    track = items.pop(pos - 1)
+    queues[ctx.guild.id] = collections.deque(items)
+    await ctx.send(f"**{track.get('title', '?')}** eliminada de la cola.", delete_after=8)
+    await update_player_embed(ctx.guild, ctx.channel)
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
+
+
+@bot.command(name="priority", help="Mueve una cancion al tope de la cola. Uso: !priority <posicion>")
+async def priority_cmd(ctx: commands.Context, pos: int = 2):
+    q = queues.get(ctx.guild.id)
+    if not q:
+        await ctx.send("La cola esta vacia.", delete_after=5)
+        return
+    if pos < 1 or pos > len(q):
+        await ctx.send(f"Posicion invalida. La cola tiene {len(q)} canciones.", delete_after=5)
+        return
+    items = list(q)
+    track = items.pop(pos - 1)
+    items.insert(0, track)
+    queues[ctx.guild.id] = collections.deque(items)
+    await ctx.send(f"**{track.get('title', '?')}** movida al tope de la cola.", delete_after=8)
+    await update_player_embed(ctx.guild, ctx.channel)
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
+
+
+@bot.command(name="shuffle", help="Mezcla la cola de reproduccion aleatoriamente.")
+async def shuffle_cmd(ctx: commands.Context):
+    q = queues.get(ctx.guild.id)
+    if not q or len(q) < 2:
+        await ctx.send("No hay suficientes canciones en la cola para mezclar.", delete_after=5)
+        return
+    items = list(q)
+    random.shuffle(items)
+    queues[ctx.guild.id] = collections.deque(items)
+    await ctx.send(f"Cola mezclada ({len(items)} canciones).", delete_after=8)
+    await update_player_embed(ctx.guild, ctx.channel)
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
+
+
+@bot.command(name="help", help="Muestra todos los comandos disponibles.")
+async def help_cmd(ctx: commands.Context):
+    embed = discord.Embed(
+        title="Comandos del Bot de Musica",
+        description="Estos son todos los comandos disponibles:",
+        color=0x1DB954
+    )
+    commands_info = [
+        ("!play <cancion>", "Reproduce una cancion. Acepta URLs de Spotify."),
+        ("!playlist <url>", "Carga una playlist de Spotify en la cola."),
+        ("!skip", "Salta la cancion actual."),
+        ("!pause", "Pausa la reproduccion."),
+        ("!resume", "Reanuda la reproduccion."),
+        ("!stop", "Detiene la reproduccion y limpia la cola."),
+        ("!leave", "Desconecta el bot del canal de voz."),
+        ("!queue", "Muestra la cola de reproduccion."),
+        ("!np", "Muestra la cancion actual."),
+        ("!shuffle", "Mezcla la cola aleatoriamente."),
+        ("!move <de> <a>", "Mueve una cancion a otra posicion en la cola."),
+        ("!remove <pos>", "Elimina una cancion de la cola."),
+        ("!priority <pos>", "Mueve una cancion al tope de la cola."),
+        ("!search <cancion>", "Busca canciones en Spotify."),
+        ("!auth", "Autenticacion de Spotify (solo admin)."),
+        ("!ping", "Verifica que el bot este vivo."),
+    ]
+    for cmd, desc in commands_info:
+        embed.add_field(name=cmd, value=desc, inline=False)
+    embed.set_footer(text="Tambien puedes usar los botones del embed")
+    await ctx.send(embed=embed, delete_after=60)
+
+
 @bot.command(name="playlist", help="Carga una playlist de Spotify en la cola. Uso: !playlist <url>")
 async def playlist_cmd(ctx: commands.Context, *, url: str):
     if not ctx.author.voice:
@@ -296,16 +428,15 @@ async def playlist_cmd(ctx: commands.Context, *, url: str):
     except Exception as e:
         err = str(e)
         if "404" in err:
-            await msg.edit(
-                content=(
-                    "\u274c No se pudo acceder a esta playlist.\n"
-                    "Las playlists editoriales de Spotify (Daily Mix, Top 50, etc.) "
-                    "no son accesibles por bots de terceros \u2014 solo funcionan playlists propias o compartidas.\n"
-                    f"-# `{err}`"
-                )
+            embed = error_embed(
+                "No se pudo acceder a esta playlist",
+                "Las playlists editoriales de Spotify (Daily Mix, Top 50, etc.) no son accesibles por bots de terceros — solo funcionan playlists propias o compartidas.",
+                err[:200]
             )
+            await msg.edit(embed=embed)
         else:
-            await msg.edit(content=f"\u274c Error cargando la playlist: `{err}`")
+            embed = error_embed("Error cargando la playlist", details=err[:200])
+            await msg.edit(embed=embed)
         return
 
     if not track_queries:
