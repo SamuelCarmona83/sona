@@ -151,24 +151,46 @@ async def play(ctx: commands.Context, *, query: str):
     if ctx.guild.id not in queues:
         queues[ctx.guild.id] = collections.deque()
 
-    # Search YouTube for all queries and build track objects
+    # Search YouTube for all queries in parallel and build track objects
     tracks_to_queue = []
-    for idx, yt_query in enumerate(yt_queries):
-        # Only use LLM for first N tracks in album/playlist (reduces API calls by ~70%)
-        enable_llm = (idx < LLM_ENABLED_FOR_ALBUM_TRACKS) if len(yt_queries) > 1 else True
-        yt_info = await search_youtube(yt_query, enable_llm=enable_llm)
+    if len(yt_queries) == 1:
+        # Single track: no gather overhead needed
+        yt_info = await search_youtube(yt_queries[0], enable_llm=True)
         if yt_info:
+            artist, title = _split_query_parts(yt_queries[0])
+            tracks_to_queue.append({
+                "title":     yt_info["title"],
+                "yt_query":  yt_queries[0],
+                "url":       yt_info["url"],
+                "requester": ctx.author.display_name,
+                "artist":    artist or "Unknown",
+                "duration":  yt_info.get("duration") or 0,
+                "thumbnail": yt_info.get("thumbnail") or "",
+            })
+    else:
+        # Album / playlist: search all tracks concurrently
+        async def _fetch(idx: int, yt_query: str) -> dict | None:
+            enable_llm = idx < LLM_ENABLED_FOR_ALBUM_TRACKS
+            yt_info = await search_youtube(yt_query, enable_llm=enable_llm)
+            if not yt_info:
+                return None
             artist, title = _split_query_parts(yt_query)
-            track = {
+            return {
                 "title":     yt_info["title"],
                 "yt_query":  yt_query,
                 "url":       yt_info["url"],
-                "requester":  ctx.author.display_name,
-                "artist":     artist or "Unknown",
-                "duration":   yt_info.get("duration") or 0,
-                "thumbnail":  yt_info.get("thumbnail") or "",
+                "requester": ctx.author.display_name,
+                "artist":    artist or "Unknown",
+                "duration":  yt_info.get("duration") or 0,
+                "thumbnail": yt_info.get("thumbnail") or "",
+                "_order":    idx,
             }
-            tracks_to_queue.append(track)
+
+        results = await asyncio.gather(*(_fetch(i, q) for i, q in enumerate(yt_queries)))
+        # Preserve original playlist order; filter out failed searches
+        tracks_to_queue = [t for t in results if t is not None]
+        for t in tracks_to_queue:
+            t.pop("_order", None)
 
     if not tracks_to_queue:
         await msg.edit(content=f"No se encontro nada para: **{query}**")
