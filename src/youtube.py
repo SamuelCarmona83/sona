@@ -27,6 +27,34 @@ _anthropic_client = None
 _search_cache: dict[str, dict] = {}  # Cache YouTube search results to avoid redundant queries
 
 
+class _YtDlpLogger:
+    """Routes yt-dlp output through Python's logging instead of printing to stderr.
+
+    Without this, yt-dlp's report_error() bypasses quiet=True and writes directly
+    to stderr — e.g. age-restricted / unavailable videos during search scans.
+    """
+    _warned_once: set[str] = set()  # class-level dedup set for one-time warnings
+
+    def debug(self, msg: str) -> None:
+        if msg.startswith("[download]"):
+            return  # suppress noisy download progress lines
+        logger.debug("yt-dlp: %s", msg)
+
+    def info(self, msg: str) -> None:
+        logger.debug("yt-dlp: %s", msg)
+
+    def warning(self, msg: str) -> None:
+        # Deduplicate warnings that repeat on every yt-dlp instance (e.g. JS runtime missing)
+        key = msg[:120]
+        if key in _YtDlpLogger._warned_once:
+            return
+        _YtDlpLogger._warned_once.add(key)
+        logger.warning("yt-dlp: %s", msg)
+
+    def error(self, msg: str) -> None:
+        logger.warning("yt-dlp: %s", msg)
+
+
 async def _llm_pick_best(query: str, candidates: list[dict]) -> dict | None:
     """Ask Claude Haiku to pick the best YouTube candidate. Returns None on any failure."""
     global _anthropic_client
@@ -78,7 +106,8 @@ async def _llm_pick_best(query: str, candidates: list[dict]) -> dict | None:
 
 async def _search_youtube_candidates(query: str) -> list[dict]:
     def _search():
-        with yt_dlp.YoutubeDL(YTDL_OPTIONS) as ydl:
+        opts = {**YTDL_OPTIONS, "logger": _YtDlpLogger()}
+        with yt_dlp.YoutubeDL(opts) as ydl:
             try:
                 info = ydl.extract_info(f"ytsearch{SEARCH_RESULT_COUNT}:{query}", download=False)
             except yt_dlp.utils.DownloadError as e:

@@ -134,6 +134,24 @@ async def update_player_embed(guild: discord.Guild, channel):
             pass
     track = now_playing_info.get(gid)
     view = PlayerView(gid) if track else discord.ui.View()
+
+    if track and view:
+        q = queues.get(gid, collections.deque())
+        queue_size = len(q)
+        
+        # Disable/enable buttons based on queue state
+        for item in view.children:
+            if hasattr(item, 'label'):
+                # Skip button: disable if queue is empty
+                if "Saltar" in item.label:
+                    item.disabled = queue_size == 0
+                # Shuffle button: disable if queue has 0 or 1 items
+                elif "Shuffle" in item.label:
+                    item.disabled = queue_size < 2
+                # Queue button: disable if queue is empty
+                elif "Cola" in item.label:
+                    item.disabled = queue_size == 0
+
     msg = await channel.send(embed=_build_embed(gid), view=view)
     _player_messages[gid] = msg
 

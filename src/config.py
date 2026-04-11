@@ -47,13 +47,23 @@ YTDL_OPTIONS = {
 # -bufsize 512k      output buffer large enough to absorb jitter (128k was causing artifacts).
 # Note: do NOT add -ar or -ac here — FFmpegOpusAudio handles Opus encoding internally
 # and forcing resample/channel conversion introduces stereo phase artifacts.
+# dynaudnorm is applied as an FFmpeg -af filter for real-time loudness normalization on streams.
+# p=0.9 targets 90% peak; s=5 uses a 5-second analysis window (responsive without jarring jumps).
+# Controlled via the NORMALIZE_AUDIO env var (default: true).
+FFMPEG_NORMALIZE_FILTER = "dynaudnorm=p=0.9:s=5"
+_normalize_audio = os.getenv("NORMALIZE_AUDIO", "true").lower() in ("1", "true", "yes")
+
 FFMPEG_OPTIONS = {
     "before_options": (
         "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 "
         "-probesize 10M -analyzeduration 2000000 "
         "-thread_queue_size 4096"
     ),
-    "options": "-vn -bufsize 512k",
+    "options": (
+        f"-vn -bufsize 512k -af {FFMPEG_NORMALIZE_FILTER}"
+        if _normalize_audio else
+        "-vn -bufsize 512k"
+    ),
 }
 
 SEARCH_RESULT_COUNT = 5
