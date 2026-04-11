@@ -162,7 +162,10 @@ async def _prefetch_next(guild_id: int):
     """Resolve the URL of the next queued track in the background."""
     q = queues.get(guild_id)
     if q:
-        await _resolve_url(q[0])
+        try:
+            await _resolve_url(q[0])
+        except Exception as e:
+            logger.warning(f"_prefetch_next: error prefetching next track: {e}")
 
 
 async def play_next(guild: discord.Guild, vc: discord.VoiceClient, text_channel):

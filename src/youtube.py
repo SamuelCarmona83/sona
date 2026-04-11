@@ -79,7 +79,11 @@ async def _llm_pick_best(query: str, candidates: list[dict]) -> dict | None:
 async def _search_youtube_candidates(query: str) -> list[dict]:
     def _search():
         with yt_dlp.YoutubeDL(YTDL_OPTIONS) as ydl:
-            info = ydl.extract_info(f"ytsearch{SEARCH_RESULT_COUNT}:{query}", download=False)
+            try:
+                info = ydl.extract_info(f"ytsearch{SEARCH_RESULT_COUNT}:{query}", download=False)
+            except yt_dlp.utils.DownloadError as e:
+                logger.warning(f"_search_candidates: DownloadError buscando '{query}': {e}")
+                return []
             if not info or not info.get("entries"):
                 return []
             candidates = []
@@ -104,6 +108,28 @@ async def _search_youtube_candidates(query: str) -> list[dict]:
             return candidates
 
     return await asyncio.to_thread(_search)
+
+
+async def get_search_candidates(query: str) -> list[dict]:
+    """Get top 5 search candidates for user selection (no auto-selection)."""
+    for candidate_query in _build_search_queries(query):
+        candidates = await _search_youtube_candidates(candidate_query)
+        if not candidates:
+            continue
+
+        scored = _rank_candidates(query, candidates)
+        preview = ", ".join(
+            f"{c['score']:.2f}:{c.get('title', '?')}"
+            for c in scored[:5]
+        )
+        logger.info(f"get_search_candidates: top 5 para '{query}': {preview}")
+
+        # Return top 5 if first candidate meets minimum score
+        if scored[0]["score"] >= MIN_SEARCH_SCORE:
+            return scored[:5]
+
+    logger.warning(f"get_search_candidates: no hubo candidatos confiables para '{query}'")
+    return []
 
 
 async def search_youtube(query: str, enable_llm: bool = True) -> dict | None:

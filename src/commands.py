@@ -5,6 +5,7 @@ import re
 
 import discord
 from discord.ext import commands
+from discord.ui import Button, View
 
 from src.config import ALLOWED_CHANNEL_ID, ADMIN_USER_ID, LLM_ENABLED_FOR_ALBUM_TRACKS, sp
 from src.bot_instance import bot
@@ -17,7 +18,7 @@ from src.spotify import (
     _get_spotify_query,
     _ensure_auth,
 )
-from src.youtube import search_youtube
+from src.youtube import search_youtube, get_search_candidates
 from src.scoring import _split_query_parts
 
 logger = logging.getLogger(__name__)
@@ -28,6 +29,46 @@ def error_embed(title: str, description: str = "", details: str = "") -> discord
     if details:
         embed.add_field(name="Detalles", value=f"`{details[:1024]}`", inline=False)
     return embed
+
+
+class SearchSelectionView(View):
+    """Interactive view for selecting one of multiple search results."""
+    def __init__(self, candidates: list[dict], query: str, ctx: commands.Context):
+        super().__init__(timeout=30)
+        self.candidates = candidates
+        self.query = query
+        self.ctx = ctx
+        self.selected = None
+        
+        # Create buttons numbered 1-5
+        for idx in range(min(5, len(candidates))):
+            button = Button(
+                label=str(idx + 1),
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"search_select_{idx}"
+            )
+            button.callback = self._make_callback(idx)
+            self.add_item(button)
+    
+    def _make_callback(self, idx: int):
+        async def callback(interaction: discord.Interaction):
+            if interaction.user.id != self.ctx.author.id:
+                await interaction.response.send_message(
+                    "Solo quien hizo la búsqueda puede seleccionar.",
+                    ephemeral=True
+                )
+                return
+            
+            self.selected = self.candidates[idx]
+            self.stop()
+            await interaction.response.defer()
+        
+        return callback
+    
+    async def on_timeout(self):
+        """Called when the view times out."""
+        self.stop()
+
 
 @bot.check
 async def only_allowed_channel(ctx: commands.Context) -> bool:
@@ -151,6 +192,140 @@ async def play(ctx: commands.Context, *, query: str):
         await play_next(ctx.guild, vc, ctx.channel)
 
 
+@bot.command(name="search", help="Busca canciones y te permite elegir una. Uso: !search <busqueda>")
+async def search(ctx: commands.Context, *, query: str):
+    if not ctx.author.voice:
+        await ctx.send("Debes estar en un canal de voz para usar este comando.", delete_after=5)
+        return
+
+    voice_channel = ctx.author.voice.channel
+    msg = await ctx.send(f"\U0001f50d Buscando **{query}**...", delete_after=60)
+
+    # Get top 5 candidates
+    candidates = await get_search_candidates(query)
+    if not candidates:
+        await msg.edit(content=f"No se encontro nada para: **{query}**")
+        return
+
+    # Connect to voice if needed (do this early)
+    vc = ctx.guild.voice_client
+    if vc is None:
+        vc = await voice_channel.connect()
+    elif vc.channel != voice_channel:
+        await vc.move_to(voice_channel)
+
+    if ctx.guild.id not in queues:
+        queues[ctx.guild.id] = collections.deque()
+
+    # Keep track of tried candidates
+    available_candidates = list(candidates)
+    
+    while available_candidates:
+        # Prepare embed with remaining candidates
+        embed = discord.Embed(
+            title="🎵 Elige una canción",
+            description=f"Buscaste: **{query}**\n\nSelecciona una opción (válido por 30 segundos)",
+            color=0x1DB954  # Spotify green
+        )
+
+        # Add fields for each candidate
+        for idx, candidate in enumerate(available_candidates):
+            title = candidate.get("title", "Unknown")
+            uploader = candidate.get("uploader", "Unknown")
+            duration = candidate.get("duration") or 0
+            dur_str = f"{duration // 60}:{duration % 60:02d}" if duration else "?"
+            
+            field_value = f"{uploader}\n`[{dur_str}]`"
+            embed.add_field(
+                name=f"{idx + 1}️⃣ {title}",
+                value=field_value,
+                inline=False
+            )
+
+        # Create view with buttons
+        view = SearchSelectionView(available_candidates, query, ctx)
+        
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+
+        selection_msg = await ctx.send(embed=embed, view=view)
+
+        # Wait for user selection
+        await view.wait()
+
+        if view.selected is None:
+            await selection_msg.edit(content="⏱️ Tiempo agotado. Búsqueda cancelada.", embed=None, view=None)
+            return
+
+        selected = view.selected
+        
+        # Create track object
+        artist, title = _split_query_parts(query)
+        track = {
+            "title":     selected["title"],
+            "yt_query":  query,
+            "url":       selected["url"],
+            "requester":  ctx.author.display_name,
+            "artist":     artist or selected.get("uploader", "Unknown"),
+            "duration":   selected.get("duration") or 0,
+            "thumbnail":  selected.get("thumbnail") or "",
+        }
+
+        # Add to queue
+        queues[ctx.guild.id].append(track)
+
+        # Try to play
+        if not (vc.is_playing() or vc.is_paused()):
+            try:
+                await play_next(ctx.guild, vc, ctx.channel)
+                # Success! Update message and exit
+                embed_confirm = discord.Embed(
+                    title="✅ Reproduciendo",
+                    description=f"**{selected['title']}**\n{selected.get('uploader', '')}",
+                    color=0x1DB954
+                )
+                await selection_msg.edit(embed=embed_confirm, view=None)
+                return
+            except Exception as e:
+                logger.error(f"Error al reproducir canción: {e}")
+                # Remove this candidate from available and retry
+                available_candidates.remove(selected)
+                queues[ctx.guild.id].pop()  # Remove from queue
+                
+                if available_candidates:
+                    # Show message and retry
+                    embed_error = discord.Embed(
+                        title="⚠️ No disponible",
+                        description=f"**{selected['title']}** no pudo reproducirse.\n\nIntenta con otra opción.",
+                        color=0xFF9500
+                    )
+                    await selection_msg.edit(embed=embed_error, view=None)
+                    await asyncio.sleep(2)
+                    msg = selection_msg
+                    continue
+                else:
+                    # No more candidates
+                    embed_error = discord.Embed(
+                        title="❌ Sin opciones disponibles",
+                        description="Todas las canciones fallaron. Intenta una búsqueda diferente.",
+                        color=0xFF5555
+                    )
+                    await selection_msg.edit(embed=embed_error, view=None)
+                    return
+        else:
+            # Already playing, just add to queue
+            embed_confirm = discord.Embed(
+                title="✅ Canción agregada a la cola",
+                description=f"**{selected['title']}**\n{selected.get('uploader', '')}",
+                color=0x1DB954
+            )
+            await selection_msg.edit(embed=embed_confirm, view=None)
+            return
+
+
+
 @bot.command(name="skip", help="Salta la cancion actual.")
 async def skip(ctx: commands.Context):
     vc = ctx.guild.voice_client
@@ -258,25 +433,25 @@ async def now_playing_cmd(ctx: commands.Context):
     await ctx.send(f"\U0001f3b5 **{current['title']}** — pedido por {current['requester']}", delete_after=15)
 
 
-@bot.command(name="search", help="Busca canciones en Spotify. Uso: !search <busqueda>")
-async def search(ctx: commands.Context, *, query: str):
-    if not await _ensure_auth(ctx):
-        return
-    try:
-        results = await asyncio.to_thread(lambda: sp.search(q=query, type="track", limit=5))
-    except Exception as e:
-        await ctx.send(f"Error buscando en Spotify: `{e}`")
-        return
-    items = results.get("tracks", {}).get("items", [])
-    if not items:
-        await ctx.send(f"No se encontraron resultados para: **{query}**")
-        return
-    embed = discord.Embed(title=f'Resultados para "{query}"', color=discord.Color.blurple())
-    for i, track in enumerate(items, 1):
-        artists = ", ".join(a["name"] for a in track["artists"])
-        album   = track.get("album", {}).get("name", "")
-        embed.add_field(name=f"{i}. {track['name']}", value=f"{artists} — {album}", inline=False)
-    await ctx.send(embed=embed)
+# @bot.command(name="search", help="Busca canciones en Spotify. Uso: !search <busqueda>")
+# async def search(ctx: commands.Context, *, query: str):
+#     if not await _ensure_auth(ctx):
+#         return
+#     try:
+#         results = await asyncio.to_thread(lambda: sp.search(q=query, type="track", limit=5))
+#     except Exception as e:
+#         await ctx.send(f"Error buscando en Spotify: `{e}`")
+#         return
+#     items = results.get("tracks", {}).get("items", [])
+#     if not items:
+#         await ctx.send(f"No se encontraron resultados para: **{query}**")
+#         return
+#     embed = discord.Embed(title=f'Resultados para "{query}"', color=discord.Color.blurple())
+#     for i, track in enumerate(items, 1):
+#         artists = ", ".join(a["name"] for a in track["artists"])
+#         album   = track.get("album", {}).get("name", "")
+#         embed.add_field(name=f"{i}. {track['name']}", value=f"{artists} — {album}", inline=False)
+#     await ctx.send(embed=embed)
 
 
 @bot.command(name="move", help="Mueve una cancion en la cola. Uso: !move <pos_actual> <pos_nueva>")

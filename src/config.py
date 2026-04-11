@@ -37,6 +37,7 @@ YTDL_OPTIONS = {
     "no_warnings": True,
     "noplaylist": True,
     "source_address": "0.0.0.0",
+    "ignoreerrors": True,  # Skip unavailable videos in search results instead of failing
 }
 
 # -reconnect*        keeps the stream alive on transient network errors.
