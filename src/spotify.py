@@ -197,12 +197,12 @@ async def _get_recommendations(
 ) -> list[dict]:
     """Return track suggestions as list of {query, spotify_id, artist_id}.
 
-    The Spotify /recommendations endpoint was restricted to apps created before
-    Nov 2023, so we use two search-based strategies instead:
+    The Spotify /recommendations and /related-artists endpoints are restricted
+    to apps created before Nov 2023, so we use three search-based strategies:
 
     1. Genre seeds  → sp.search(q='genre:"<g>"') with a randomised offset for variety.
-    2. Track seeds  → look up each track's artist, fetch related artists,
-                      pick their top tracks.
+    2. Track seeds  → fetch the seed track's artist top-tracks directly.
+    3. Track seeds  → search by artist name to find more tracks (genre search variant).
 
     Results are deduplicated and shuffled before returning.
     """
@@ -232,7 +232,7 @@ async def _get_recommendations(
         except Exception as exc:
             logger.warning(f"_get_recommendations: genre search failed for '{genre}': {exc}")
 
-    # --- Strategy 2: related artists from track seeds ---
+    # --- Strategy 2: seed track's artist top tracks (no related-artists call) ---
     for track_id in seed_tracks:
         if len(results) >= limit * 2:
             break
@@ -242,20 +242,29 @@ async def _get_recommendations(
             if not artists:
                 continue
             artist_id = artists[0]["id"]
-            related = await asyncio.to_thread(lambda aid=artist_id: sp.artist_related_artists(aid))
-            related_artists = (related.get("artists") or [])[:3]
-            for ra in related_artists:
-                if len(results) >= limit * 2:
-                    break
-                top = await asyncio.to_thread(
-                    lambda rid=ra["id"]: sp.artist_top_tracks(rid, country="US")
+            artist_name = artists[0].get("name", "")
+            # Top tracks for the seed artist directly
+            top = await asyncio.to_thread(
+                lambda aid=artist_id: sp.artist_top_tracks(aid, country="US")
+            )
+            for t in (top.get("tracks") or [])[:5]:
+                if t and t.get("id") and t["id"] not in seen_ids:
+                    seen_ids.add(t["id"])
+                    results.append(_track_to_info(t))
+            # Also search by artist name with random offset for more variety
+            if len(results) < limit * 2 and artist_name:
+                offset = _random.randint(0, 20)
+                res = await asyncio.to_thread(
+                    lambda an=artist_name, o=offset: sp.search(
+                        q=f'artist:"{an}"', type="track", limit=5, offset=o
+                    )
                 )
-                for t in (top.get("tracks") or [])[:3]:
+                for t in (res.get("tracks") or {}).get("items") or []:
                     if t and t.get("id") and t["id"] not in seen_ids:
                         seen_ids.add(t["id"])
                         results.append(_track_to_info(t))
         except Exception as exc:
-            logger.warning(f"_get_recommendations: related-artist search failed for track {track_id}: {exc}")
+            logger.warning(f"_get_recommendations: artist search failed for track {track_id}: {exc}")
 
     if not results:
         return []

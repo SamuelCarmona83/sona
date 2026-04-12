@@ -199,20 +199,30 @@ async def record_played(guild_id: int, track: dict) -> None:
         cluster = _map_cluster(genres)
 
     _play_history[guild_id].append({
-        "spotify_id": spotify_id,
-        "artist_id":  artist_id,
-        "cluster":    cluster,
+        "spotify_id":  spotify_id,
+        "artist_id":   artist_id,
+        "cluster":     cluster,
+        "artist_name": track.get("artist"),
     })
-    if spotify_id:
-        ids = _played_ids.setdefault(guild_id, [])
-        ids.append(spotify_id)
+    
+    # Save to played_ids (use spotify_id if available, else hash of title)
+    track_title = track.get("title", "")
+    track_id = spotify_id or f"yt_{hash(track_title) & 0x7fffffff:08x}"
+    ids = _played_ids.setdefault(guild_id, [])
+    if track_id not in ids:
+        ids.append(track_id)
         if len(ids) > _PLAYED_IDS_MAX:
             _played_ids[guild_id] = ids[-_PLAYED_IDS_MAX:]
         _save_played_ids()
-    logger.debug(
-        "radio.record_played: guild=%s track='%s' cluster=%s",
-        guild_id, track.get("title", "?"), cluster,
-    )
+        logger.info(
+            "radio.record_played: saved track id=%s title='%s' (total: %d)",
+            track_id, track_title, len(ids),
+        )
+    else:
+        logger.debug(
+            "radio.record_played: track id=%s already in history",
+            track_id,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -277,6 +287,77 @@ def _build_diversity_seeds(guild_id: int) -> tuple[list[str], list[str]]:
 
 
 # ---------------------------------------------------------------------------
+# YouTube-only fallback fill (used when Spotify is unavailable)
+# ---------------------------------------------------------------------------
+
+async def _youtube_fallback_fill(guild_id: int, needed: int) -> list[dict]:
+    """Build track dicts using YouTube search when Spotify recommendations fail.
+
+    Strategy:
+    1. Use artist names from recent play history (most diverse, most recent).
+    2. Fill remaining slots with mood-genre plain-text queries.
+    3. Return list of {query, spotify_id=None, artist_id=None}.
+    """
+    import random as _random
+    from src.scoring import _split_query_parts
+
+    queries: list[str] = []
+
+    # --- From play history: recent unique artists ---
+    history = list(_play_history.get(guild_id, []))
+    seen_artists: set[str] = set()
+    for entry in reversed(history):
+        artist = entry.get("artist_name")
+        if artist and artist not in seen_artists:
+            seen_artists.add(artist)
+            queries.append(f"{artist} best songs")
+        if len(queries) >= needed:
+            break
+
+    # --- From mood genres: genre playlist queries ---
+    mood = get_mood(guild_id)
+    mood_genres = (
+        _custom_moods.get(guild_id, {}).get(mood)
+        or MOODS.get(mood, [])
+        or _FALLBACK_GENRES
+    )
+    _random.shuffle(mood_genres)
+    for genre in mood_genres:
+        if len(queries) >= needed:
+            break
+        queries.append(f"{genre} playlist mix")
+
+    # Pad with fallback if still short
+    for genre in _FALLBACK_GENRES:
+        if len(queries) >= needed:
+            break
+        queries.append(f"{genre} popular songs")
+
+    _random.shuffle(queries)
+
+    from src.youtube import search_youtube
+    results: list[dict] = []
+    for q in queries[:needed]:
+        yt_info = await search_youtube(q, enable_llm=False)
+        if not yt_info:
+            continue
+        artist, _title = _split_query_parts(q)
+        results.append({
+            "query":      q,
+            "spotify_id": None,
+            "artist_id":  None,
+            "yt_info":    yt_info,
+            "artist":     artist or "Unknown",
+        })
+
+    logger.info(
+        "radio.yt_fallback: guild=%s generated %d candidates from YouTube",
+        guild_id, len(results),
+    )
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Fill engine
 # ---------------------------------------------------------------------------
 
@@ -313,23 +394,36 @@ async def fill_radio_queue(
         )
 
         recs = await _get_recommendations(seed_tracks, seed_genres, limit=needed + 3)
+        using_fallback = False
         if not recs:
-            logger.warning("radio.fill: sin recomendaciones de Spotify para guild=%s", gid)
+            logger.warning(
+                "radio.fill: Spotify sin recomendaciones para guild=%s, usando fallback YouTube",
+                gid,
+            )
+            recs = await _youtube_fallback_fill(gid, needed + 3)
+            using_fallback = True
+
+        if not recs:
+            logger.warning("radio.fill: fallback YouTube tambien vacio para guild=%s", gid)
             return
 
-        # Search YouTube for all recommendations in parallel
+        # Search YouTube for all Spotify-sourced recommendations in parallel.
+        # Fallback recs already have yt_info pre-fetched; skip search for those.
         async def _fetch(idx: int, info: dict) -> dict | None:
-            enable_llm = idx < LLM_ENABLED_FOR_ALBUM_TRACKS
-            yt_info = await search_youtube(info["query"], enable_llm=enable_llm)
+            if using_fallback:
+                yt_info = info.get("yt_info")
+            else:
+                enable_llm = idx < LLM_ENABLED_FOR_ALBUM_TRACKS
+                yt_info = await search_youtube(info["query"], enable_llm=enable_llm)
             if not yt_info:
                 return None
-            artist, title = _split_query_parts(info["query"])
+            artist, _title = _split_query_parts(info["query"])
             return {
                 "title":      yt_info["title"],
                 "yt_query":   info["query"],
                 "url":        yt_info["url"],
                 "requester":  "📻 Radio",
-                "artist":     artist or "Unknown",
+                "artist":     info.get("artist") or artist or "Unknown",
                 "duration":   yt_info.get("duration") or 0,
                 "thumbnail":  yt_info.get("thumbnail") or "",
                 "spotify_id": info.get("spotify_id"),
@@ -338,10 +432,21 @@ async def fill_radio_queue(
 
         results = await asyncio.gather(*(_fetch(i, r) for i, r in enumerate(recs)))
         played_set = set(_played_ids.get(gid, []))
-        new_tracks = [
-            t for t in results
-            if t is not None and t.get("spotify_id") not in played_set
-        ][:needed]
+        seen_urls: set[str] = set()
+        new_tracks = []
+        for t in results:
+            if t is None:
+                continue
+            # Dedup by spotify_id (non-None) or by YouTube URL
+            sid = t.get("spotify_id")
+            url = t.get("url", "")
+            dedup_key = sid if sid else f"url_{url}"
+            if dedup_key in played_set or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            new_tracks.append(t)
+            if len(new_tracks) >= needed:
+                break
 
         if not new_tracks:
             logger.warning("radio.fill: ninguna recomendacion encontrada en YouTube para guild=%s", gid)
