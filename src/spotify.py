@@ -1,3 +1,4 @@
+import random as _random
 import asyncio
 import logging
 import re
@@ -20,6 +21,9 @@ logger = logging.getLogger(__name__)
 
 _oauth_code: str | None = None
 _oauth_received = threading.Event()
+
+# In-memory cache: artist_id -> list of genre strings (avoids repeated API calls per artist)
+_artist_genres_cache: dict[str, list[str]] = {}
 
 
 class _CallbackHandler(BaseHTTPRequestHandler):
@@ -60,8 +64,20 @@ def _parse_spotify_url(url: str) -> dict | None:
     return None
 
 
-async def _get_tracks_from_spotify_url(url: str) -> list[str] | None:
-    """Extract track queries from a Spotify URL. Returns list of 'Artist - Title' queries or None on error."""
+def _track_to_info(track: dict) -> dict:
+    """Extract {query, spotify_id, artist_id} from a Spotify track object."""
+    return {
+        "query":     _format_spotify_track_query(track),
+        "spotify_id": track.get("id"),
+        "artist_id":  (track.get("artists") or [{}])[0].get("id"),
+    }
+
+
+async def _get_tracks_from_spotify_url(url: str) -> list[dict] | None:
+    """Extract track info from a Spotify URL.
+
+    Returns list of {query, spotify_id, artist_id} dicts, or None on error.
+    """
     parsed = _parse_spotify_url(url)
     if not parsed:
         return None
@@ -72,20 +88,19 @@ async def _get_tracks_from_spotify_url(url: str) -> list[str] | None:
 
         if resource_type == "track":
             track = await asyncio.to_thread(lambda: sp.track(resource_id))
-            query = _format_spotify_track_query(track)
-            logger.info(f"spotify_url: extraida cancion '{query}' de URL de track")
-            return [query]
+            info = _track_to_info(track)
+            logger.info(f"spotify_url: extraida cancion '{info['query']}' de URL de track")
+            return [info]
 
         elif resource_type == "album":
             album = await asyncio.to_thread(lambda: sp.album(resource_id))
             album_name = album.get("name", "Album")
             tracks = album.get("tracks", {}).get("items", [])
-            queries = [_format_spotify_track_query(t) for t in tracks]
-            logger.info(f"spotify_url: extraidas {len(queries)} canciones del album '{album_name}'")
-            return queries
+            infos = [_track_to_info(t) for t in tracks]
+            logger.info(f"spotify_url: extraidas {len(infos)} canciones del album '{album_name}'")
+            return infos
 
         elif resource_type == "playlist":
-            # Playlists are paginated; fetch all items
             all_tracks = []
             playlist_name = ""
             offset = 0
@@ -100,9 +115,9 @@ async def _get_tracks_from_spotify_url(url: str) -> list[str] | None:
                     if item.get("track"):
                         all_tracks.append(item["track"])
                 offset += limit
-            queries = [_format_spotify_track_query(t) for t in all_tracks]
-            logger.info(f"spotify_url: extraidas {len(queries)} canciones de la playlist '{playlist_name}'")
-            return queries
+            infos = [_track_to_info(t) for t in all_tracks]
+            logger.info(f"spotify_url: extraidas {len(infos)} canciones de la playlist '{playlist_name}'")
+            return infos
 
     except Exception as exc:
         logger.warning(f"spotify_url: fallo extrayendo canciones de URL: {exc}")
@@ -110,14 +125,18 @@ async def _get_tracks_from_spotify_url(url: str) -> list[str] | None:
     return None
 
 
-async def _get_spotify_query(query: str) -> str:
-    """Try to refine the search query using Spotify metadata; fall back to raw."""
+async def _get_spotify_track_info(query: str) -> dict:
+    """Refine a text query using Spotify and return {query, spotify_id, artist_id}.
+
+    Falls back to {query=query, spotify_id=None, artist_id=None} on any failure.
+    """
+    fallback = {"query": query, "spotify_id": None, "artist_id": None}
     try:
         auth_manager = sp.auth_manager
         cached = await asyncio.to_thread(auth_manager.cache_handler.get_cached_token)
         valid  = await asyncio.to_thread(auth_manager.validate_token, cached)
         if not valid:
-            return query
+            return fallback
         results = await asyncio.to_thread(lambda: sp.search(q=query, type="track", limit=5))
         items = results.get("tracks", {}).get("items", [])
         if items:
@@ -125,34 +144,128 @@ async def _get_spotify_query(query: str) -> str:
             for item in items:
                 score = _score_spotify_match(query, item)
                 scored_items.append((score, item))
-
-            scored_items.sort(key=lambda item: item[0], reverse=True)
+            scored_items.sort(key=lambda x: x[0], reverse=True)
             preview = ", ".join(
                 f"{score:.2f}:{_format_spotify_track_query(item)}"
                 for score, item in scored_items[:3]
             )
             logger.info(f"spotify_refine: top candidatos para '{query}': {preview}")
-
             best_score, best_item = scored_items[0]
             if best_score >= MIN_SPOTIFY_REFINEMENT_SCORE:
-                refined_query = _format_spotify_track_query(best_item)
+                refined = _format_spotify_track_query(best_item)
                 logger.info(
                     "spotify_refine: usando '%s' para '%s' (score=%.2f)",
-                    refined_query,
-                    query,
-                    best_score,
+                    refined, query, best_score,
                 )
-                return refined_query
-
+                return {
+                    "query":      refined,
+                    "spotify_id": best_item.get("id"),
+                    "artist_id":  (best_item.get("artists") or [{}])[0].get("id"),
+                }
             logger.warning(
                 "spotify_refine: descartando refinamiento para '%s'; mejor candidato '%s' con score %.2f",
-                query,
-                _format_spotify_track_query(best_item),
-                best_score,
+                query, _format_spotify_track_query(best_item), best_score,
             )
     except Exception as exc:
         logger.warning(f"spotify_refine: fallo refinando '{query}': {exc}")
-    return query
+    return fallback
+
+
+async def _get_spotify_query(query: str) -> str:
+    """Thin wrapper around _get_spotify_track_info; returns only the refined query string."""
+    return (await _get_spotify_track_info(query))["query"]
+
+
+async def _get_artist_genres(artist_id: str) -> list[str]:
+    """Return Spotify genre tags for an artist, with in-memory caching."""
+    if artist_id in _artist_genres_cache:
+        return _artist_genres_cache[artist_id]
+    try:
+        artist = await asyncio.to_thread(lambda: sp.artist(artist_id))
+        genres = artist.get("genres") or []
+    except Exception as exc:
+        logger.warning(f"_get_artist_genres: error para artist_id={artist_id}: {exc}")
+        genres = []
+    _artist_genres_cache[artist_id] = genres
+    return genres
+
+
+async def _get_recommendations(
+    seed_tracks: list[str],
+    seed_genres: list[str],
+    limit: int = 10,
+) -> list[dict]:
+    """Return track suggestions as list of {query, spotify_id, artist_id}.
+
+    The Spotify /recommendations endpoint was restricted to apps created before
+    Nov 2023, so we use two search-based strategies instead:
+
+    1. Genre seeds  → sp.search(q='genre:"<g>"') with a randomised offset for variety.
+    2. Track seeds  → look up each track's artist, fetch related artists,
+                      pick their top tracks.
+
+    Results are deduplicated and shuffled before returning.
+    """
+    if not seed_tracks and not seed_genres:
+        return []
+
+    seen_ids: set[str] = set()
+    results: list[dict] = []
+
+    # --- Strategy 1: genre search ---
+    per_genre = max(1, (limit // max(len(seed_genres), 1)) + 1) if seed_genres else 0
+    for genre in seed_genres:
+        if len(results) >= limit * 2:
+            break
+        try:
+            # Random offset (0–40) gives variety across fills without repeating the same top hits
+            offset = _random.randint(0, 40)
+            res = await asyncio.to_thread(
+                lambda g=genre, o=offset: sp.search(
+                    q=f'genre:"{g}"', type="track", limit=per_genre + 2, offset=o
+                )
+            )
+            for t in (res.get("tracks") or {}).get("items") or []:
+                if t and t.get("id") and t["id"] not in seen_ids:
+                    seen_ids.add(t["id"])
+                    results.append(_track_to_info(t))
+        except Exception as exc:
+            logger.warning(f"_get_recommendations: genre search failed for '{genre}': {exc}")
+
+    # --- Strategy 2: related artists from track seeds ---
+    for track_id in seed_tracks:
+        if len(results) >= limit * 2:
+            break
+        try:
+            track = await asyncio.to_thread(lambda tid=track_id: sp.track(tid))
+            artists = track.get("artists") or []
+            if not artists:
+                continue
+            artist_id = artists[0]["id"]
+            related = await asyncio.to_thread(lambda aid=artist_id: sp.artist_related_artists(aid))
+            related_artists = (related.get("artists") or [])[:3]
+            for ra in related_artists:
+                if len(results) >= limit * 2:
+                    break
+                top = await asyncio.to_thread(
+                    lambda rid=ra["id"]: sp.artist_top_tracks(rid, country="US")
+                )
+                for t in (top.get("tracks") or [])[:3]:
+                    if t and t.get("id") and t["id"] not in seen_ids:
+                        seen_ids.add(t["id"])
+                        results.append(_track_to_info(t))
+        except Exception as exc:
+            logger.warning(f"_get_recommendations: related-artist search failed for track {track_id}: {exc}")
+
+    if not results:
+        return []
+
+    _random.shuffle(results)
+    logger.info(
+        "_get_recommendations: %d sugerencias generadas (genres=%s, seed_tracks=%d)",
+        len(results), seed_genres, len(seed_tracks),
+    )
+    return results[:limit]
 
 
 async def _ensure_auth(ctx: commands.Context) -> bool:

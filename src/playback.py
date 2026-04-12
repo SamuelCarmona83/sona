@@ -45,7 +45,12 @@ def _build_embed(guild_id: int) -> discord.Embed:
         embed.add_field(name="Siguiente", value=next_track.get("title", "?")[:100], inline=False)
     if track.get("thumbnail"):
         embed.set_thumbnail(url=track["thumbnail"])
-    embed.set_footer(text="\u23f8 En pausa" if paused else "\u25b6 Reproduciendo")
+    from src import radio as _radio
+    radio_on  = _radio.is_radio_active(guild_id)
+    mood      = _radio.get_mood(guild_id)
+    radio_txt = " | 📻 Radio ON" if radio_on else ""
+    mood_txt  = f" | 🎭 {mood.capitalize()}" if radio_on and mood != "neutral" else ""
+    embed.set_footer(text=("\u23f8 En pausa" if paused else "\u25b6 Reproduciendo") + radio_txt + mood_txt)
     return embed
 
 
@@ -58,6 +63,12 @@ class PlayerView(discord.ui.View):
         self.toggle_btn.style = (
             discord.ButtonStyle.success if paused else discord.ButtonStyle.secondary
         )
+        from src import radio as _radio
+        radio_on = _radio.is_radio_active(guild_id)
+        self.radio_btn.style = discord.ButtonStyle.success if radio_on else discord.ButtonStyle.secondary
+        self.radio_btn.label = "📻 Radio ✓" if radio_on else "📻 Radio"
+        mood = _radio.get_mood(guild_id)
+        self.mood_btn.label = f"🎭 {mood.capitalize()}"
 
     @discord.ui.button(label="\u23ed Saltar", style=discord.ButtonStyle.primary)
     async def skip_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -121,6 +132,30 @@ class PlayerView(discord.ui.View):
             color=0x1DB954
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="\U0001f4fb Radio", style=discord.ButtonStyle.secondary, row=2)
+    async def radio_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        gid = interaction.guild.id
+        from src import radio as _radio
+        was_active = _radio.is_radio_active(gid)
+        _radio.set_radio_active(gid, not was_active)
+        await interaction.response.defer()
+        if not was_active:
+            vc = interaction.guild.voice_client
+            asyncio.ensure_future(_radio.fill_radio_queue(interaction.guild, vc, interaction.channel))
+        await update_player_embed(interaction.guild, interaction.channel)
+
+    @discord.ui.button(label="\U0001f3ad Mood", style=discord.ButtonStyle.secondary, row=2)
+    async def mood_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        gid = interaction.guild.id
+        from src import radio as _radio
+        mood_names = list(_radio.MOODS.keys())
+        current = _radio.get_mood(gid)
+        idx = mood_names.index(current) if current in mood_names else 0
+        next_mood = mood_names[(idx + 1) % len(mood_names)]
+        _radio.set_mood(gid, next_mood)
+        await interaction.response.defer()
+        await update_player_embed(interaction.guild, interaction.channel)
 
 
 async def update_player_embed(guild: discord.Guild, channel):
@@ -198,6 +233,11 @@ async def play_next(guild: discord.Guild, vc: discord.VoiceClient, text_channel)
         _paused[guild.id] = False
         await _update_status(guild, None)
         await update_player_embed(guild, text_channel)
+        # Radio mode: refill instead of disconnecting
+        from src import radio as _radio
+        if _radio.is_radio_active(guild.id):
+            asyncio.ensure_future(_radio.fill_radio_queue(guild, vc, text_channel))
+            return
         await asyncio.sleep(1)
         if guild.voice_client:
             await guild.voice_client.disconnect()
@@ -214,6 +254,15 @@ async def play_next(guild: discord.Guild, vc: discord.VoiceClient, text_channel)
 
     now_playing_info[guild.id] = track
     _paused[guild.id] = False
+
+    # Record in radio history (lazy import to avoid circular)
+    from src import radio as _radio
+    asyncio.ensure_future(_radio.record_played(guild.id, track))
+
+    # If radio is active and queue is running low, trigger a background fill
+    from src.config import RADIO_QUEUE_MIN
+    if _radio.is_radio_active(guild.id) and len(q) < RADIO_QUEUE_MIN:
+        asyncio.ensure_future(_radio.fill_radio_queue(guild, vc, text_channel))
 
     # Pre-fetch the next track's URL while this one starts playing
     if q:

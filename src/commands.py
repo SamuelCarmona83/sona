@@ -16,6 +16,7 @@ from src.spotify import (
     _is_spotify_url,
     _get_tracks_from_spotify_url,
     _get_spotify_query,
+    _get_spotify_track_info,
     _ensure_auth,
 )
 from src.youtube import search_youtube, get_search_candidates
@@ -128,8 +129,8 @@ async def play(ctx: commands.Context, *, query: str):
 
     # Check if query is a Spotify URL (album/playlist/track)
     if _is_spotify_url(query):
-        yt_queries = await _get_tracks_from_spotify_url(query)
-        if not yt_queries:
+        track_infos = await _get_tracks_from_spotify_url(query)
+        if not track_infos:
             await msg.edit(content="No se pudo procesar la URL de Spotify.")
             await asyncio.sleep(5)
             try:
@@ -137,10 +138,12 @@ async def play(ctx: commands.Context, *, query: str):
             except Exception:
                 pass
             return
+        # track_infos is now list[dict] with {query, spotify_id, artist_id}
+        yt_queries = track_infos
     else:
         # Regular text search; refine with Spotify
-        refined = await _get_spotify_query(query)
-        yt_queries = [refined]
+        info = await _get_spotify_track_info(query)
+        yt_queries = [info]
 
     vc = ctx.guild.voice_client
     if vc is None:
@@ -155,35 +158,44 @@ async def play(ctx: commands.Context, *, query: str):
     tracks_to_queue = []
     if len(yt_queries) == 1:
         # Single track: no gather overhead needed
-        yt_info = await search_youtube(yt_queries[0], enable_llm=True)
+        info = yt_queries[0]  # {query, spotify_id, artist_id}
+        yt_info = await search_youtube(info["query"], enable_llm=True)
         if yt_info:
-            artist, title = _split_query_parts(yt_queries[0])
+            artist, title = _split_query_parts(info["query"])
             tracks_to_queue.append({
-                "title":     yt_info["title"],
-                "yt_query":  yt_queries[0],
-                "url":       yt_info["url"],
-                "requester": ctx.author.display_name,
-                "artist":    artist or "Unknown",
-                "duration":  yt_info.get("duration") or 0,
-                "thumbnail": yt_info.get("thumbnail") or "",
+                "title":      yt_info["title"],
+                "yt_query":   info["query"],
+                "url":        yt_info["url"],
+                "requester":  ctx.author.display_name,
+                "artist":     artist or "Unknown",
+                "duration":   yt_info.get("duration") or 0,
+                "thumbnail":  yt_info.get("thumbnail") or "",
+                "spotify_id": info.get("spotify_id"),
+                "artist_id":  info.get("artist_id"),
+                "acodec":     yt_info.get("acodec", "?"),
+                "abr":        yt_info.get("abr", 0),
             })
     else:
         # Album / playlist: search all tracks concurrently
-        async def _fetch(idx: int, yt_query: str) -> dict | None:
+        async def _fetch(idx: int, info: dict) -> dict | None:
             enable_llm = idx < LLM_ENABLED_FOR_ALBUM_TRACKS
-            yt_info = await search_youtube(yt_query, enable_llm=enable_llm)
+            yt_info = await search_youtube(info["query"], enable_llm=enable_llm)
             if not yt_info:
                 return None
-            artist, title = _split_query_parts(yt_query)
+            artist, title = _split_query_parts(info["query"])
             return {
-                "title":     yt_info["title"],
-                "yt_query":  yt_query,
-                "url":       yt_info["url"],
-                "requester": ctx.author.display_name,
-                "artist":    artist or "Unknown",
-                "duration":  yt_info.get("duration") or 0,
-                "thumbnail": yt_info.get("thumbnail") or "",
-                "_order":    idx,
+                "title":      yt_info["title"],
+                "yt_query":   info["query"],
+                "url":        yt_info["url"],
+                "requester":  ctx.author.display_name,
+                "artist":     artist or "Unknown",
+                "duration":   yt_info.get("duration") or 0,
+                "thumbnail":  yt_info.get("thumbnail") or "",
+                "spotify_id": info.get("spotify_id"),
+                "artist_id":  info.get("artist_id"),
+                "acodec":     yt_info.get("acodec", "?"),
+                "abr":        yt_info.get("abr", 0),
+                "_order":     idx,
             }
 
         results = await asyncio.gather(*(_fetch(i, q) for i, q in enumerate(yt_queries)))
@@ -202,8 +214,16 @@ async def play(ctx: commands.Context, *, query: str):
         pass
 
     # Add all tracks to queue
-    for track in tracks_to_queue:
-        queues[ctx.guild.id].append(track)
+    # Radio mode: user requests go to the front (right after the current song)
+    from src import radio as _radio
+    radio_on = _radio.is_radio_active(ctx.guild.id)
+    if radio_on and (vc.is_playing() or vc.is_paused()):
+        # appendleft in reverse order so first requested track ends up at position 0
+        for track in reversed(tracks_to_queue):
+            queues[ctx.guild.id].appendleft(track)
+    else:
+        for track in tracks_to_queue:
+            queues[ctx.guild.id].append(track)
 
     # Start playing if not already playing
     if vc.is_playing() or vc.is_paused():
@@ -401,6 +421,8 @@ async def resume(ctx: commands.Context):
 
 @bot.command(name="stop", help="Detiene la reproduccion y limpia la cola.")
 async def stop(ctx: commands.Context):
+    from src import radio as _radio
+    _radio.set_radio_active(ctx.guild.id, False)
     queues[ctx.guild.id] = collections.deque()
     now_playing_info[ctx.guild.id] = None
     _paused[ctx.guild.id] = False
@@ -417,6 +439,8 @@ async def stop(ctx: commands.Context):
 
 @bot.command(name="leave", help="Desconecta el bot del canal de voz.")
 async def leave(ctx: commands.Context):
+    from src import radio as _radio
+    _radio.set_radio_active(ctx.guild.id, False)
     queues[ctx.guild.id] = collections.deque()
     now_playing_info[ctx.guild.id] = None
     _paused[ctx.guild.id] = False
@@ -511,6 +535,138 @@ async def remove_cmd(ctx: commands.Context, pos: int):
     queues[ctx.guild.id] = collections.deque(items)
     await ctx.send(f"**{track.get('title', '?')}** eliminada de la cola.", delete_after=8)
     await update_player_embed(ctx.guild, ctx.channel)
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
+
+
+@bot.command(name="radio", help="Activa/desactiva el modo radio 24/7. Uso: !radio [on|off]")
+async def radio_cmd(ctx: commands.Context, action: str = ""):
+    from src import radio as _radio
+    gid = ctx.guild.id
+    action = action.strip().lower()
+    if action in ("on", "off"):
+        active = action == "on"
+    else:
+        active = not _radio.is_radio_active(gid)  # toggle if no argument
+    _radio.set_radio_active(gid, active)
+
+    if active:
+        embed = discord.Embed(
+            title="📻 Radio activado",
+            description=(
+                f"Mood actual: **{_radio.get_mood(gid).capitalize()}**\n"
+                "La cola se rellena automaticamente con recomendaciones.\n"
+                "Usa `!mood <nombre>` para cambiar el estilo."
+            ),
+            color=0x1DB954,
+        )
+        await ctx.send(embed=embed, delete_after=15)
+        vc = ctx.guild.voice_client
+        if vc is None and ctx.author.voice:
+            vc = await ctx.author.voice.channel.connect()
+            if gid not in queues:
+                queues[gid] = collections.deque()
+        if vc:
+            asyncio.ensure_future(_radio.fill_radio_queue(ctx.guild, vc, ctx.channel))
+    else:
+        embed = discord.Embed(
+            title="📻 Radio desactivado",
+            description="El bot reproducira la cola actual y se desconectara al terminar.",
+            color=0x2B2D31,
+        )
+        await ctx.send(embed=embed, delete_after=10)
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
+
+
+@bot.command(name="mood", help="Cambia el mood del radio. Uso: !mood <nombre> | !mood create <nombre> <query> | !mood delete <nombre>")
+async def mood_cmd(ctx: commands.Context, *, args: str = ""):
+    from src import radio as _radio
+    gid = ctx.guild.id
+    parts = args.strip().split(None, 2)  # up to 3 parts: [subcommand, name, query]
+    subcommand = parts[0].lower() if parts else ""
+
+    if subcommand == "create":
+        if len(parts) < 3:
+            await ctx.send("Uso: `!mood create <nombre> <cancion o artista>`", delete_after=10)
+            return
+        mood_name = parts[1].lower()
+        query = parts[2]
+        if mood_name in _radio.MOODS:
+            await ctx.send(f"`{mood_name}` es un mood built-in y no puede ser sobreescrito.", delete_after=10)
+            return
+        msg = await ctx.send(f"\U0001f50d Buscando géneros para **{query}**...")
+        from src.spotify import _get_artist_genres
+        info = await _get_spotify_track_info(query)
+        artist_id = info.get("artist_id")
+        if not artist_id:
+            await msg.edit(content="No se encontró el artista en Spotify. Intenta con otro query.")
+            return
+        genres = await _get_artist_genres(artist_id)
+        if not genres:
+            await msg.edit(content="El artista no tiene géneros registrados en Spotify. Prueba con otro artista.")
+            return
+        _radio.create_custom_mood(gid, mood_name, genres)
+        embed = discord.Embed(
+            title=f"🎭 Mood custom creado: {mood_name}",
+            description=f"Géneros: {', '.join(f'`{g}`' for g in genres[:8])}",
+            color=0x1DB954,
+        )
+        await msg.edit(content=None, embed=embed)
+
+    elif subcommand == "delete":
+        if len(parts) < 2:
+            await ctx.send("Uso: `!mood delete <nombre>`", delete_after=10)
+            return
+        mood_name = parts[1].lower()
+        try:
+            _radio.delete_custom_mood(gid, mood_name)
+            await ctx.send(f"🗑️ Mood `{mood_name}` eliminado.", delete_after=8)
+        except ValueError as e:
+            await ctx.send(str(e), delete_after=10)
+
+    elif not subcommand:
+        current = _radio.get_mood(gid)
+        lines = []
+        for m in _radio.MOODS:
+            marker = " ← actual" if m == current else ""
+            lines.append(f"`{m}`{marker}")
+        custom = _radio._custom_moods.get(gid, {})
+        if custom:
+            lines.append("")
+            for m in custom:
+                marker = " ← actual" if m == current else ""
+                lines.append(f"`{m}` [custom]{marker}")
+        embed = discord.Embed(
+            title="🎭 Moods disponibles",
+            description="\n".join(lines),
+            color=0x1DB954,
+        )
+        await ctx.send(embed=embed, delete_after=20)
+
+    else:
+        name = subcommand
+        all_moods = {**_radio.MOODS, **_radio._custom_moods.get(gid, {})}
+        if name not in all_moods:
+            available = ", ".join(f"`{m}`" for m in all_moods)
+            await ctx.send(f"Mood desconocido. Disponibles: {available}", delete_after=10)
+            return
+        try:
+            _radio.set_mood(gid, name)
+        except ValueError as e:
+            await ctx.send(str(e), delete_after=10)
+            return
+        embed = discord.Embed(
+            title=f"🎭 Mood cambiado a {name.capitalize()}",
+            description="El siguiente batch de recomendaciones usara este estilo.",
+            color=0x1DB954,
+        )
+        await ctx.send(embed=embed, delete_after=10)
+
     try:
         await ctx.message.delete()
     except Exception:

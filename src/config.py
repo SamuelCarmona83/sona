@@ -68,6 +68,8 @@ FFMPEG_OPTIONS = {
 
 SEARCH_RESULT_COUNT = 5
 MIN_SEARCH_SCORE = 6.0
+RADIO_QUEUE_MIN = 3   # Fill trigger: radio refills when queue drops below this
+RADIO_FILL_COUNT = 5  # Target queue size after a radio fill
 LLM_SCORE_MARGIN = 4.5  # Increased from 3.0 to reduce LLM calls; only use when candidates very close
 LLM_RANKING_TIMEOUT = 8.0
 LLM_ENABLED_FOR_ALBUM_TRACKS = 3  # Only use LLM for first N tracks in bulk operations
