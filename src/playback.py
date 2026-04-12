@@ -312,7 +312,8 @@ async def _update_status(guild: discord.Guild, title: str | None):
     if not vc:
         logger.warning("_update_status: no hay voice_client activo, no se puede actualizar estado")
         return
-    status_text = f"\U0001f3b5 {title}" if title else ""
+    # \U0001f3b5 is the musical note emoji 🎵
+    status_text = f"{title}" if title else ""
     logger.info(f"_update_status: actualizando canal {vc.channel.id} con estado: '{status_text}'")
     try:
         route = discord.http.Route(
