@@ -68,7 +68,7 @@ class LocalBot:
     def _player_panel(self) -> Panel:
         """Build a Rich panel that simulates a Discord player embed."""
         if not self.now_playing:
-            body = Text("Nada reproduciendose.", style="dim")
+            body = Text("Nada reproduciéndose.", style="dim")
             return Panel(
                 body,
                 title="🎵 Reproductor",

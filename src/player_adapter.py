@@ -113,7 +113,10 @@ class FfplayAudioPlayer(AudioPlayer):
         # -vn        → skip video (supported by ffplay)
         # -bufsize    → ignored (ffplay doesn't accept -bufsize as a global option)
         # -af <filter> → supported by ffplay
-        extra_opts = [p for p in shlex.split(options) if not p.startswith("-bufsize")]
+        extra_opts = [
+            p for p in shlex.split(options)
+            if p != "-bufsize" and not p.startswith("-bufsize=") and p not in ("-vn",)
+        ]
         cmd += extra_opts
         cmd.append(url)
 
@@ -124,8 +127,8 @@ class FfplayAudioPlayer(AudioPlayer):
             self._paused = False
             self._monitor_task = asyncio.create_task(self._monitor(after))
         except FileNotFoundError:
-            logger.error("ffplay no encontrado. Instala ffmpeg/ffplay.")
-            after(Exception("ffplay not found — instala ffmpeg"))
+            logger.error("ffplay no encontrado. Instala ffmpeg.")
+            after(Exception("ffplay not found — install ffmpeg"))
 
     async def _monitor(self, after: Callable[[Optional[Exception]], None]) -> None:
         """Wait for the ffplay process to finish and call *after*."""
