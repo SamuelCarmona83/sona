@@ -103,6 +103,46 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
     await ctx.send(f"Error inesperado: `{error}`")
     logger.error(f"[ERROR] {ctx.command}: {error}")
 
+
+@bot.event
+async def on_voice_state_update(
+    member: discord.Member,
+    before: discord.VoiceState,
+    after: discord.VoiceState,
+) -> None:
+    """Stop radio and disconnect if bot is alone in the voice channel."""
+    from src import radio as _radio
+    
+    # Only care if someone left a voice channel
+    if before.channel is None or after.channel == before.channel:
+        return
+    
+    # Check if the bot is in this channel
+    vc = before.guild.voice_client
+    if vc is None or vc.channel != before.channel:
+        return
+    
+    # Count non-bot members in the channel
+    human_members = [
+        m for m in before.channel.members
+        if not m.bot and m.id != member.id  # exclude the member who just left and bots
+    ]
+    
+    # If no humans left, stop the radio and disconnect
+    if not human_members:
+        logger.info(
+            "on_voice_state_update: bot is alone in channel %s (guild %s), stopping radio and disconnecting",
+            before.channel.id,
+            before.guild.id,
+        )
+        _radio.set_radio_active(before.guild.id, False)
+        queues[before.guild.id] = collections.deque()
+        now_playing_info[before.guild.id] = None
+        _paused[before.guild.id] = False
+        vc.stop()
+        await vc.disconnect()
+
+
 @bot.command(name="ping", help="Comprueba que el bot esta vivo.")
 async def ping(ctx: commands.Context):
     await ctx.send(f"Pong! Latencia: {round(bot.latency * 1000)}ms")
@@ -541,16 +581,27 @@ async def remove_cmd(ctx: commands.Context, pos: int):
         pass
 
 
-@bot.command(name="radio", help="Activa/desactiva el modo radio 24/7. Uso: !radio [on|off]")
+@bot.command(name="radio", help="Activa/desactiva el modo radio 24/7. Uso: !radio [on|off|<mood>]")
 async def radio_cmd(ctx: commands.Context, action: str = ""):
     from src import radio as _radio
     gid = ctx.guild.id
     action = action.strip().lower()
-    if action in ("on", "off"):
+
+    # Check if action is a known mood name → activate radio with that mood
+    all_moods = {**_radio.MOODS, **_radio._custom_moods.get(gid, {})}
+    if action and action not in ("on", "off") and action in all_moods:
+        _radio.set_radio_active(gid, True)
+        try:
+            _radio.set_mood(gid, action)
+        except ValueError:
+            pass
+        active = True
+    elif action in ("on", "off"):
         active = action == "on"
+        _radio.set_radio_active(gid, active)
     else:
         active = not _radio.is_radio_active(gid)  # toggle if no argument
-    _radio.set_radio_active(gid, active)
+        _radio.set_radio_active(gid, active)
 
     if active:
         embed = discord.Embed(
@@ -601,19 +652,60 @@ async def mood_cmd(ctx: commands.Context, *, args: str = ""):
             return
         msg = await ctx.send(f"\U0001f50d Buscando géneros para **{query}**...")
         from src.spotify import _get_artist_genres
-        info = await _get_spotify_track_info(query)
-        artist_id = info.get("artist_id")
-        if not artist_id:
-            await msg.edit(content="No se encontró el artista en Spotify. Intenta con otro query.")
-            return
-        genres = await _get_artist_genres(artist_id)
+
+        # --- Try full query first, then individual comma/space-split terms ---
+        async def _collect_genres(q: str) -> list[str]:
+            info = await _get_spotify_track_info(q)
+            aid = info.get("artist_id")
+            if not aid:
+                return []
+            return await _get_artist_genres(aid)
+
+        genres: list[str] = await _collect_genres(query)
+
         if not genres:
-            await msg.edit(content="El artista no tiene géneros registrados en Spotify. Prueba con otro artista.")
-            return
+            # Split by comma first; otherwise slide a 2-word window left→right
+            raw_terms: list[str] = (
+                [t.strip() for t in query.split(",") if t.strip()]
+                if "," in query
+                else [
+                    " ".join(query.split()[i : i + 2])
+                    for i in range(0, len(query.split()), 2)
+                    if query.split()[i : i + 2]
+                ]
+            )
+            seen: set[str] = set()
+            for term in raw_terms:
+                for g in await _collect_genres(term):
+                    if g not in seen:
+                        seen.add(g)
+                        genres.append(g)
+
+        using_raw_tokens = False
+        if not genres:
+            # Last resort: store the raw query tokens as YouTube-friendly genre hints
+            if "," in query:
+                genres = [t.strip() for t in query.split(",") if t.strip()]
+            else:
+                words = query.split()
+                genres = [
+                    " ".join(words[i : i + 2])
+                    for i in range(0, len(words), 2)
+                    if words[i : i + 2]
+                ]
+            using_raw_tokens = True
+
         _radio.create_custom_mood(gid, mood_name, genres)
+        genre_display = ", ".join(f"`{g}`" for g in genres[:8])
+        if using_raw_tokens:
+            description = (
+                f"Sin géneros Spotify detectados. El radio buscará en YouTube: {genre_display}"
+            )
+        else:
+            description = f"Géneros: {genre_display}"
         embed = discord.Embed(
             title=f"🎭 Mood custom creado: {mood_name}",
-            description=f"Géneros: {', '.join(f'`{g}`' for g in genres[:8])}",
+            description=description,
             color=0x1DB954,
         )
         await msg.edit(content=None, embed=embed)

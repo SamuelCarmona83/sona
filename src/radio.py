@@ -245,10 +245,16 @@ def _build_diversity_seeds(guild_id: int) -> tuple[list[str], list[str]]:
     4. If no seeds at all (no history, neutral mood) → fall back to diverse genre set.
     """
     mood = get_mood(guild_id)
-    mood_seed_genres = (
+    raw_mood_genres = (
         _custom_moods.get(guild_id, {}).get(mood)
         or MOODS.get(mood, [])
-    )[:2]  # up to 2 mood genre seeds
+    )
+    # Only pass Spotify-valid genre seeds (single-word or hyphenated, known in cluster map).
+    # Free-text tokens from raw-token moods are kept for YouTube fallback only.
+    mood_seed_genres = [
+        g for g in raw_mood_genres
+        if g in _GENRE_CLUSTER_MAP or ("-" in g and " " not in g)
+    ][:2]
 
     history = list(_play_history.get(guild_id, []))
     if not history:
