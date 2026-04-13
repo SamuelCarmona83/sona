@@ -284,8 +284,24 @@ def _build_diversity_seeds(guild_id: int) -> tuple[list[str], list[str]]:
         if sid:
             cluster_tracks.setdefault(c, []).append(sid)
 
+    # When a specific mood is active (not neutral/mixed), only consider seed
+    # tracks whose cluster matches the mood.  This prevents leftover hiphop
+    # history from seeding metal recommendations (and vice-versa).
+    mood_cluster: str | None = None
+    if mood not in ("neutral", "mixed"):
+        for g in raw_mood_genres:
+            mood_cluster = _GENRE_CLUSTER_MAP.get(g)
+            if mood_cluster:
+                break
+
+    if mood_cluster:
+        matching = cluster_tracks.get(mood_cluster, [])
+        filtered_clusters = {mood_cluster: matching} if matching else {}
+    else:
+        filtered_clusters = cluster_tracks
+
     # Sort clusters by count ascending → underrepresented first
-    sorted_clusters = sorted(cluster_tracks.items(), key=lambda x: len(x[1]))
+    sorted_clusters = sorted(filtered_clusters.items(), key=lambda x: len(x[1]))
 
     # Pick 1 track ID from each cluster (underrepresented first) until we have
     # enough to fill remaining slots after mood genres
