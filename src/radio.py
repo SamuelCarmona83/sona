@@ -358,7 +358,7 @@ async def _youtube_fallback_fill(guild_id: int, needed: int) -> list[dict]:
     from src.youtube import search_youtube
     results: list[dict] = []
     for q in queries[:needed]:
-        yt_info = await search_youtube(q, enable_llm=False)
+        yt_info = await search_youtube(q, enable_llm=False, trusted=True)
         if not yt_info:
             continue
         artist, _title = _split_query_parts(q)
@@ -434,7 +434,7 @@ async def fill_radio_queue(
                 yt_info = info.get("yt_info")
             else:
                 enable_llm = idx < LLM_ENABLED_FOR_ALBUM_TRACKS
-                yt_info = await search_youtube(info["query"], enable_llm=enable_llm)
+                yt_info = await search_youtube(info["query"], enable_llm=enable_llm, trusted=True)
             if not yt_info:
                 return None
             artist, _title = _split_query_parts(info["query"])

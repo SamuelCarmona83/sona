@@ -195,11 +195,12 @@ async def play(ctx: commands.Context, *, query: str):
         queues[ctx.guild.id] = collections.deque()
 
     # Search YouTube for all queries in parallel and build track objects
+    from_spotify = _is_spotify_url(query)
     tracks_to_queue = []
     if len(yt_queries) == 1:
         # Single track: no gather overhead needed
         info = yt_queries[0]  # {query, spotify_id, artist_id}
-        yt_info = await search_youtube(info["query"], enable_llm=True)
+        yt_info = await search_youtube(info["query"], enable_llm=True, trusted=from_spotify)
         if yt_info:
             artist, title = _split_query_parts(info["query"])
             tracks_to_queue.append({
@@ -219,7 +220,7 @@ async def play(ctx: commands.Context, *, query: str):
         # Album / playlist: search all tracks concurrently
         async def _fetch(idx: int, info: dict) -> dict | None:
             enable_llm = idx < LLM_ENABLED_FOR_ALBUM_TRACKS
-            yt_info = await search_youtube(info["query"], enable_llm=enable_llm)
+            yt_info = await search_youtube(info["query"], enable_llm=enable_llm, trusted=from_spotify)
             if not yt_info:
                 return None
             artist, title = _split_query_parts(info["query"])

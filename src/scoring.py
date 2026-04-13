@@ -14,10 +14,11 @@ logger = logging.getLogger(__name__)
 
 
 def _normalize_text(value: str) -> str:
-    text = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode("ascii")
+    text = unicodedata.normalize("NFKC", value)
     text = text.lower().replace("&", " and ")
     text = re.sub(r"[\[\](){}|]", " ", text)
-    text = re.sub(r"[^a-z0-9\s-]", " ", text)
+    # Keep Unicode letters/digits so non-Latin scripts survive comparison
+    text = re.sub(r"[^\w\s-]", " ", text, flags=re.UNICODE)
     text = re.sub(r"\s+", " ", text)
     return text.strip()
 
@@ -89,8 +90,11 @@ def _build_search_queries(query: str) -> list[str]:
     if artist and title:
         queries.append(f"{artist} - {title} official audio")
         queries.append(f"{artist} {title} topic")
+        # Extra: title-only fallback helps when artist name confuses YT
+        queries.append(f"{title} {artist}")
     else:
         queries.append(f"{query} official audio")
+        queries.append(f"{query} topic")
     seen = set()
     unique_queries = []
     for item in queries:

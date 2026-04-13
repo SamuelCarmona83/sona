@@ -161,13 +161,22 @@ async def get_search_candidates(query: str) -> list[dict]:
     return []
 
 
-async def search_youtube(query: str, enable_llm: bool = True) -> dict | None:
-    """Search YouTube and return the best scored candidate, using the LLM as tie-breaker."""
+async def search_youtube(query: str, enable_llm: bool = True, *, trusted: bool = False) -> dict | None:
+    """Search YouTube and return the best scored candidate, using the LLM as tie-breaker.
+
+    When *trusted* is True (e.g. query comes from a Spotify URL where we already
+    know the exact track), accept the best candidate even if its score is below
+    MIN_SEARCH_SCORE — as long as it exceeds a lower safety floor.
+    """
+    TRUSTED_FLOOR = 3.0  # absolute minimum even for trusted queries
+
     # Check cache first (reduces redundant YouTube searches)
     cache_key = _normalize_text(query)
     if cache_key in _search_cache:
         logger.info(f"search_youtube: usando resultado en cache para '{query}'")
         return _search_cache[cache_key]
+
+    best_overall: dict | None = None  # track the best candidate across all queries
 
     for candidate_query in _build_search_queries(query):
         candidates = await _search_youtube_candidates(candidate_query)
@@ -180,6 +189,10 @@ async def search_youtube(query: str, enable_llm: bool = True) -> dict | None:
             for c in scored[:3]
         )
         logger.info(f"search_youtube: top candidatos para '{query}': {preview}")
+
+        # Keep track of the absolute best candidate across all query variants
+        if best_overall is None or scored[0]["score"] > best_overall["score"]:
+            best_overall = scored[0]
 
         if scored[0]["score"] < MIN_SEARCH_SCORE:
             continue
@@ -214,6 +227,17 @@ async def search_youtube(query: str, enable_llm: bool = True) -> dict | None:
         # Cache the result for future queries
         _search_cache[cache_key] = best
         return best
+
+    # Trusted fallback: accept best candidate above the safety floor
+    if trusted and best_overall and best_overall["score"] >= TRUSTED_FLOOR:
+        logger.info(
+            "search_youtube: trusted fallback '%s' para '%s' (score=%.2f)",
+            best_overall["title"],
+            query,
+            best_overall["score"],
+        )
+        _search_cache[cache_key] = best_overall
+        return best_overall
 
     logger.warning(f"search_youtube: no hubo candidato confiable para '{query}'")
     return None
