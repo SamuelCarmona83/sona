@@ -753,47 +753,16 @@ async def playlist_cmd(ctx: commands.Context, *, url: str):
 
     msg = await ctx.send("📋 Cargando playlist de Spotify...")
 
-    # Extract playlist ID from URL or plain ID
-    import re as _re
-    match = _re.search(r"playlist[:/]([A-Za-z0-9]+)", url)
-    playlist_id = match.group(1) if match else url.strip()
-
     try:
-        # Fetch all tracks (Spotify paginates at 50 for playlist_items)
-        def _fetch_all_tracks(pid):
-            tracks = []
-            offset = 0
-            limit = 50
-            while True:
-                result = sp.playlist_items(pid, offset=offset, limit=limit, market="from_token")
-                items = result.get("items", [])
-                if not items:
-                    break
-                for item in items:
-                    t = item.get("track")
-                    if t and t.get("name"):
-                        artists = ", ".join(a["name"] for a in t.get("artists", []))
-                        tracks.append(f"{artists} - {t['name']}")
-                offset += limit
-            return tracks
-
-        track_queries = await asyncio.to_thread(_fetch_all_tracks, playlist_id)
+        track_infos = await _get_tracks_from_spotify_url(url)
     except Exception as e:
-        err = str(e)
-        if "404" in err:
-            embed = error_embed(
-                "No se pudo acceder a esta playlist",
-                "Las playlists editoriales de Spotify (Daily Mix, Top 50, etc.) no son accesibles por bots de terceros — solo funcionan playlists propias o compartidas.",
-                err[:200]
-            )
-            await msg.edit(embed=embed)
-        else:
-            embed = error_embed("Error cargando la playlist", details=err[:200])
-            await msg.edit(embed=embed)
+        embed = error_embed("Error cargando la playlist", details=str(e)[:200])
+        await msg.edit(embed=embed)
         return
 
-    if not track_queries:
-        await msg.edit(content="La playlist esta vacia o no se pudo leer.")
+    if not track_infos:
+        embed = error_embed("Error cargando la playlist", details="URL de Spotify no válida o sin canciones.")
+        await msg.edit(embed=embed)
         return
 
     voice_channel = ctx.author.voice.channel
@@ -807,15 +776,18 @@ async def playlist_cmd(ctx: commands.Context, *, url: str):
         queues[ctx.guild.id] = collections.deque()
 
     # Enqueue all tracks lazily (url=None, resolved just before playback)
-    for q_str in track_queries:
+    for info in track_infos:
+        q_str = info["query"]
         queues[ctx.guild.id].append({
-            "title":     q_str,
-            "yt_query":  q_str,
-            "url":       None,
-            "requester": ctx.author.display_name,
+            "title":      q_str,
+            "yt_query":   q_str,
+            "url":        None,
+            "requester":  ctx.author.display_name,
+            "spotify_id": info.get("spotify_id"),
+            "artist_id":  info.get("artist_id"),
         })
 
-    await msg.edit(content=f"✅ {len(track_queries)} canciones añadidas a la cola.")
+    await msg.edit(content=f"✅ {len(track_infos)} canciones añadidas a la cola.")
 
     # Start playing if nothing is currently playing
     if not (vc.is_playing() or vc.is_paused()):
