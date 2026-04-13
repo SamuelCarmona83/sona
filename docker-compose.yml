@@ -5,11 +5,15 @@ services:
     ports:
       - "8888:8888"
     volumes:
-      # .env is read by the app itself (load_dotenv_values), not by Docker
-      - ./.env:/app/.env:ro
       # Persist the Spotify OAuth token between restarts
       - ./spotify_cache:/app/.cache
     environment:
-      SPOTIFY_CACHE_PATH: /app/.cache/spotify.cache
+      # Required — set these in your CI/CD secrets or shell environment before running
+      BOT_TOKEN: ${BOT_TOKEN}
+      SPOTIFY_CLIENT_ID: ${SPOTIFY_CLIENT_ID}
+      SPOTIFY_CLIENT_SECRET: ${SPOTIFY_CLIENT_SECRET}
+      SPOTIFY_REDIRECT_URI: ${SPOTIFY_REDIRECT_URI:-http://localhost:8888/callback}
+      # Optional
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-      NORMALIZE_AUDIO: true
+      NORMALIZE_AUDIO: ${NORMALIZE_AUDIO:-true}
+      SPOTIFY_CACHE_PATH: /app/.cache/spotify.cache

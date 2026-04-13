@@ -117,9 +117,20 @@ def build_spotify_client(dotenv_values: dict) -> spotipy.Spotify:
     )
 
 
+APP_MODE = os.getenv("APP_MODE", "discord").lower()
+
 dotenv_values = load_dotenv_values()
 bot_token = get_config_value("BOT_TOKEN", dotenv_values)
-if not bot_token:
+if not bot_token and APP_MODE != "local":
     raise ValueError("Falta BOT_TOKEN en variables de entorno o en .env.")
 
-sp = build_spotify_client(dotenv_values)
+try:
+    sp = build_spotify_client(dotenv_values)
+except ValueError as _sp_err:
+    if APP_MODE != "local":
+        raise
+    logger.warning(
+        "Spotify no configurado — modo local funcionará sin refinamiento Spotify: %s",
+        _sp_err,
+    )
+    sp = None  # type: ignore[assignment]
