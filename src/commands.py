@@ -258,9 +258,15 @@ async def play(ctx: commands.Context, *, query: str):
     from src import radio as _radio
     radio_on = _radio.is_radio_active(ctx.guild.id)
     if radio_on and (vc.is_playing() or vc.is_paused()):
-        # appendleft in reverse order so first requested track ends up at position 0
-        for track in reversed(tracks_to_queue):
-            queues[ctx.guild.id].appendleft(track)
+        # Insert user tracks before the first radio track in queue
+        items = list(queues[ctx.guild.id])
+        insert_idx = next(
+            (i for i, t in enumerate(items) if t.get("requester") == "📻 Radio"),
+            len(items),
+        )
+        for i, track in enumerate(tracks_to_queue):
+            items.insert(insert_idx + i, track)
+        queues[ctx.guild.id] = collections.deque(items)
     else:
         for track in tracks_to_queue:
             queues[ctx.guild.id].append(track)
@@ -355,8 +361,18 @@ async def search(ctx: commands.Context, *, query: str):
             "thumbnail":  selected.get("thumbnail") or "",
         }
 
-        # Add to queue
-        queues[ctx.guild.id].append(track)
+        # Add to queue (user tracks go before radio tracks)
+        from src import radio as _radio
+        if _radio.is_radio_active(ctx.guild.id) and (vc.is_playing() or vc.is_paused()):
+            items = list(queues[ctx.guild.id])
+            insert_idx = next(
+                (i for i, t in enumerate(items) if t.get("requester") == "📻 Radio"),
+                len(items),
+            )
+            items.insert(insert_idx, track)
+            queues[ctx.guild.id] = collections.deque(items)
+        else:
+            queues[ctx.guild.id].append(track)
 
         # Try to play
         if not (vc.is_playing() or vc.is_paused()):
@@ -752,9 +768,15 @@ async def mood_cmd(ctx: commands.Context, *, args: str = ""):
         except ValueError as e:
             await ctx.send(str(e), delete_after=10)
             return
+        # Flush radio tracks and refill with new mood
+        removed = _radio.flush_radio_tracks(gid)
+        if _radio.is_radio_active(gid):
+            vc = ctx.guild.voice_client
+            if vc:
+                asyncio.ensure_future(_radio.fill_radio_queue(ctx.guild, vc, ctx.channel))
         embed = discord.Embed(
             title=f"🎭 Mood cambiado a {name.capitalize()}",
-            description="El siguiente batch de recomendaciones usara este estilo.",
+            description=f"Se removieron {removed} canciones del mood anterior." if removed else "El siguiente batch usara este estilo.",
             color=0x1DB954,
         )
         await ctx.send(embed=embed, delete_after=10)
@@ -811,26 +833,37 @@ async def help_cmd(ctx: commands.Context):
         color=0x1DB954
     )
     commands_info = [
-        ("!play <cancion>", "Reproduce una cancion. Acepta URLs de Spotify."),
+        ("🎵 Reproduccion", None),
+        ("!play <cancion>", "Reproduce una cancion. Acepta URLs de Spotify (tracks, albums)."),
+        ("!search <cancion>", "Busca canciones y te permite elegir entre resultados."),
         ("!playlist <url>", "Carga una playlist de Spotify en la cola."),
         ("!skip", "Salta la cancion actual."),
         ("!pause", "Pausa la reproduccion."),
         ("!resume", "Reanuda la reproduccion."),
         ("!stop", "Detiene la reproduccion y limpia la cola."),
         ("!leave", "Desconecta el bot del canal de voz."),
+        ("📋 Cola", None),
         ("!queue", "Muestra la cola de reproduccion."),
         ("!np", "Muestra la cancion actual."),
         ("!shuffle", "Mezcla la cola aleatoriamente."),
         ("!move <de> <a>", "Mueve una cancion a otra posicion en la cola."),
         ("!remove <pos>", "Elimina una cancion de la cola."),
         ("!priority <pos>", "Mueve una cancion al tope de la cola."),
-        ("!search <cancion>", "Busca canciones en Spotify."),
+        ("📻 Radio", None),
+        ("!radio [on|off]", "Activa/desactiva el modo radio 24/7 con recomendaciones."),
+        ("!mood [nombre]", "Lista moods disponibles o cambia el mood del radio."),
+        ("!mood create <nombre> <query>", "Crea un mood custom basado en un artista/cancion."),
+        ("!mood delete <nombre>", "Elimina un mood custom."),
+        ("⚙️ Otros", None),
         ("!auth", "Autenticacion de Spotify (solo admin)."),
         ("!ping", "Verifica que el bot este vivo."),
     ]
     for cmd, desc in commands_info:
-        embed.add_field(name=cmd, value=desc, inline=False)
-    embed.set_footer(text="Tambien puedes usar los botones del embed")
+        if desc is None:
+            embed.add_field(name=f"\u200b\n**{cmd}**", value="\u200b", inline=False)
+        else:
+            embed.add_field(name=cmd, value=desc, inline=False)
+    embed.set_footer(text="Tambien puedes usar los botones del embed del reproductor")
     await ctx.send(embed=embed, delete_after=60)
 
 

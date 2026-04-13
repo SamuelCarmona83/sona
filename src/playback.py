@@ -154,7 +154,12 @@ class PlayerView(discord.ui.View):
         idx = mood_names.index(current) if current in mood_names else 0
         next_mood = mood_names[(idx + 1) % len(mood_names)]
         _radio.set_mood(gid, next_mood)
+        _radio.flush_radio_tracks(gid)
         await interaction.response.defer()
+        if _radio.is_radio_active(gid):
+            vc = interaction.guild.voice_client
+            if vc:
+                asyncio.ensure_future(_radio.fill_radio_queue(interaction.guild, vc, interaction.channel))
         await update_player_embed(interaction.guild, interaction.channel)
 
 

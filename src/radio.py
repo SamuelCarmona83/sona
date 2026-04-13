@@ -184,6 +184,20 @@ def delete_custom_mood(guild_id: int, name: str) -> None:
     _save_custom_moods()
 
 
+def flush_radio_tracks(guild_id: int) -> int:
+    """Remove radio-auto-queued tracks from queue, keep user tracks. Returns removed count."""
+    from src.playback import queues
+    q = queues.get(guild_id)
+    if not q:
+        return 0
+    items = list(q)
+    kept = [t for t in items if t.get("requester") != "📻 Radio"]
+    removed = len(items) - len(kept)
+    queues[guild_id] = collections.deque(kept)
+    logger.info("flush_radio_tracks: guild=%s removed=%d kept=%d", guild_id, removed, len(kept))
+    return removed
+
+
 async def record_played(guild_id: int, track: dict) -> None:
     """Record a track in the guild's play history for diversity seeding."""
     if guild_id not in _play_history:
