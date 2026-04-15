@@ -53,12 +53,12 @@ def _run_callback_server():
 
 def _is_spotify_url(query: str) -> bool:
     """Check if query is a Spotify URL."""
-    return bool(re.match(r"https?://(open\.)?spotify\.com/(track|album|playlist)", query))
+    return bool(re.search(r"spotify\.com/(?:[a-z]{2}(?:-[a-zA-Z]{2,4})?/)?(track|album|playlist)/", query))
 
 
 def _parse_spotify_url(url: str) -> dict | None:
     """Parse Spotify URL and return {type, id}. Returns None if not a valid Spotify URL."""
-    match = re.search(r"spotify\.com/(track|album|playlist)/([a-zA-Z0-9]+)", url)
+    match = re.search(r"spotify\.com/(?:[a-z]{2}(?:-[a-zA-Z]{2,4})?/)?(track|album|playlist)/([a-zA-Z0-9]+)", url)
     if match:
         return {"type": match.group(1), "id": match.group(2)}
     return None

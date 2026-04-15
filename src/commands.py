@@ -118,7 +118,7 @@ async def on_voice_state_update(
         return
     
     # Check if the bot is in this channel
-    vc = before.guild.voice_client
+    vc = member.guild.voice_client
     if vc is None or vc.channel != before.channel:
         return
     
@@ -133,12 +133,12 @@ async def on_voice_state_update(
         logger.info(
             "on_voice_state_update: bot is alone in channel %s (guild %s), stopping radio and disconnecting",
             before.channel.id,
-            before.guild.id,
+            member.guild.id,
         )
-        _radio.set_radio_active(before.guild.id, False)
-        queues[before.guild.id] = collections.deque()
-        now_playing_info[before.guild.id] = None
-        _paused[before.guild.id] = False
+        _radio.set_radio_active(member.guild.id, False)
+        queues[member.guild.id] = collections.deque()
+        now_playing_info[member.guild.id] = None
+        _paused[member.guild.id] = False
         vc.stop()
         await vc.disconnect()
 
@@ -289,6 +289,13 @@ async def search(ctx: commands.Context, *, query: str):
 
     voice_channel = ctx.author.voice.channel
     msg = await ctx.send(f"\U0001f50d Buscando **{query}**...", delete_after=60)
+
+    # Resolve Spotify URLs to track name before searching YouTube
+    if _is_spotify_url(query):
+        spotify_infos = await _get_tracks_from_spotify_url(query)
+        if spotify_infos:
+            query = spotify_infos[0]["query"]
+            await msg.edit(content=f"\U0001f50d Buscando **{query}**...")
 
     # Get top 5 candidates
     candidates = await get_search_candidates(query)

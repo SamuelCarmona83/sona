@@ -28,6 +28,9 @@ MOODS: dict[str, list[str]] = {
     "metal":    ["metal", "heavy-metal", "thrash-metal"],
     "hiphop":   ["hip-hop", "rap", "trap"],
     "techno":   ["techno", "minimal-techno", "electronic"],
+    "dubstep":  ["dubstep", "drum-and-bass", "breakbeat"],
+    "hardcore": ["hardcore", "hardstyle", "speedcore"],
+    "gabber":   ["gabber", "hardcore", "industrial"],
     "chill":    ["chill", "lo-fi", "ambient"],
     "rock":     ["rock", "alternative", "indie"],
     "pop":      ["pop", "dance-pop"],
@@ -52,6 +55,9 @@ _GENRE_CLUSTER_MAP: dict[str, str] = {
     "techno": "techno", "minimal-techno": "techno", "electronic": "techno",
     "house": "techno", "trance": "techno", "edm": "techno",
     "ambient": "techno", "idm": "techno",
+    "gabber": "techno", "hardstyle": "techno", "speedcore": "techno",
+    "hardcore": "techno", "industrial": "techno", "drum-and-bass": "techno",
+    "dubstep": "techno", "breakbeat": "techno", "noise": "techno",
     # Rock family
     "rock": "rock", "alternative": "rock", "indie": "rock",
     "punk": "rock", "emo": "rock", "grunge": "rock", "post-rock": "rock",
@@ -267,7 +273,7 @@ def _build_diversity_seeds(guild_id: int) -> tuple[list[str], list[str]]:
     # Free-text tokens from raw-token moods are kept for YouTube fallback only.
     mood_seed_genres = [
         g for g in raw_mood_genres
-        if g in _GENRE_CLUSTER_MAP or ("-" in g and " " not in g)
+        if g in _GENRE_CLUSTER_MAP or " " not in g
     ][:2]
 
     history = list(_play_history.get(guild_id, []))
