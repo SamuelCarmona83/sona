@@ -23,6 +23,86 @@ from src.scoring import _normalize_text, _build_search_queries, _rank_candidates
 
 logger = logging.getLogger(__name__)
 
+# Max tracks to extract from a YouTube/YouTube Music playlist
+_YT_PLAYLIST_MAX = 50
+
+
+# ---------------------------------------------------------------------------
+# YouTube / YouTube Music URL helpers
+# ---------------------------------------------------------------------------
+
+_YT_URL_RE = re.compile(
+    r"(?:https?://)?(?:www\.|music\.)?(?:youtube\.com|youtu\.be)/",
+    re.IGNORECASE,
+)
+
+
+def _is_youtube_url(query: str) -> str | None:
+    """Return ``'track'``, ``'playlist'``, or ``None``."""
+    if not _YT_URL_RE.search(query):
+        return None
+    if re.search(r"[?&]list=", query):
+        return "playlist"
+    if re.search(r"youtu\.be/|[?&]v=|/watch", query):
+        return "track"
+    return None
+
+
+async def extract_youtube_tracks(url: str) -> list[dict]:
+    """Extract track(s) from a YouTube / YouTube Music URL via yt-dlp.
+
+    * Single video → 1-item list with resolved streaming URL.
+    * Playlist     → list of ``{title, url (None – lazy), yt_query, duration, thumbnail, uploader}``
+      capped at ``_YT_PLAYLIST_MAX``.
+    """
+    url_type = _is_youtube_url(url)
+    if not url_type:
+        return []
+
+    def _extract():
+        opts = {
+            **YTDL_OPTIONS,
+            "logger": _YtDlpLogger(),
+            "noplaylist": url_type == "track",
+        }
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            try:
+                info = ydl.extract_info(url, download=False)
+            except yt_dlp.utils.DownloadError as e:
+                logger.warning("extract_youtube_tracks: DownloadError: %s", e)
+                return []
+            if not info:
+                return []
+
+            entries = info.get("entries")  # None for single video
+            if entries is None:
+                entries = [info]
+
+            tracks: list[dict] = []
+            for entry in entries:
+                if not entry:
+                    continue
+                if entry.get("availability") in (
+                    "needs_auth", "subscriber_only", "premium_only", "unavailable",
+                ):
+                    continue
+                title = entry.get("title") or "Unknown"
+                tracks.append({
+                    "title": title,
+                    "url": entry.get("url") if url_type == "track" else None,
+                    "yt_query": title,
+                    "duration": entry.get("duration") or 0,
+                    "thumbnail": entry.get("thumbnail") or "",
+                    "uploader": entry.get("uploader") or "",
+                    "acodec": entry.get("acodec") or "?",
+                    "abr": entry.get("abr") or 0,
+                })
+                if len(tracks) >= _YT_PLAYLIST_MAX:
+                    break
+            return tracks
+
+    return await asyncio.to_thread(_extract)
+
 _anthropic_client = None
 _search_cache: dict[str, dict] = {}  # Cache YouTube search results to avoid redundant queries
 

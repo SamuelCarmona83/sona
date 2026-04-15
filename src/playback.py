@@ -5,7 +5,7 @@ import random
 
 import discord
 
-from src.config import FFMPEG_OPTIONS
+from src.config import FFMPEG_OPTIONS, DJ_ANNOUNCER_ENABLED, DJ_FUN_FACT_INTERVAL
 from src.youtube import search_youtube
 from src.bot_instance import bot
 
@@ -19,6 +19,10 @@ now_playing_info: dict[int, dict | None] = {}
 _prefetch_tasks: dict[int, asyncio.Task | None] = {}
 _player_messages: dict[int, discord.Message | None] = {}
 _paused: dict[int, bool] = {}
+_last_cluster: dict[int, str | None] = {}  # DJ announcer: last genre cluster per guild
+_prefetch_dj: dict[int, str | None] = {}   # DJ announcer: pre-generated TTS file path
+_welcome_active: dict[int, bool] = {}       # Guard: prevent duplicate welcome per guild
+_songs_since_comment: dict[int, int] = {}   # DJ fun-fact counter per guild
 
 
 # ---------------------------------------------------------------------------
@@ -142,7 +146,7 @@ class PlayerView(discord.ui.View):
         await interaction.response.defer()
         if not was_active:
             vc = interaction.guild.voice_client
-            asyncio.ensure_future(_radio.fill_radio_queue(interaction.guild, vc, interaction.channel))
+            asyncio.ensure_future(start_radio_with_welcome(interaction.guild, vc, interaction.channel))
         await update_player_embed(interaction.guild, interaction.channel)
 
     @discord.ui.button(label="\U0001f3ad Mood", style=discord.ButtonStyle.secondary, row=2)
@@ -217,13 +221,63 @@ async def _resolve_url(track: dict) -> dict | None:
 
 
 async def _prefetch_next(guild_id: int):
-    """Resolve the URL of the next queued track in the background."""
+    """Resolve the URL of the next queued track in the background.
+
+    Also pre-generates DJ transition TTS if a genre cluster change is detected,
+    so play_next has zero delay when the song ends.
+    """
     q = queues.get(guild_id)
-    if q:
-        try:
-            await _resolve_url(q[0])
-        except Exception as e:
-            logger.warning(f"_prefetch_next: error prefetching next track: {e}")
+    if not q:
+        return
+    next_track = q[0]
+    try:
+        await _resolve_url(next_track)
+    except Exception as e:
+        logger.warning(f"_prefetch_next: error prefetching next track: {e}")
+
+    # Pre-generate DJ TTS for transition (runs during current song)
+    if not DJ_ANNOUNCER_ENABLED:
+        return
+    from src import radio as _radio
+    try:
+        from src.dj_announcer import (
+            check_cooldown, generate_dj_comment, generate_fun_fact,
+            synthesize_dj_audio,
+        )
+        songs = _songs_since_comment.get(guild_id, 0)
+
+        # Priority 1: genre transition (radio only)
+        if _radio.is_radio_active(guild_id):
+            if not check_cooldown(guild_id):
+                return
+            prev_cluster = _last_cluster.get(guild_id)
+            if prev_cluster:
+                new_cluster = await _radio.get_track_cluster(next_track)
+                if new_cluster and new_cluster != prev_cluster:
+                    comment = await generate_dj_comment(
+                        prev_cluster, new_cluster,
+                        next_track.get("title", ""), next_track.get("artist", "Unknown"),
+                    )
+                    dj_file = await synthesize_dj_audio(comment, guild_id)
+                    if dj_file:
+                        _prefetch_dj[guild_id] = dj_file
+                        logger.info("_prefetch_next: pre-generated DJ transition TTS for guild=%s", guild_id)
+                    return
+
+        # Priority 2: fun fact every N songs (all modes)
+        if songs >= DJ_FUN_FACT_INTERVAL - 1:
+            cluster = await _radio.get_track_cluster(next_track) if _radio.is_radio_active(guild_id) else None
+            comment = await generate_fun_fact(
+                next_track.get("title", ""),
+                next_track.get("artist", "Unknown"),
+                cluster,
+            )
+            dj_file = await synthesize_dj_audio(comment, guild_id)
+            if dj_file:
+                _prefetch_dj[guild_id] = dj_file
+                logger.info("_prefetch_next: pre-generated DJ fun-fact TTS for guild=%s", guild_id)
+    except Exception as exc:
+        logger.debug("_prefetch_next: DJ pre-gen failed: %s", exc)
 
 
 async def play_next(guild: discord.Guild, vc: discord.VoiceClient, text_channel):
@@ -273,6 +327,50 @@ async def play_next(guild: discord.Guild, vc: discord.VoiceClient, text_channel)
     if q:
         _prefetch_tasks[guild.id] = asyncio.create_task(_prefetch_next(guild.id))
 
+    # --- DJ Announcer: use pre-generated TTS or generate on-demand ---
+    dj_file: str | None = _prefetch_dj.pop(guild.id, None)
+    _songs_since_comment[guild.id] = _songs_since_comment.get(guild.id, 0) + 1
+
+    if DJ_ANNOUNCER_ENABLED:
+        try:
+            from src.dj_announcer import mark_announced, cleanup_dj_audio
+
+            # --- Genre transition (radio mode only) ---
+            if _radio.is_radio_active(guild.id):
+                new_cluster = await _radio.get_track_cluster(track)
+                if new_cluster:
+                    prev_cluster = _last_cluster.get(guild.id)
+                    _last_cluster[guild.id] = new_cluster
+                    # On-demand transition TTS if not pre-generated
+                    if not dj_file and prev_cluster and prev_cluster != new_cluster:
+                        from src.dj_announcer import (
+                            check_cooldown, generate_dj_comment, synthesize_dj_audio,
+                        )
+                        if check_cooldown(guild.id):
+                            comment = await generate_dj_comment(
+                                prev_cluster, new_cluster,
+                                track.get("title", ""), track.get("artist", "Unknown"),
+                            )
+                            dj_file = await synthesize_dj_audio(comment, guild.id)
+
+            # --- Fun fact every N songs (all playback modes) ---
+            if not dj_file and _songs_since_comment.get(guild.id, 0) >= DJ_FUN_FACT_INTERVAL:
+                from src.dj_announcer import generate_fun_fact, synthesize_dj_audio
+                cluster = _last_cluster.get(guild.id)
+                comment = await generate_fun_fact(
+                    track.get("title", ""), track.get("artist", "Unknown"), cluster,
+                )
+                dj_file = await synthesize_dj_audio(comment, guild.id)
+
+            if dj_file:
+                mark_announced(guild.id)
+                _songs_since_comment[guild.id] = 0
+        except Exception as exc:
+            logger.warning("play_next: DJ announcer error: %s", exc)
+            if dj_file:
+                cleanup_dj_audio(dj_file)
+            dj_file = None
+
     try:
         # Use FFmpegOpusAudio directly (no probe) to avoid an extra HTTP round-trip
         # on token-authenticated YouTube stream URLs.
@@ -297,9 +395,114 @@ async def play_next(guild: discord.Guild, vc: discord.VoiceClient, text_channel)
             logger.error(f"Error en reproduccion: {error}")
         asyncio.run_coroutine_threadsafe(play_next(guild, vc, text_channel), bot.loop)
 
-    vc.play(source, after=after)
+    if dj_file:
+        # Play TTS announcement first, then chain to the actual song
+        from src.dj_announcer import cleanup_dj_audio, get_dj_ffmpeg_options
+
+        def after_dj(error):
+            cleanup_dj_audio(dj_file)
+            if error:
+                logger.warning("play_next: DJ TTS playback error: %s", error)
+            # Now play the actual song
+            try:
+                song_source = discord.FFmpegOpusAudio(track["url"], **FFMPEG_OPTIONS)
+                vc.play(song_source, after=after)
+            except Exception as e:
+                logger.warning("play_next: song source failed after DJ: %s", e)
+                asyncio.run_coroutine_threadsafe(play_next(guild, vc, text_channel), bot.loop)
+
+        try:
+            dj_source = discord.FFmpegOpusAudio(dj_file, **get_dj_ffmpeg_options())
+            vc.play(dj_source, after=after_dj)
+        except Exception as e:
+            logger.warning("play_next: DJ TTS source failed: %s", e)
+            cleanup_dj_audio(dj_file)
+            vc.play(source, after=after)
+    else:
+        vc.play(source, after=after)
     await update_player_embed(guild, text_channel)
     await _update_status(guild, track["title"])
+
+
+async def start_radio_with_welcome(
+    guild: discord.Guild,
+    vc: discord.VoiceClient,
+    text_channel,
+) -> None:
+    """Generate welcome TTS in parallel with queue fill, play welcome first."""
+    from src import radio as _radio
+    gid = guild.id
+
+    # Prevent duplicate concurrent calls per guild
+    if _welcome_active.get(gid):
+        logger.info("start_radio_with_welcome: already active for guild=%s, skipping", gid)
+        return
+    _welcome_active[gid] = True
+
+    dj_file: str | None = None
+
+    async def _gen_welcome() -> str | None:
+        if not DJ_ANNOUNCER_ENABLED:
+            return None
+        from src.dj_announcer import generate_welcome_message, synthesize_dj_audio
+        mood = _radio.get_mood(gid)
+        text = await generate_welcome_message(mood)
+        return await synthesize_dj_audio(text, gid)
+
+    async def _fill():
+        await _radio.fill_radio_queue(guild, vc, text_channel, auto_play=False)
+
+    try:
+        welcome_task = asyncio.create_task(_gen_welcome())
+        fill_task = asyncio.create_task(_fill())
+
+        # Wait for welcome with timeout (fill runs in parallel)
+        try:
+            dj_file = await asyncio.wait_for(asyncio.shield(welcome_task), timeout=15.0)
+        except asyncio.TimeoutError:
+            logger.warning("start_radio_with_welcome: welcome gen timed out, skipping")
+        except Exception as exc:
+            logger.warning("start_radio_with_welcome: welcome gen error: %s", exc)
+
+        if dj_file:
+            from src.dj_announcer import cleanup_dj_audio, get_dj_ffmpeg_options
+
+            # If vc is already playing (fill finished first), skip welcome
+            if vc.is_playing() or vc.is_paused():
+                cleanup_dj_audio(dj_file)
+            else:
+                done_event = asyncio.Event()
+
+                def after_welcome(error):
+                    cleanup_dj_audio(dj_file)
+                    if error:
+                        logger.warning("start_radio_with_welcome: TTS error: %s", error)
+                    bot.loop.call_soon_threadsafe(done_event.set)
+
+                dj_source = discord.FFmpegOpusAudio(dj_file, **get_dj_ffmpeg_options())
+                vc.play(dj_source, after=after_welcome)
+                logger.info("start_radio_with_welcome: playing welcome for guild=%s", gid)
+                try:
+                    await asyncio.wait_for(done_event.wait(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    pass
+
+        # Ensure fill completes
+        await fill_task
+
+        # Kick playback: start first song (or re-fill if queue still empty)
+        if not (vc.is_playing() or vc.is_paused()):
+            q = queues.get(gid)
+            if q:
+                await play_next(guild, vc, text_channel)
+            elif _radio.is_radio_active(gid):
+                # Fill returned 0 tracks (all deduped) — retry with auto_play
+                logger.info("start_radio_with_welcome: queue empty after fill, retrying")
+                await _radio.fill_radio_queue(guild, vc, text_channel, auto_play=True)
+    except Exception as exc:
+        logger.warning("start_radio_with_welcome: error: %s", exc)
+    finally:
+        _welcome_active.pop(gid, None)
 
 
 async def _update_status(guild: discord.Guild, title: str | None):

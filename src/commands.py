@@ -19,7 +19,7 @@ from src.spotify import (
     _get_spotify_track_info,
     _ensure_auth,
 )
-from src.youtube import search_youtube, get_search_candidates
+from src.youtube import search_youtube, get_search_candidates, _is_youtube_url, extract_youtube_tracks
 from src.scoring import _split_query_parts
 
 logger = logging.getLogger(__name__)
@@ -166,6 +166,54 @@ async def play(ctx: commands.Context, *, query: str):
 
     voice_channel = ctx.author.voice.channel
     msg = await ctx.send(f"\U0001f50d Buscando **{query}**...", delete_after=30)
+
+    # Check if query is a YouTube / YouTube Music URL
+    yt_url_type = _is_youtube_url(query)
+    if yt_url_type:
+        yt_tracks = await extract_youtube_tracks(query)
+        if not yt_tracks:
+            await msg.edit(content="No se pudo procesar la URL de YouTube.")
+            await asyncio.sleep(5)
+            try:
+                await msg.delete()
+            except Exception:
+                pass
+            return
+
+        vc = ctx.guild.voice_client
+        if vc is None:
+            vc = await voice_channel.connect()
+        elif vc.channel != voice_channel:
+            await vc.move_to(voice_channel)
+        if ctx.guild.id not in queues:
+            queues[ctx.guild.id] = collections.deque()
+
+        truncated = len(yt_tracks) >= 50  # hit the cap
+        for t in yt_tracks:
+            queues[ctx.guild.id].append({
+                "title":     t["title"],
+                "yt_query":  t["yt_query"],
+                "url":       t.get("url"),
+                "requester": ctx.author.display_name,
+                "artist":    t.get("uploader") or "Unknown",
+                "duration":  t.get("duration") or 0,
+                "thumbnail": t.get("thumbnail") or "",
+                "acodec":    t.get("acodec", "?"),
+                "abr":       t.get("abr", 0),
+            })
+
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+
+        label = yt_tracks[0]["title"] if len(yt_tracks) == 1 else f"{len(yt_tracks)} canciones"
+        suffix = " (máximo 50)" if truncated else ""
+        if vc.is_playing() or vc.is_paused():
+            await ctx.send(f"\u2795 {label}{suffix} añadida(s) a la cola.", delete_after=8)
+        else:
+            await play_next(ctx.guild, vc, ctx.channel)
+        return
 
     # Check if query is a Spotify URL (album/playlist/track)
     if _is_spotify_url(query):
@@ -644,7 +692,8 @@ async def radio_cmd(ctx: commands.Context, action: str = ""):
             if gid not in queues:
                 queues[gid] = collections.deque()
         if vc:
-            asyncio.ensure_future(_radio.fill_radio_queue(ctx.guild, vc, ctx.channel))
+            from src.playback import start_radio_with_welcome
+            asyncio.ensure_future(start_radio_with_welcome(ctx.guild, vc, ctx.channel))
     else:
         embed = discord.Embed(
             title="📻 Radio desactivado",
@@ -842,9 +891,9 @@ async def help_cmd(ctx: commands.Context):
     )
     commands_info = [
         ("🎵 Reproduccion", None),
-        ("!play <cancion>", "Reproduce una cancion. Acepta URLs de Spotify (tracks, albums)."),
+        ("!play <cancion>", "Reproduce una cancion. Acepta URLs de Spotify, YouTube y YouTube Music."),
         ("!search <cancion>", "Busca canciones y te permite elegir entre resultados."),
-        ("!playlist <url>", "Carga una playlist de Spotify en la cola."),
+        ("!playlist <url>", "Carga una playlist de Spotify o YouTube en la cola."),
         ("!skip", "Salta la cancion actual."),
         ("!pause", "Pausa la reproduccion."),
         ("!resume", "Reanuda la reproduccion."),
@@ -875,12 +924,50 @@ async def help_cmd(ctx: commands.Context):
     await ctx.send(embed=embed, delete_after=60)
 
 
-@bot.command(name="playlist", help="Carga una playlist de Spotify en la cola. Uso: !playlist <url>")
+@bot.command(name="playlist", help="Carga una playlist de Spotify o YouTube en la cola. Uso: !playlist <url>")
 async def playlist_cmd(ctx: commands.Context, *, url: str):
     if not ctx.author.voice:
         await ctx.send("Debes estar en un canal de voz para usar este comando.")
         return
 
+    # YouTube / YouTube Music playlist
+    if _is_youtube_url(url) == "playlist":
+        msg = await ctx.send("📋 Cargando playlist de YouTube...")
+        yt_tracks = await extract_youtube_tracks(url)
+        if not yt_tracks:
+            await msg.edit(content="No se pudo procesar la playlist de YouTube.")
+            return
+
+        voice_channel = ctx.author.voice.channel
+        vc = ctx.guild.voice_client
+        if vc is None:
+            vc = await voice_channel.connect()
+        elif vc.channel != voice_channel:
+            await vc.move_to(voice_channel)
+        if ctx.guild.id not in queues:
+            queues[ctx.guild.id] = collections.deque()
+
+        truncated = len(yt_tracks) >= 50
+        for t in yt_tracks:
+            queues[ctx.guild.id].append({
+                "title":     t["title"],
+                "yt_query":  t["yt_query"],
+                "url":       t.get("url"),
+                "requester": ctx.author.display_name,
+                "artist":    t.get("uploader") or "Unknown",
+                "duration":  t.get("duration") or 0,
+                "thumbnail": t.get("thumbnail") or "",
+                "acodec":    t.get("acodec", "?"),
+                "abr":       t.get("abr", 0),
+            })
+
+        suffix = " (máximo 50)" if truncated else ""
+        await msg.edit(content=f"✅ {len(yt_tracks)} canciones{suffix} añadidas a la cola.")
+        if not (vc.is_playing() or vc.is_paused()):
+            await play_next(ctx.guild, vc, ctx.channel)
+        return
+
+    # Spotify playlist
     if not await _ensure_auth(ctx):
         return
 

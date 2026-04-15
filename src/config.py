@@ -76,6 +76,15 @@ LLM_ENABLED_FOR_ALBUM_TRACKS = 3  # Only use LLM for first N tracks in bulk oper
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = "claude-haiku-4-5"
 
+# ---------------------------------------------------------------------------
+# DJ Announcer (TTS between genre changes in radio mode)
+# ---------------------------------------------------------------------------
+DJ_ANNOUNCER_ENABLED = os.getenv("DJ_ANNOUNCER_ENABLED", "true").lower() in ("1", "true", "yes")
+DJ_VOICE = os.getenv("DJ_VOICE", "es-MX-DaliaNeural")  # edge-tts voice
+DJ_ANNOUNCE_COOLDOWN = int(os.getenv("DJ_ANNOUNCE_COOLDOWN", "120"))  # seconds between announcements
+DJ_VOLUME = os.getenv("DJ_VOLUME", "1.2")  # FFmpeg volume filter for TTS
+DJ_FUN_FACT_INTERVAL = int(os.getenv("DJ_FUN_FACT_INTERVAL", "5"))  # songs between fun-fact comments
+
 NOISE_TERMS = {
     "official",
     "video",

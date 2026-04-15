@@ -86,6 +86,16 @@ def _map_cluster(genres: list[str]) -> str | None:
     return None
 
 
+async def get_track_cluster(track: dict) -> str | None:
+    """Return the macro genre cluster for a track, or None if unknown."""
+    artist_id = track.get("artist_id")
+    if not artist_id:
+        return None
+    from src.spotify import _get_artist_genres
+    genres = await _get_artist_genres(artist_id)
+    return _map_cluster(genres)
+
+
 # ---------------------------------------------------------------------------
 # Per-guild state
 # ---------------------------------------------------------------------------
@@ -407,11 +417,16 @@ async def fill_radio_queue(
     guild: discord.Guild,
     vc: discord.VoiceClient,
     text_channel,
+    *,
+    auto_play: bool = True,
 ) -> None:
     """Fetch Spotify recommendations and add them to the queue.
 
     Called when queue length drops below RADIO_QUEUE_MIN, or when radio is
     first activated. Guarded by _filling to prevent concurrent fills.
+
+    If *auto_play* is False, tracks are queued but playback is NOT started
+    automatically (caller is responsible for starting playback).
     """
     from src.playback import queues, now_playing_info, play_next
     from src.spotify import _get_recommendations
@@ -501,8 +516,8 @@ async def fill_radio_queue(
 
         logger.info("radio.fill: %d canciones añadidas a la cola de guild=%s", len(new_tracks), gid)
 
-        # If bot was idle, start playing
-        if not (vc and (vc.is_playing() or vc.is_paused())):
+        # If bot was idle, start playing (unless caller handles playback)
+        if auto_play and not (vc and (vc.is_playing() or vc.is_paused())):
             await play_next(guild, vc, text_channel)
 
     except Exception as exc:
