@@ -29,33 +29,78 @@ _songs_since_comment: dict[int, int] = {}   # DJ fun-fact counter per guild
 # Persistent player embed + buttons
 # ---------------------------------------------------------------------------
 
-def _build_embed(guild_id: int) -> discord.Embed:
+def _build_v2_payload(guild_id: int) -> dict:
+    """Build a Components V2 (IS_COMPONENTS_V2) message payload for the player."""
+    from discord.http import Route  # noqa: F401 — imported here to avoid circular at module level
     track = now_playing_info.get(guild_id)
     q = queues.get(guild_id, collections.deque())
-    if not track:
-        embed = discord.Embed(description="Nada reproduciendose.", color=0x2B2D31)
-        embed.set_footer(text="Usa !play <cancion> para agregar canciones")
-        return embed
     paused = _paused.get(guild_id, False)
-    embed = discord.Embed(title=track["title"], color=0x1DB954)
-    embed.add_field(name="Artista", value=track.get("artist", "Unknown"), inline=True)
+    from src import radio as _radio
+    radio_on = _radio.is_radio_active(guild_id)
+    mood = _radio.get_mood(guild_id)
+    queue_size = len(q)
+    accent = 0x808080 if paused else 0x1DB954
+
+    if not track:
+        return {
+            "flags": 32768,
+            "components": [{
+                "type": 17,
+                "accent_color": 0x2B2D31,
+                "components": [{"type": 10, "content": "Nada reproduciéndose.\n-# Usa `!play <cancion>` para agregar canciones"}]
+            }]
+        }
+
     duration = track.get("duration", 0)
     duration_str = f"{duration // 60}:{duration % 60:02d}" if duration else "--:--"
-    embed.add_field(name="Duracion", value=duration_str, inline=True)
-    embed.add_field(name="Pedido por", value=track["requester"], inline=True)
-    embed.add_field(name="En cola", value=str(len(q)), inline=True)
-    if len(q) > 0:
-        next_track = list(q)[0]
-        embed.add_field(name="Siguiente", value=next_track.get("title", "?")[:100], inline=False)
+    status = "⏸ En pausa" if paused else "▶ Reproduciendo"
+    if radio_on:
+        status += " | 📻 Radio ON"
+        if mood != "neutral":
+            status += f" | 🎭 {mood.capitalize()}"
+
+    lines = [
+        f"## {track['title']}",
+        f"**Artista:** {track.get('artist', 'Unknown')}  ·  **Duración:** {duration_str}  ·  **Pedido por:** {track['requester']}",
+        f"**En cola:** {queue_size}",
+    ]
+    if queue_size > 0:
+        lines.append(f"**Siguiente:** {list(q)[0].get('title', '?')[:100]}")
+    lines.append(f"-# {status}")
+    content_text = "\n".join(lines)
+
+    children: list[dict] = []
     if track.get("thumbnail"):
-        embed.set_thumbnail(url=track["thumbnail"])
-    from src import radio as _radio
-    radio_on  = _radio.is_radio_active(guild_id)
-    mood      = _radio.get_mood(guild_id)
-    radio_txt = " | 📻 Radio ON" if radio_on else ""
-    mood_txt  = f" | 🎭 {mood.capitalize()}" if radio_on and mood != "neutral" else ""
-    embed.set_footer(text=("\u23f8 En pausa" if paused else "\u25b6 Reproduciendo") + radio_txt + mood_txt)
-    return embed
+        children.append({
+            "type": 9,
+            "components": [{"type": 10, "content": content_text}],
+            "accessory": {"type": 11, "media": {"url": track["thumbnail"]}}
+        })
+    else:
+        children.append({"type": 10, "content": content_text})
+
+    children.append({"type": 14, "divider": True, "spacing": 1})
+
+    children.append({"type": 1, "components": [
+        {"type": 2, "custom_id": "player_toggle", "label": "▶ Reanudar" if paused else "⏸ Pausar",
+         "style": 3 if paused else 2},
+        {"type": 2, "custom_id": "player_skip",   "label": "⏭ Saltar",   "style": 1, "disabled": queue_size == 0},
+        {"type": 2, "custom_id": "player_stop",   "label": "⏹ Detener",  "style": 4},
+    ]})
+    children.append({"type": 1, "components": [
+        {"type": 2, "custom_id": "player_shuffle", "label": "🔀 Shuffle", "style": 2, "disabled": queue_size < 2},
+        {"type": 2, "custom_id": "player_queue",   "label": "📜 Cola",    "style": 2, "disabled": queue_size == 0},
+    ]})
+    children.append({"type": 1, "components": [
+        {"type": 2, "custom_id": "player_radio", "label": "📻 Radio ✓" if radio_on else "📻 Radio",
+         "style": 3 if radio_on else 2},
+        {"type": 2, "custom_id": "player_mood",  "label": f"🎭 {mood.capitalize()}", "style": 2},
+    ]})
+
+    return {
+        "flags": 32768,
+        "components": [{"type": 17, "accent_color": accent, "components": children}]
+    }
 
 
 class PlayerView(discord.ui.View):
@@ -74,14 +119,7 @@ class PlayerView(discord.ui.View):
         mood = _radio.get_mood(guild_id)
         self.mood_btn.label = f"🎭 {mood.capitalize()}"
 
-    @discord.ui.button(label="\u23ed Saltar", style=discord.ButtonStyle.primary)
-    async def skip_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        vc = interaction.guild.voice_client
-        if vc and (vc.is_playing() or vc.is_paused()):
-            vc.stop()
-        await interaction.response.defer()
-
-    @discord.ui.button(label="\u23f8 Pausar", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="\u23f8 Pausar", style=discord.ButtonStyle.secondary, row=0, custom_id="player_toggle")
     async def toggle_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         vc = interaction.guild.voice_client
         gid = interaction.guild.id
@@ -94,7 +132,14 @@ class PlayerView(discord.ui.View):
         await interaction.response.defer()
         await update_player_embed(interaction.guild, interaction.channel)
 
-    @discord.ui.button(label="\u23f9 Detener", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="\u23ed Saltar", style=discord.ButtonStyle.primary, row=0, custom_id="player_skip")
+    async def skip_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        vc = interaction.guild.voice_client
+        if vc and (vc.is_playing() or vc.is_paused()):
+            vc.stop()
+        await interaction.response.defer()
+
+    @discord.ui.button(label="\u23f9 Detener", style=discord.ButtonStyle.danger, row=0, custom_id="player_stop")
     async def stop_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         gid = interaction.guild.id
         queues[gid] = collections.deque()
@@ -107,7 +152,7 @@ class PlayerView(discord.ui.View):
         await interaction.response.defer()
         await update_player_embed(interaction.guild, interaction.channel)
 
-    @discord.ui.button(label="\U0001f500 Shuffle", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="\U0001f500 Shuffle", style=discord.ButtonStyle.secondary, row=1, custom_id="player_shuffle")
     async def shuffle_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         gid = interaction.guild.id
         q = queues.get(gid)
@@ -118,7 +163,7 @@ class PlayerView(discord.ui.View):
         await interaction.response.defer()
         await update_player_embed(interaction.guild, interaction.channel)
 
-    @discord.ui.button(label="\U0001f4dc Cola", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="\U0001f4dc Cola", style=discord.ButtonStyle.secondary, row=1, custom_id="player_queue")
     async def queue_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         gid = interaction.guild.id
         q = queues.get(gid, collections.deque())
@@ -137,7 +182,7 @@ class PlayerView(discord.ui.View):
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    @discord.ui.button(label="\U0001f4fb Radio", style=discord.ButtonStyle.secondary, row=2)
+    @discord.ui.button(label="\U0001f4fb Radio", style=discord.ButtonStyle.secondary, row=2, custom_id="player_radio")
     async def radio_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         gid = interaction.guild.id
         from src import radio as _radio
@@ -149,7 +194,7 @@ class PlayerView(discord.ui.View):
             asyncio.ensure_future(start_radio_with_welcome(interaction.guild, vc, interaction.channel))
         await update_player_embed(interaction.guild, interaction.channel)
 
-    @discord.ui.button(label="\U0001f3ad Mood", style=discord.ButtonStyle.secondary, row=2)
+    @discord.ui.button(label="\U0001f3ad Mood", style=discord.ButtonStyle.secondary, row=2, custom_id="player_mood")
     async def mood_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         gid = interaction.guild.id
         from src import radio as _radio
@@ -168,7 +213,8 @@ class PlayerView(discord.ui.View):
 
 
 async def update_player_embed(guild: discord.Guild, channel):
-    """Delete the previous player embed and post a fresh one at the bottom of the channel."""
+    """Delete previous player message and post a fresh Components V2 one."""
+    from discord.http import Route
     gid = guild.id
     old = _player_messages.get(gid)
     if old:
@@ -176,27 +222,10 @@ async def update_player_embed(guild: discord.Guild, channel):
             await old.delete()
         except Exception:
             pass
-    track = now_playing_info.get(gid)
-    view = PlayerView(gid) if track else discord.ui.View()
-
-    if track and view:
-        q = queues.get(gid, collections.deque())
-        queue_size = len(q)
-        
-        # Disable/enable buttons based on queue state
-        for item in view.children:
-            if hasattr(item, 'label'):
-                # Skip button: disable if queue is empty
-                if "Saltar" in item.label:
-                    item.disabled = queue_size == 0
-                # Shuffle button: disable if queue has 0 or 1 items
-                elif "Shuffle" in item.label:
-                    item.disabled = queue_size < 2
-                # Queue button: disable if queue is empty
-                elif "Cola" in item.label:
-                    item.disabled = queue_size == 0
-
-    msg = await channel.send(embed=_build_embed(gid), view=view)
+    payload = _build_v2_payload(gid)
+    route = Route("POST", "/channels/{channel_id}/messages", channel_id=channel.id)
+    data = await bot.http.request(route, json=payload)
+    msg = discord.Message(state=bot._connection, channel=channel, data=data)
     _player_messages[gid] = msg
 
 
@@ -244,12 +273,25 @@ async def _prefetch_next(guild_id: int):
             check_cooldown, generate_dj_comment, generate_fun_fact,
             synthesize_dj_audio,
         )
+        # Priority 1: if current playing track is a user pick, generate fun fact
+        # about it — plays before the next track as a bridge back to radio
+        current = now_playing_info.get(guild_id)
+        if current and current.get("requester") != "\U0001f4fb Radio":
+            comment = await generate_fun_fact(
+                current.get("title", ""),
+                current.get("artist", "Unknown"),
+                _last_cluster.get(guild_id),
+            )
+            dj_file = await synthesize_dj_audio(comment, guild_id)
+            if dj_file:
+                _prefetch_dj[guild_id] = dj_file
+                logger.info("_prefetch_next: pre-generated user-pick fun-fact TTS for guild=%s", guild_id)
+            return
+
         songs = _songs_since_comment.get(guild_id, 0)
 
-        # Priority 1: genre transition (radio only)
-        if _radio.is_radio_active(guild_id):
-            if not check_cooldown(guild_id):
-                return
+        # Priority 2: genre transition (radio only) — only if cooldown has passed
+        if _radio.is_radio_active(guild_id) and check_cooldown(guild_id):
             prev_cluster = _last_cluster.get(guild_id)
             if prev_cluster:
                 new_cluster = await _radio.get_track_cluster(next_track)
@@ -262,9 +304,9 @@ async def _prefetch_next(guild_id: int):
                     if dj_file:
                         _prefetch_dj[guild_id] = dj_file
                         logger.info("_prefetch_next: pre-generated DJ transition TTS for guild=%s", guild_id)
-                    return
+                    return  # transition wins; skip fun fact
 
-        # Priority 2: fun fact every N songs (all modes)
+        # Priority 2: fun fact every N songs (all modes) — never blocked by cooldown
         if songs >= DJ_FUN_FACT_INTERVAL - 1:
             cluster = await _radio.get_track_cluster(next_track) if _radio.is_radio_active(guild_id) else None
             comment = await generate_fun_fact(
@@ -330,8 +372,10 @@ async def play_next(guild: discord.Guild, vc: discord.VoiceClient, text_channel)
     # --- DJ Announcer: use pre-generated TTS or generate on-demand ---
     dj_file: str | None = _prefetch_dj.pop(guild.id, None)
     _songs_since_comment[guild.id] = _songs_since_comment.get(guild.id, 0) + 1
+    is_user_pick = track.get("requester") != "\U0001f4fb Radio"
 
-    if DJ_ANNOUNCER_ENABLED:
+    if DJ_ANNOUNCER_ENABLED and not is_user_pick:
+        # User picks: no TTS before their song — fun fact generated during playback instead
         try:
             from src.dj_announcer import mark_announced, cleanup_dj_audio
 
@@ -341,7 +385,6 @@ async def play_next(guild: discord.Guild, vc: discord.VoiceClient, text_channel)
                 if new_cluster:
                     prev_cluster = _last_cluster.get(guild.id)
                     _last_cluster[guild.id] = new_cluster
-                    # On-demand transition TTS if not pre-generated
                     if not dj_file and prev_cluster and prev_cluster != new_cluster:
                         from src.dj_announcer import (
                             check_cooldown, generate_dj_comment, synthesize_dj_audio,
@@ -353,7 +396,7 @@ async def play_next(guild: discord.Guild, vc: discord.VoiceClient, text_channel)
                             )
                             dj_file = await synthesize_dj_audio(comment, guild.id)
 
-            # --- Fun fact every N songs (all playback modes) ---
+            # --- Fun fact every N songs (radio mode) ---
             if not dj_file and _songs_since_comment.get(guild.id, 0) >= DJ_FUN_FACT_INTERVAL:
                 from src.dj_announcer import generate_fun_fact, synthesize_dj_audio
                 cluster = _last_cluster.get(guild.id)
@@ -370,6 +413,11 @@ async def play_next(guild: discord.Guild, vc: discord.VoiceClient, text_channel)
             if dj_file:
                 cleanup_dj_audio(dj_file)
             dj_file = None
+    elif dj_file:
+        # Discard any stale pre-gen that was queued before a user pick
+        from src.dj_announcer import cleanup_dj_audio
+        cleanup_dj_audio(dj_file)
+        dj_file = None
 
     try:
         # Use FFmpegOpusAudio directly (no probe) to avoid an extra HTTP round-trip

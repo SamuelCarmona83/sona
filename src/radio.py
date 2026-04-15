@@ -202,14 +202,21 @@ def delete_custom_mood(guild_id: int, name: str) -> None:
 
 def flush_radio_tracks(guild_id: int) -> int:
     """Remove radio-auto-queued tracks from queue, keep user tracks. Returns removed count."""
-    from src.playback import queues
+    from src.playback import queues, _prefetch_dj, _last_cluster
+    from src.dj_announcer import cleanup_dj_audio
     q = queues.get(guild_id)
     if not q:
         return 0
     items = list(q)
-    kept = [t for t in items if t.get("requester") != "📻 Radio"]
+    kept = [t for t in items if t.get("requester") != "\U0001f4fb Radio"]
     removed = len(items) - len(kept)
     queues[guild_id] = collections.deque(kept)
+    # Discard stale pre-generated TTS — it was for a track that no longer fits the new mood
+    stale = _prefetch_dj.pop(guild_id, None)
+    if stale:
+        cleanup_dj_audio(stale)
+    # Reset cluster so first new-mood song doesn't trigger a false genre transition
+    _last_cluster.pop(guild_id, None)
     logger.info("flush_radio_tracks: guild=%s removed=%d kept=%d", guild_id, removed, len(kept))
     return removed
 

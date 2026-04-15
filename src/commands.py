@@ -77,6 +77,8 @@ async def only_allowed_channel(ctx: commands.Context) -> bool:
 
 @bot.event
 async def on_ready():
+    from src.playback import PlayerView
+    bot.add_view(PlayerView(0))
     logger.info(f"Bot conectado como {bot.user} (id={bot.user.id})")
     logger.info(f"Guilds: {[g.name for g in bot.guilds]}")
     try:
