@@ -3,6 +3,7 @@ services:
     build: .
     restart: unless-stopped
     ports:
+      - "5017:5000"
       - "8888:8888"
     volumes:
       # .env is read by the app itself (load_dotenv_values), not by Docker

@@ -8,6 +8,7 @@ import discord
 from src.config import FFMPEG_OPTIONS, DJ_ANNOUNCER_ENABLED, DJ_FUN_FACT_INTERVAL
 from src.youtube import search_youtube
 from src.bot_instance import bot
+from src import web_stream
 
 logger = logging.getLogger(__name__)
 
@@ -569,6 +570,23 @@ async def play_next(guild: discord.Guild, vc: discord.VoiceClient, text_channel)
             track["title"],
             track.get("acodec", "?"),
             track.get("abr", "?"),
+        )
+        
+        # Start web stream (parallel to Discord)
+        q = queues.get(guild.id, collections.deque())
+        queue_size = len(q)
+        asyncio.ensure_future(
+            web_stream.stream_track_async(
+                track["url"],
+                {
+                    "title": track.get("title", "Unknown"),
+                    "artist": track.get("artist", "Unknown"),
+                    "duration": track.get("duration", 0),
+                    "thumbnail": track.get("thumbnail"),
+                    "requester": track.get("requester", "Unknown"),
+                },
+                queue_size,
+            )
         )
     except Exception as e:
         logger.warning(f"play_next: video no disponible '{track['title']}': {e}, saltando...")
