@@ -83,10 +83,12 @@ async def on_ready():
     logger.info(f"Guilds: {[g.name for g in bot.guilds]}")
     try:
         channel = await bot.fetch_channel(ALLOWED_CHANNEL_ID)
-        await channel.send(
-            "\U0001f3b5 Bot de musica listo. "
-            "Entra a un canal de voz y usa `!play <cancion>` para reproducir."
+        embed = discord.Embed(
+            title="🎵 Bot de música listo",
+            description="Usa `!play <canción>` para reproducir.",
+            color=0x1DB954
         )
+        await channel.send(embed=embed)
         logger.info("Mensaje de startup enviado correctamente.")
     except Exception as e:
         logger.error(f"No se pudo enviar el mensaje de startup: {e}")
@@ -591,28 +593,6 @@ async def now_playing_cmd(ctx: commands.Context):
         await ctx.send("No hay nada reproduciendose.")
         return
     await ctx.send(f"\U0001f3b5 **{current['title']}** — pedido por {current['requester']}", delete_after=15)
-
-
-# @bot.command(name="search", help="Busca canciones en Spotify. Uso: !search <busqueda>")
-# async def search(ctx: commands.Context, *, query: str):
-#     if not await _ensure_auth(ctx):
-#         return
-#     try:
-#         results = await asyncio.to_thread(lambda: sp.search(q=query, type="track", limit=5))
-#     except Exception as e:
-#         await ctx.send(f"Error buscando en Spotify: `{e}`")
-#         return
-#     items = results.get("tracks", {}).get("items", [])
-#     if not items:
-#         await ctx.send(f"No se encontraron resultados para: **{query}**")
-#         return
-#     embed = discord.Embed(title=f'Resultados para "{query}"', color=discord.Color.blurple())
-#     for i, track in enumerate(items, 1):
-#         artists = ", ".join(a["name"] for a in track["artists"])
-#         album   = track.get("album", {}).get("name", "")
-#         embed.add_field(name=f"{i}. {track['name']}", value=f"{artists} — {album}", inline=False)
-#     await ctx.send(embed=embed)
-
 
 @bot.command(name="move", help="Mueve una cancion en la cola. Uso: !move <pos_actual> <pos_nueva>")
 async def move_cmd(ctx: commands.Context, current_pos: int, new_pos: int):

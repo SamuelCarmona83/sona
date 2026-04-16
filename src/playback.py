@@ -53,20 +53,28 @@ def _build_v2_payload(guild_id: int) -> dict:
 
     duration = track.get("duration", 0)
     duration_str = f"{duration // 60}:{duration % 60:02d}" if duration else "--:--"
-    status = "⏸ En pausa" if paused else "▶ Reproduciendo"
-    if radio_on:
-        status += " | 📻 Radio ON"
-        if mood != "neutral":
-            status += f" | 🎭 {mood.capitalize()}"
-
+    
+    # Compact text layout (no status line, radio/mood shown via buttons)
+    artist = track.get("artist", "Unknown")
+    requester = track["requester"]
+    # Avoid duplicating artist if already in title
+    title_line = track['title']
+    
+    # If artist is "Unknown", try to extract from title (format: "Song - Artist" or "Song · Artist")
+    if artist == "Unknown" and (" - " in title_line or " · " in title_line):
+        parts = title_line.replace(" · ", " - ").split(" - ")
+        if len(parts) >= 2:
+            artist = parts[-1].strip()
+    
+    if artist.lower() not in title_line.lower():
+        title_line = f"{title_line} · {artist}"
     lines = [
-        f"## {track['title']}",
-        f"**Artista:** {track.get('artist', 'Unknown')}  ·  **Duración:** {duration_str}  ·  **Pedido por:** {track['requester']}",
-        f"**En cola:** {queue_size}",
+        f"## {title_line}",
+        f"{duration_str} · por {requester}",
     ]
     if queue_size > 0:
-        lines.append(f"**Siguiente:** {list(q)[0].get('title', '?')[:100]}")
-    lines.append(f"-# {status}")
+        next_title = list(q)[0].get("title", "?")[:80]
+        lines.append(f"Siguiente: {next_title}")
     content_text = "\n".join(lines)
 
     children: list[dict] = []
@@ -81,20 +89,19 @@ def _build_v2_payload(guild_id: int) -> dict:
 
     children.append({"type": 14, "divider": True, "spacing": 1})
 
+    # Row 1: Playback + Queue controls (left-aligned)
     children.append({"type": 1, "components": [
-        {"type": 2, "custom_id": "player_toggle", "label": "▶ Reanudar" if paused else "⏸ Pausar",
-         "style": 3 if paused else 2},
-        {"type": 2, "custom_id": "player_skip",   "label": "⏭ Saltar",   "style": 1, "disabled": queue_size == 0},
-        {"type": 2, "custom_id": "player_stop",   "label": "⏹ Detener",  "style": 4},
+        {"type": 2, "custom_id": "player_toggle", "label": "▶" if paused else "⏸", "style": 3 if paused else 2},
+        {"type": 2, "custom_id": "player_skip",   "label": "⏭", "style": 1, "disabled": queue_size == 0},
+        {"type": 2, "custom_id": "player_stop",   "label": "⏹", "style": 4},
+        {"type": 2, "custom_id": "player_shuffle", "label": "⇄", "style": 2, "disabled": queue_size < 2},
+        {"type": 2, "custom_id": "player_queue",   "label": "≡", "style": 2, "disabled": queue_size == 0},
     ]})
+    
+    # Row 2: Radio + Mood (right-aligned)
     children.append({"type": 1, "components": [
-        {"type": 2, "custom_id": "player_shuffle", "label": "🔀 Shuffle", "style": 2, "disabled": queue_size < 2},
-        {"type": 2, "custom_id": "player_queue",   "label": "📜 Cola",    "style": 2, "disabled": queue_size == 0},
-    ]})
-    children.append({"type": 1, "components": [
-        {"type": 2, "custom_id": "player_radio", "label": "📻 Radio ✓" if radio_on else "📻 Radio",
-         "style": 3 if radio_on else 2},
-        {"type": 2, "custom_id": "player_mood",  "label": f"🎭 {mood.capitalize()}", "style": 2},
+        {"type": 2, "custom_id": "player_radio", "label": "📻" + ("✓" if radio_on else ""), "style": 3 if radio_on else 2},
+        {"type": 2, "custom_id": "player_mood",  "label": "🎭 Mood", "style": 2},
     ]})
 
     return {
@@ -152,7 +159,7 @@ class PlayerView(discord.ui.View):
         await interaction.response.defer()
         await update_player_embed(interaction.guild, interaction.channel)
 
-    @discord.ui.button(label="\U0001f500 Shuffle", style=discord.ButtonStyle.secondary, row=1, custom_id="player_shuffle")
+    @discord.ui.button(label="⇄", style=discord.ButtonStyle.secondary, row=0, custom_id="player_shuffle")
     async def shuffle_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         gid = interaction.guild.id
         q = queues.get(gid)
@@ -163,7 +170,7 @@ class PlayerView(discord.ui.View):
         await interaction.response.defer()
         await update_player_embed(interaction.guild, interaction.channel)
 
-    @discord.ui.button(label="\U0001f4dc Cola", style=discord.ButtonStyle.secondary, row=1, custom_id="player_queue")
+    @discord.ui.button(label="≡", style=discord.ButtonStyle.secondary, row=0, custom_id="player_queue")
     async def queue_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         gid = interaction.guild.id
         q = queues.get(gid, collections.deque())
@@ -182,7 +189,7 @@ class PlayerView(discord.ui.View):
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    @discord.ui.button(label="\U0001f4fb Radio", style=discord.ButtonStyle.secondary, row=2, custom_id="player_radio")
+    @discord.ui.button(label="\U0001f4fb Radio", style=discord.ButtonStyle.secondary, row=1, custom_id="player_radio")
     async def radio_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         gid = interaction.guild.id
         from src import radio as _radio
@@ -194,22 +201,70 @@ class PlayerView(discord.ui.View):
             asyncio.ensure_future(start_radio_with_welcome(interaction.guild, vc, interaction.channel))
         await update_player_embed(interaction.guild, interaction.channel)
 
-    @discord.ui.button(label="\U0001f3ad Mood", style=discord.ButtonStyle.secondary, row=2, custom_id="player_mood")
+    @discord.ui.button(label="\U0001f3ad Mood", style=discord.ButtonStyle.secondary, row=1, custom_id="player_mood")
     async def mood_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         gid = interaction.guild.id
         from src import radio as _radio
+        
+        # Get available moods
         mood_names = list(_radio.MOODS.keys())
         current = _radio.get_mood(gid)
-        idx = mood_names.index(current) if current in mood_names else 0
-        next_mood = mood_names[(idx + 1) % len(mood_names)]
-        _radio.set_mood(gid, next_mood)
-        _radio.flush_radio_tracks(gid)
-        await interaction.response.defer()
-        if _radio.is_radio_active(gid):
-            vc = interaction.guild.voice_client
-            if vc:
-                asyncio.ensure_future(_radio.fill_radio_queue(interaction.guild, vc, interaction.channel))
-        await update_player_embed(interaction.guild, interaction.channel)
+        
+        # Build radio options for modal
+        options = [
+            discord.SelectOption(label=m.capitalize(), value=m, default=(m == current))
+            for m in mood_names
+        ]
+        
+        # State for tracking selected mood
+        selected_mood = [current]  # Use list to allow mutation in nested class
+        
+        # Create select menu for mood
+        class MoodSelect(discord.ui.Select):
+            def __init__(self, parent_view):
+                super().__init__(
+                    placeholder="Elige un mood...",
+                    min_values=1,
+                    max_values=1,
+                    options=options,
+                    custom_id="mood_select"
+                )
+                self.parent_view = parent_view
+            
+            async def callback(self, select_interaction: discord.Interaction):
+                selected_mood[0] = self.values[0]
+                await select_interaction.response.defer()
+        
+        # Create modal view with select + buttons
+        class MoodModalView(discord.ui.View):
+            def __init__(self):
+                super().__init__()
+                self.add_item(MoodSelect(self))
+            
+            @discord.ui.button(label="Confirmar", style=discord.ButtonStyle.success, row=1)
+            async def confirm_btn(self, btn_interaction: discord.Interaction, button: discord.ui.Button):
+                _radio.set_mood(gid, selected_mood[0])
+                _radio.flush_radio_tracks(gid)
+                await btn_interaction.response.defer()
+                if _radio.is_radio_active(gid):
+                    vc = interaction.guild.voice_client
+                    if vc:
+                        asyncio.ensure_future(_radio.fill_radio_queue(interaction.guild, vc, interaction.channel))
+                await update_player_embed(interaction.guild, interaction.channel)
+                await btn_interaction.delete_original_response()
+            
+            @discord.ui.button(label="Cancelar", style=discord.ButtonStyle.secondary, row=1)
+            async def cancel_btn(self, btn_interaction: discord.Interaction, button: discord.ui.Button):
+                await btn_interaction.response.defer()
+                await btn_interaction.delete_original_response()
+        
+        # Send as followup with select menu + buttons
+        view = MoodModalView()
+        await interaction.response.send_message(
+            "🎭 **Selecciona un Mood:**",
+            view=view,
+            ephemeral=True
+        )
 
 
 async def update_player_embed(guild: discord.Guild, channel):
