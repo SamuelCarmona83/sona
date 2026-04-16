@@ -18,11 +18,16 @@ queues: dict[int, collections.deque] = {}
 now_playing_info: dict[int, dict | None] = {}
 _prefetch_tasks: dict[int, asyncio.Task | None] = {}
 _player_messages: dict[int, discord.Message | None] = {}
+_player_channels: dict[int, discord.abc.Messageable | None] = {}
+_player_refresh_tasks: dict[int, asyncio.Task | None] = {}
+_player_update_locks: dict[int, asyncio.Lock] = {}
 _paused: dict[int, bool] = {}
 _last_cluster: dict[int, str | None] = {}  # DJ announcer: last genre cluster per guild
 _prefetch_dj: dict[int, str | None] = {}   # DJ announcer: pre-generated TTS file path
 _welcome_active: dict[int, bool] = {}       # Guard: prevent duplicate welcome per guild
 _songs_since_comment: dict[int, int] = {}   # DJ fun-fact counter per guild
+
+PLAYER_REFRESH_INTERVAL = 4.0
 
 
 # ---------------------------------------------------------------------------
@@ -39,6 +44,7 @@ def _build_v2_payload(guild_id: int) -> dict:
     radio_on = _radio.is_radio_active(guild_id)
     mood = _radio.get_mood(guild_id)
     queue_size = len(q)
+    has_track = bool(track)
     accent = 0x808080 if paused else 0x1DB954
 
     if not track:
@@ -92,10 +98,10 @@ def _build_v2_payload(guild_id: int) -> dict:
     # Row 1: Playback + Queue controls (left-aligned)
     children.append({"type": 1, "components": [
         {"type": 2, "custom_id": "player_toggle", "label": "▶" if paused else "⏸", "style": 3 if paused else 2},
-        {"type": 2, "custom_id": "player_skip",   "label": "⏭", "style": 1, "disabled": queue_size == 0},
+        {"type": 2, "custom_id": "player_skip",   "label": "⏭", "style": 1, "disabled": not has_track and queue_size == 0},
         {"type": 2, "custom_id": "player_stop",   "label": "⏹", "style": 4},
         {"type": 2, "custom_id": "player_shuffle", "label": "⇄", "style": 2, "disabled": queue_size < 2},
-        {"type": 2, "custom_id": "player_queue",   "label": "≡", "style": 2, "disabled": queue_size == 0},
+        {"type": 2, "custom_id": "player_queue",   "label": "≡", "style": 2},
     ]})
     
     # Row 2: Radio + Mood (right-aligned)
@@ -108,6 +114,38 @@ def _build_v2_payload(guild_id: int) -> dict:
         "flags": 32768,
         "components": [{"type": 17, "accent_color": accent, "components": children}]
     }
+
+
+def _resolve_interaction_guild(interaction: discord.Interaction, fallback_gid: int = 0) -> tuple[discord.Guild | None, int]:
+    gid = interaction.guild_id or (interaction.guild.id if interaction.guild else fallback_gid)
+    guild = interaction.guild or (bot.get_guild(gid) if gid else None)
+    return guild, gid
+
+
+async def _player_refresh_loop(guild_id: int):
+    try:
+        while True:
+            await asyncio.sleep(PLAYER_REFRESH_INTERVAL)
+            guild = bot.get_guild(guild_id)
+            channel = _player_channels.get(guild_id)
+            vc = guild.voice_client if guild else None
+            active = bool(now_playing_info.get(guild_id) or queues.get(guild_id))
+            if not guild or channel is None or not active and not (vc and (vc.is_playing() or vc.is_paused())):
+                break
+            try:
+                await update_player_embed(guild, channel)
+            except Exception as exc:
+                logger.debug("_player_refresh_loop: embed refresh failed for guild=%s: %s", guild_id, exc)
+    finally:
+        _player_refresh_tasks.pop(guild_id, None)
+
+
+def _ensure_player_refresh(guild: discord.Guild, channel) -> None:
+    _player_channels[guild.id] = channel
+    task = _player_refresh_tasks.get(guild.id)
+    if task and not task.done():
+        return
+    _player_refresh_tasks[guild.id] = asyncio.create_task(_player_refresh_loop(guild.id))
 
 
 class PlayerView(discord.ui.View):
@@ -128,8 +166,12 @@ class PlayerView(discord.ui.View):
 
     @discord.ui.button(label="\u23f8 Pausar", style=discord.ButtonStyle.secondary, row=0, custom_id="player_toggle")
     async def toggle_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        vc = interaction.guild.voice_client
-        gid = interaction.guild.id
+        guild, gid = _resolve_interaction_guild(interaction, self.guild_id)
+        if not guild:
+            await interaction.response.send_message("No pude encontrar este servidor.", ephemeral=True)
+            return
+        self.guild_id = gid
+        vc = guild.voice_client
         if vc and vc.is_playing():
             vc.pause()
             _paused[gid] = True
@@ -137,42 +179,62 @@ class PlayerView(discord.ui.View):
             vc.resume()
             _paused[gid] = False
         await interaction.response.defer()
-        await update_player_embed(interaction.guild, interaction.channel)
+        await update_player_embed(guild, interaction.channel)
 
     @discord.ui.button(label="\u23ed Saltar", style=discord.ButtonStyle.primary, row=0, custom_id="player_skip")
     async def skip_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        vc = interaction.guild.voice_client
+        guild, gid = _resolve_interaction_guild(interaction, self.guild_id)
+        if not guild:
+            await interaction.response.send_message("No pude encontrar este servidor.", ephemeral=True)
+            return
+        self.guild_id = gid
+        vc = guild.voice_client
         if vc and (vc.is_playing() or vc.is_paused()):
             vc.stop()
-        await interaction.response.defer()
+            await interaction.response.defer()
+        else:
+            await interaction.response.send_message("Nada para saltar ahora mismo.", ephemeral=True)
 
     @discord.ui.button(label="\u23f9 Detener", style=discord.ButtonStyle.danger, row=0, custom_id="player_stop")
     async def stop_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        gid = interaction.guild.id
+        guild, gid = _resolve_interaction_guild(interaction, self.guild_id)
+        if not guild:
+            await interaction.response.send_message("No pude encontrar este servidor.", ephemeral=True)
+            return
+        self.guild_id = gid
         queues[gid] = collections.deque()
         now_playing_info[gid] = None
         _paused[gid] = False
-        vc = interaction.guild.voice_client
+        vc = guild.voice_client
         if vc:
             vc.stop()
             await vc.disconnect()
         await interaction.response.defer()
-        await update_player_embed(interaction.guild, interaction.channel)
+        await update_player_embed(guild, interaction.channel)
 
     @discord.ui.button(label="⇄", style=discord.ButtonStyle.secondary, row=0, custom_id="player_shuffle")
     async def shuffle_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        gid = interaction.guild.id
+        guild, gid = _resolve_interaction_guild(interaction, self.guild_id)
+        if not guild:
+            await interaction.response.send_message("No pude encontrar este servidor.", ephemeral=True)
+            return
+        self.guild_id = gid
         q = queues.get(gid)
         if q and len(q) > 1:
             items = list(q)
             random.shuffle(items)
             queues[gid] = collections.deque(items)
         await interaction.response.defer()
-        await update_player_embed(interaction.guild, interaction.channel)
+        await update_player_embed(guild, interaction.channel)
 
     @discord.ui.button(label="≡", style=discord.ButtonStyle.secondary, row=0, custom_id="player_queue")
     async def queue_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        gid = interaction.guild.id
+        guild, gid = _resolve_interaction_guild(interaction, self.guild_id)
+        if not gid:
+            await interaction.response.send_message("No pude encontrar este servidor.", ephemeral=True)
+            return
+        if guild:
+            self.guild_id = gid
         q = queues.get(gid, collections.deque())
         if not q:
             await interaction.response.send_message("La cola esta vacia.", ephemeral=True)
@@ -191,19 +253,27 @@ class PlayerView(discord.ui.View):
 
     @discord.ui.button(label="\U0001f4fb Radio", style=discord.ButtonStyle.secondary, row=1, custom_id="player_radio")
     async def radio_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        gid = interaction.guild.id
+        guild, gid = _resolve_interaction_guild(interaction, self.guild_id)
+        if not guild:
+            await interaction.response.send_message("No pude encontrar este servidor.", ephemeral=True)
+            return
+        self.guild_id = gid
         from src import radio as _radio
         was_active = _radio.is_radio_active(gid)
         _radio.set_radio_active(gid, not was_active)
         await interaction.response.defer()
         if not was_active:
-            vc = interaction.guild.voice_client
-            asyncio.ensure_future(start_radio_with_welcome(interaction.guild, vc, interaction.channel))
-        await update_player_embed(interaction.guild, interaction.channel)
+            vc = guild.voice_client
+            asyncio.ensure_future(start_radio_with_welcome(guild, vc, interaction.channel))
+        await update_player_embed(guild, interaction.channel)
 
     @discord.ui.button(label="\U0001f3ad Mood", style=discord.ButtonStyle.secondary, row=1, custom_id="player_mood")
     async def mood_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        gid = interaction.guild.id
+        guild, gid = _resolve_interaction_guild(interaction, self.guild_id)
+        if not guild:
+            await interaction.response.send_message("No pude encontrar este servidor.", ephemeral=True)
+            return
+        self.guild_id = gid
         from src import radio as _radio
         
         # Get available moods
@@ -247,10 +317,10 @@ class PlayerView(discord.ui.View):
                 _radio.flush_radio_tracks(gid)
                 await btn_interaction.response.defer()
                 if _radio.is_radio_active(gid):
-                    vc = interaction.guild.voice_client
+                    vc = guild.voice_client
                     if vc:
-                        asyncio.ensure_future(_radio.fill_radio_queue(interaction.guild, vc, interaction.channel))
-                await update_player_embed(interaction.guild, interaction.channel)
+                        asyncio.ensure_future(_radio.fill_radio_queue(guild, vc, interaction.channel))
+                await update_player_embed(guild, interaction.channel)
                 await btn_interaction.delete_original_response()
             
             @discord.ui.button(label="Cancelar", style=discord.ButtonStyle.secondary, row=1)
@@ -268,20 +338,36 @@ class PlayerView(discord.ui.View):
 
 
 async def update_player_embed(guild: discord.Guild, channel):
-    """Delete previous player message and post a fresh Components V2 one."""
+    """Upsert the player message and keep button state fresh."""
     from discord.http import Route
     gid = guild.id
-    old = _player_messages.get(gid)
-    if old:
-        try:
-            await old.delete()
-        except Exception:
-            pass
-    payload = _build_v2_payload(gid)
-    route = Route("POST", "/channels/{channel_id}/messages", channel_id=channel.id)
-    data = await bot.http.request(route, json=payload)
-    msg = discord.Message(state=bot._connection, channel=channel, data=data)
-    _player_messages[gid] = msg
+    _player_channels[gid] = channel
+    _ensure_player_refresh(guild, channel)
+    lock = _player_update_locks.setdefault(gid, asyncio.Lock())
+
+    async with lock:
+        payload = _build_v2_payload(gid)
+        old = _player_messages.get(gid)
+
+        if old:
+            try:
+                route = Route(
+                    "PATCH",
+                    "/channels/{channel_id}/messages/{message_id}",
+                    channel_id=old.channel.id,
+                    message_id=old.id,
+                )
+                data = await bot.http.request(route, json=payload)
+                msg = discord.Message(state=bot._connection, channel=old.channel, data=data)
+                _player_messages[gid] = msg
+                return
+            except Exception:
+                logger.debug("update_player_embed: patch failed for guild=%s; creating fresh message", gid)
+
+        route = Route("POST", "/channels/{channel_id}/messages", channel_id=channel.id)
+        data = await bot.http.request(route, json=payload)
+        msg = discord.Message(state=bot._connection, channel=channel, data=data)
+        _player_messages[gid] = msg
 
 
 # ---------------------------------------------------------------------------
