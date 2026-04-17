@@ -7,6 +7,8 @@ from spotipy.oauth2 import SpotifyOAuth
 from poc_setlistfm import load_dotenv_values, get_config_value
 
 logging.basicConfig(level=logging.INFO)
+# Suppress verbose discord.py internals (voice, gateway, player)
+logging.getLogger("discord").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 

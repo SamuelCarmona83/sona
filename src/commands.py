@@ -998,3 +998,25 @@ async def playlist_cmd(ctx: commands.Context, *, url: str):
     # Start playing if nothing is currently playing
     if not (vc.is_playing() or vc.is_paused()):
         await play_next(ctx.guild, vc, ctx.channel)
+
+
+@bot.command(name="likes", help="Muestra tus canciones con ❤️ en este servidor.")
+async def likes_cmd(ctx: commands.Context):
+    from src import likes as _likes_mod
+    gid = ctx.guild.id
+    uid = ctx.author.id
+    user_likes = _likes_mod.get_user_likes(gid, uid)
+    if not user_likes:
+        await ctx.send("No tienes canciones con ❤️ todavía. Usa el botón del reproductor para dar like.", delete_after=15)
+        return
+    lines = []
+    for i, entry in enumerate(user_likes[:20], 1):
+        lines.append(f"`{i}.` {entry['title']} — {entry['artist']}")
+    if len(user_likes) > 20:
+        lines.append(f"... y {len(user_likes) - 20} más")
+    embed = discord.Embed(
+        title=f"❤️ Tus likes ({len(user_likes)})",
+        description="\n".join(lines),
+        color=0xe74c3c,
+    )
+    await ctx.send(embed=embed, delete_after=60)

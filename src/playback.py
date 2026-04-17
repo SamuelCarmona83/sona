@@ -108,10 +108,21 @@ def _build_v2_payload(guild_id: int) -> dict:
         {"type": 2, "custom_id": "player_queue",   "label": "≡", "style": 2},
     ]})
     
-    # Row 2: Radio + Mood (right-aligned)
+    # Row 2: Radio + Mood + Like
+    from src import likes as _likes_mod
+    guild_likes = _likes_mod._likes.get(guild_id, {})
+    like_count = sum(
+        1 for user_likes in guild_likes.values()
+        if track and any(
+            t["track_id"] == (_likes_mod._track_id(track)) for t in user_likes
+        )
+    )
+    like_label = f"❤️ {like_count}" if like_count > 0 else "🤍"
+    like_style = 4 if like_count > 0 else 2  # red if any likes, grey otherwise
     children.append({"type": 1, "components": [
         {"type": 2, "custom_id": "player_radio", "label": "📻" + ("✓" if radio_on else ""), "style": 3 if radio_on else 2},
         {"type": 2, "custom_id": "player_mood",  "label": "🎭 Mood", "style": 2},
+        {"type": 2, "custom_id": "player_like",  "label": like_label, "style": like_style, "disabled": not has_track},
     ]})
 
     return {
@@ -259,6 +270,25 @@ class PlayerView(discord.ui.View):
             color=0x1DB954
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="🤍", style=discord.ButtonStyle.secondary, row=1, custom_id="player_like")
+    async def like_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild, gid = _resolve_interaction_guild(interaction, self.guild_id)
+        if not guild:
+            await interaction.response.send_message("No pude encontrar este servidor.", ephemeral=True)
+            return
+        self.guild_id = gid
+        track = now_playing_info.get(gid)
+        if not track:
+            await interaction.response.send_message("Nada reproduciéndose ahora.", ephemeral=True)
+            return
+        from src import likes as _likes_mod
+        liked = _likes_mod.toggle_like(gid, interaction.user.id, track)
+        action = "❤️ Le diste like" if liked else "💔 Quitaste el like de"
+        await interaction.response.send_message(
+            f"{action} **{track.get('title', '?')}**", ephemeral=True
+        )
+        await update_player_embed(guild, interaction.channel)
 
     @discord.ui.button(label="\U0001f4fb Radio", style=discord.ButtonStyle.secondary, row=1, custom_id="player_radio")
     async def radio_btn(self, interaction: discord.Interaction, button: discord.ui.Button):

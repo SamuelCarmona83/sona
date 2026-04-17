@@ -251,7 +251,7 @@ async def record_played(guild_id: int, track: dict) -> None:
         if len(ids) > _PLAYED_IDS_MAX:
             _played_ids[guild_id] = ids[-_PLAYED_IDS_MAX:]
         _save_played_ids()
-        logger.info(
+        logger.debug(
             "radio.record_played: saved track id=%s title='%s' (total: %d)",
             track_id, track_title, len(ids),
         )
@@ -457,6 +457,64 @@ async def fill_radio_queue(
             gid, get_mood(gid), seed_tracks, seed_genres, needed,
         )
 
+        # --- Liked-tracks priority ---
+        from src import likes as _likes_mod
+        liked_tracks = []
+        vc_channel = getattr(guild.voice_client, "channel", None)
+        if vc_channel is not None:
+            connected_ids = [m.id for m in vc_channel.members if not m.bot]
+            if connected_ids:
+                played_set_for_likes = set(_played_ids.get(gid, []))
+                liked_tracks = _likes_mod.get_prioritized_tracks(
+                    gid, connected_ids, played_set_for_likes, limit=needed
+                )
+        # Resolve liked tracks through YouTube
+        if liked_tracks:
+            from src.youtube import search_youtube as _syt
+            async def _fetch_liked(info: dict) -> dict | None:
+                yt_info = await _syt(info["query"], enable_llm=False, trusted=True)
+                if not yt_info:
+                    return None
+                return {
+                    "title":      yt_info["title"],
+                    "yt_query":   info["query"],
+                    "url":        yt_info["url"],
+                    "requester":  f"📻 Radio ❤️×{info['_like_count']}",
+                    "artist":     info.get("artist", "Unknown"),
+                    "duration":   yt_info.get("duration") or 0,
+                    "thumbnail":  yt_info.get("thumbnail") or "",
+                    "spotify_id": info.get("spotify_id"),
+                    "artist_id":  info.get("artist_id"),
+                }
+            liked_results = await asyncio.gather(*(_fetch_liked(t) for t in liked_tracks))
+            played_set_lk = set(_played_ids.get(gid, []))
+            seen_urls_lk: set[str] = set()
+            priority_tracks = []
+            for t in liked_results:
+                if t is None:
+                    continue
+                sid = t.get("spotify_id")
+                url = t.get("url", "")
+                dedup_key = sid if sid else f"url_{url}"
+                if dedup_key in played_set_lk or url in seen_urls_lk:
+                    continue
+                seen_urls_lk.add(url)
+                priority_tracks.append(t)
+            if priority_tracks:
+                if gid not in queues:
+                    queues[gid] = collections.deque()
+                for track in priority_tracks:
+                    queues[gid].append(track)
+                needed -= len(priority_tracks)
+                logger.info(
+                    "radio.fill: %d canciones liked priorizadas para guild=%s",
+                    len(priority_tracks), gid,
+                )
+                if needed <= 0:
+                    if auto_play and not (vc and (vc.is_playing() or vc.is_paused())):
+                        await play_next(guild, vc, text_channel)
+                    return
+
         recs = await _get_recommendations(seed_tracks, seed_genres, limit=needed + 3)
         using_fallback = False
         if not recs:
@@ -511,6 +569,31 @@ async def fill_radio_queue(
             new_tracks.append(t)
             if len(new_tracks) >= needed:
                 break
+
+        if not new_tracks:
+            # played_ids may have saturated; trim and retry once with empty history
+            ids = _played_ids.get(gid, [])
+            if ids:
+                keep = ids[-200:]
+                _played_ids[gid] = keep
+                _save_played_ids()
+                logger.warning(
+                    "radio.fill: played_ids saturado para guild=%s, trimming a 200 y reintentando",
+                    gid,
+                )
+                retry_played_set = set(keep)
+                for t in results:
+                    if t is None:
+                        continue
+                    sid = t.get("spotify_id")
+                    url = t.get("url", "")
+                    dedup_key = sid if sid else f"url_{url}"
+                    if dedup_key in retry_played_set or url in seen_urls:
+                        continue
+                    seen_urls.add(url)
+                    new_tracks.append(t)
+                    if len(new_tracks) >= needed:
+                        break
 
         if not new_tracks:
             logger.warning("radio.fill: ninguna recomendacion encontrada en YouTube para guild=%s", gid)
