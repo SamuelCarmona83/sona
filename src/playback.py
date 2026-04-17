@@ -2,10 +2,12 @@ import asyncio
 import collections
 import logging
 import random
+import time
 
 import discord
 
 from src.config import FFMPEG_OPTIONS, DJ_ANNOUNCER_ENABLED, DJ_FUN_FACT_INTERVAL
+from src.dj_announcer import get_buenos_aires_hour
 from src.youtube import search_youtube
 from src.bot_instance import bot
 
@@ -26,8 +28,10 @@ _last_cluster: dict[int, str | None] = {}  # DJ announcer: last genre cluster pe
 _prefetch_dj: dict[int, str | None] = {}   # DJ announcer: pre-generated TTS file path
 _welcome_active: dict[int, bool] = {}       # Guard: prevent duplicate welcome per guild
 _songs_since_comment: dict[int, int] = {}   # DJ fun-fact counter per guild
+_last_embed_fresh: dict[int, float] = {}    # Timestamp of last fresh embed delete/recreate per guild
 
 PLAYER_REFRESH_INTERVAL = 4.0
+PLAYER_EMBED_FRESH_INTERVAL = 60.0  # Recreate embed every 60 seconds to bump it down
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +137,12 @@ async def _player_refresh_loop(guild_id: int):
             if not guild or channel is None or not active and not (vc and (vc.is_playing() or vc.is_paused())):
                 break
             try:
-                await update_player_embed(guild, channel)
+                # Check if time for fresh recreate (every ~60 seconds to bump embed down)
+                last_fresh = _last_embed_fresh.get(guild_id, 0)
+                if time.time() - last_fresh >= PLAYER_EMBED_FRESH_INTERVAL:
+                    await refresh_player_embed_fresh(guild, channel)
+                else:
+                    await update_player_embed(guild, channel)
             except Exception as exc:
                 logger.debug("_player_refresh_loop: embed refresh failed for guild=%s: %s", guild_id, exc)
     finally:
@@ -179,7 +188,7 @@ class PlayerView(discord.ui.View):
             vc.resume()
             _paused[gid] = False
         await interaction.response.defer()
-        await update_player_embed(guild, interaction.channel)
+        await refresh_player_embed_fresh(guild, interaction.channel)
 
     @discord.ui.button(label="\u23ed Saltar", style=discord.ButtonStyle.primary, row=0, custom_id="player_skip")
     async def skip_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -210,7 +219,7 @@ class PlayerView(discord.ui.View):
             vc.stop()
             await vc.disconnect()
         await interaction.response.defer()
-        await update_player_embed(guild, interaction.channel)
+        await refresh_player_embed_fresh(guild, interaction.channel)
 
     @discord.ui.button(label="⇄", style=discord.ButtonStyle.secondary, row=0, custom_id="player_shuffle")
     async def shuffle_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -225,7 +234,7 @@ class PlayerView(discord.ui.View):
             random.shuffle(items)
             queues[gid] = collections.deque(items)
         await interaction.response.defer()
-        await update_player_embed(guild, interaction.channel)
+        await refresh_player_embed_fresh(guild, interaction.channel)
 
     @discord.ui.button(label="≡", style=discord.ButtonStyle.secondary, row=0, custom_id="player_queue")
     async def queue_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -265,7 +274,7 @@ class PlayerView(discord.ui.View):
         if not was_active:
             vc = guild.voice_client
             asyncio.ensure_future(start_radio_with_welcome(guild, vc, interaction.channel))
-        await update_player_embed(guild, interaction.channel)
+        await refresh_player_embed_fresh(guild, interaction.channel)
 
     @discord.ui.button(label="\U0001f3ad Mood", style=discord.ButtonStyle.secondary, row=1, custom_id="player_mood")
     async def mood_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -370,6 +379,37 @@ async def update_player_embed(guild: discord.Guild, channel):
         _player_messages[gid] = msg
 
 
+async def refresh_player_embed_fresh(guild: discord.Guild, channel):
+    """Delete old player message and create a fresh one (bumps it down in chat)."""
+    from discord.http import Route
+    gid = guild.id
+    _player_channels[gid] = channel
+    _ensure_player_refresh(guild, channel)
+    lock = _player_update_locks.setdefault(gid, asyncio.Lock())
+
+    async with lock:
+        # Delete old message if exists
+        old = _player_messages.get(gid)
+        if old:
+            try:
+                await old.delete()
+            except Exception as exc:
+                logger.debug("refresh_player_embed_fresh: delete failed for guild=%s: %s", gid, exc)
+            _player_messages[gid] = None
+
+        # Create fresh message
+        payload = _build_v2_payload(gid)
+        try:
+            route = Route("POST", "/channels/{channel_id}/messages", channel_id=channel.id)
+            data = await bot.http.request(route, json=payload)
+            msg = discord.Message(state=bot._connection, channel=channel, data=data)
+            _player_messages[gid] = msg
+            _last_embed_fresh[gid] = time.time()
+            logger.debug("refresh_player_embed_fresh: recreated embed for guild=%s", gid)
+        except Exception as exc:
+            logger.error("refresh_player_embed_fresh: failed to create new message for guild=%s: %s", gid, exc)
+
+
 # ---------------------------------------------------------------------------
 # Playback helpers
 # ---------------------------------------------------------------------------
@@ -414,6 +454,7 @@ async def _prefetch_next(guild_id: int):
             check_cooldown, generate_dj_comment, generate_fun_fact,
             synthesize_dj_audio,
         )
+        hour = get_buenos_aires_hour()
         # Priority 1: if current playing track is a user pick, generate fun fact
         # about it — plays before the next track as a bridge back to radio
         current = now_playing_info.get(guild_id)
@@ -422,6 +463,7 @@ async def _prefetch_next(guild_id: int):
                 current.get("title", ""),
                 current.get("artist", "Unknown"),
                 _last_cluster.get(guild_id),
+                hour,
             )
             dj_file = await synthesize_dj_audio(comment, guild_id)
             if dj_file:
@@ -440,6 +482,7 @@ async def _prefetch_next(guild_id: int):
                     comment = await generate_dj_comment(
                         prev_cluster, new_cluster,
                         next_track.get("title", ""), next_track.get("artist", "Unknown"),
+                        hour,
                     )
                     dj_file = await synthesize_dj_audio(comment, guild_id)
                     if dj_file:
@@ -454,6 +497,7 @@ async def _prefetch_next(guild_id: int):
                 next_track.get("title", ""),
                 next_track.get("artist", "Unknown"),
                 cluster,
+                hour,
             )
             dj_file = await synthesize_dj_audio(comment, guild_id)
             if dj_file:
@@ -531,18 +575,21 @@ async def play_next(guild: discord.Guild, vc: discord.VoiceClient, text_channel)
                             check_cooldown, generate_dj_comment, synthesize_dj_audio,
                         )
                         if check_cooldown(guild.id):
+                            hour = get_buenos_aires_hour()
                             comment = await generate_dj_comment(
                                 prev_cluster, new_cluster,
                                 track.get("title", ""), track.get("artist", "Unknown"),
+                                hour,
                             )
                             dj_file = await synthesize_dj_audio(comment, guild.id)
 
             # --- Fun fact every N songs (radio mode) ---
             if not dj_file and _songs_since_comment.get(guild.id, 0) >= DJ_FUN_FACT_INTERVAL:
                 from src.dj_announcer import generate_fun_fact, synthesize_dj_audio
+                hour = get_buenos_aires_hour()
                 cluster = _last_cluster.get(guild.id)
                 comment = await generate_fun_fact(
-                    track.get("title", ""), track.get("artist", "Unknown"), cluster,
+                    track.get("title", ""), track.get("artist", "Unknown"), cluster, hour,
                 )
                 dj_file = await synthesize_dj_audio(comment, guild.id)
 
@@ -635,7 +682,8 @@ async def start_radio_with_welcome(
             return None
         from src.dj_announcer import generate_welcome_message, synthesize_dj_audio
         mood = _radio.get_mood(gid)
-        text = await generate_welcome_message(mood)
+        hour = get_buenos_aires_hour()
+        text = await generate_welcome_message(mood, hour)
         return await synthesize_dj_audio(text, gid)
 
     async def _fill():

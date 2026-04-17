@@ -11,6 +11,8 @@ import os
 import pathlib
 import random
 import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import edge_tts
 
@@ -67,6 +69,30 @@ _WELCOME_TEMPLATES = [
     "¡La fiesta empieza ya! Modo {mood}. ¡Conecten y disfruten!",
 ]
 
+_WELCOME_TEMPLATES_MORNING = [
+    "¡Buenos días! La radio despierta en modo {mood}. ¡Que comience la música matinal!",
+    "¡Buen día a todos! Arrancamos el día con {mood}. ¡A disfrutar!",
+    "¡Hola! Mañana en la radio con modo {mood}. ¡Vamos con energía!",
+]
+
+_WELCOME_TEMPLATES_AFTERNOON = [
+    "¡Buenas tardes! Radio en el aire, modo {mood}. ¡Que disfruten!",
+    "¡Hola gente! Es momento de {mood}. ¡La tarde es nuestra!",
+    "¡Tardes! Radio con modo {mood}. ¡A conectarse!",
+]
+
+_WELCOME_TEMPLATES_EVENING = [
+    "¡Buenas noches! Radio en vivo, modo {mood}. ¡Que comience la jornada nocturna!",
+    "¡Hola a todos! Atardecer musical en modo {mood}. ¡Disfruten!",
+    "¡Llega la noche! Radio con modo {mood}. ¡Prepárense para lo mejor!",
+]
+
+_WELCOME_TEMPLATES_NIGHT = [
+    "¡Buenas noches! La radio llega a la madrugada en modo {mood}. ¡Que siga la fiesta!",
+    "¡Hola madrugadores! Modo {mood} encendido. ¡Conecten y disfruten!",
+    "¡La noche es larga! Radio en modo {mood}. ¡Vamos con todo!",
+]
+
 
 def check_cooldown(guild_id: int) -> bool:
     """Return True if enough time has passed since last announcement."""
@@ -79,6 +105,29 @@ def mark_announced(guild_id: int) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Daytime awareness (Buenos Aires timezone)
+# ---------------------------------------------------------------------------
+
+def get_buenos_aires_hour() -> int:
+    """Get current hour in Buenos Aires timezone (America/Argentina/Buenos_Aires)."""
+    tz_ba = ZoneInfo("America/Argentina/Buenos_Aires")
+    now_ba = datetime.now(tz_ba)
+    return now_ba.hour
+
+
+def get_daytime_period(hour: int) -> str:
+    """Return daytime period based on hour (0-23). Buenos Aires-aware."""
+    if 5 <= hour < 12:
+        return "morning"
+    elif 12 <= hour < 17:
+        return "afternoon"
+    elif 17 <= hour < 21:
+        return "evening"
+    else:
+        return "night"
+
+
+# ---------------------------------------------------------------------------
 # LLM comment generation
 # ---------------------------------------------------------------------------
 
@@ -87,10 +136,12 @@ async def generate_dj_comment(
     new_cluster: str,
     next_title: str,
     next_artist: str,
+    hour: int,
 ) -> str:
     """Generate a short DJ transition comment. Falls back to template on failure."""
     old_name = _CLUSTER_NAMES.get(old_cluster or "", old_cluster or "variado")
     new_name = _CLUSTER_NAMES.get(new_cluster, new_cluster)
+    daytime = get_daytime_period(hour)
 
     # Try LLM first
     if ANTHROPIC_API_KEY:
@@ -106,7 +157,8 @@ async def generate_dj_comment(
                         "Eres un DJ de radio en español, carismático y conciso. "
                         "Genera UNA frase corta (máximo 2 oraciones) anunciando "
                         "la transición de género musical. Sé natural, con energía. "
-                        "No uses hashtags ni emojis. Solo texto hablado."
+                        "No uses hashtags ni emojis. Solo texto hablado. "
+                        f"Es {daytime} en Buenos Aires."
                     ),
                     messages=[{
                         "role": "user",
@@ -135,9 +187,20 @@ async def generate_dj_comment(
 # Welcome message generation
 # ---------------------------------------------------------------------------
 
-async def generate_welcome_message(mood: str) -> str:
-    """Generate a radio startup welcome message in Spanish."""
+async def generate_welcome_message(mood: str, hour: int) -> str:
+    """Generate a radio startup welcome message in Spanish, aware of daytime."""
     mood_display = _CLUSTER_NAMES.get(mood, mood.capitalize())
+    daytime = get_daytime_period(hour)
+
+    # Select templates based on daytime
+    if daytime == "morning":
+        templates = _WELCOME_TEMPLATES_MORNING
+    elif daytime == "afternoon":
+        templates = _WELCOME_TEMPLATES_AFTERNOON
+    elif daytime == "evening":
+        templates = _WELCOME_TEMPLATES_EVENING
+    else:  # night
+        templates = _WELCOME_TEMPLATES_NIGHT
 
     if ANTHROPIC_API_KEY:
         try:
@@ -152,7 +215,8 @@ async def generate_welcome_message(mood: str) -> str:
                         "Eres un DJ de radio en español, carismático y conciso. "
                         "Genera UNA frase corta (máximo 2 oraciones) dando la bienvenida "
                         "a los oyentes y anunciando el mood musical. Sé natural, con energía. "
-                        "No uses hashtags ni emojis. Solo texto hablado."
+                        "No uses hashtags ni emojis. Solo texto hablado. "
+                        f"Es {daytime} en Buenos Aires."
                     ),
                     messages=[{
                         "role": "user",
@@ -168,7 +232,7 @@ async def generate_welcome_message(mood: str) -> str:
         except Exception as exc:
             logger.warning("dj_announcer: welcome LLM failed: %s", exc)
 
-    return random.choice(_WELCOME_TEMPLATES).format(mood=mood_display)
+    return random.choice(templates).format(mood=mood_display)
 
 
 # ---------------------------------------------------------------------------
@@ -188,9 +252,11 @@ async def generate_fun_fact(
     title: str,
     artist: str,
     cluster: str | None,
+    hour: int,
 ) -> str:
     """Generate a short interesting fact about the track, artist or genre."""
     cluster_name = _CLUSTER_NAMES.get(cluster or "", cluster or "música")
+    daytime = get_daytime_period(hour)
 
     if ANTHROPIC_API_KEY:
         try:
@@ -206,7 +272,8 @@ async def generate_fun_fact(
                         "Genera UNA frase corta (máximo 2 oraciones) con un dato "
                         "curioso o interesante sobre el artista, la canción o el "
                         "género musical. Sé informativo y entretenido. "
-                        "No uses hashtags ni emojis. Solo texto hablado."
+                        "No uses hashtags ni emojis. Solo texto hablado. "
+                        f"Es {daytime} en Buenos Aires."
                     ),
                     messages=[{
                         "role": "user",

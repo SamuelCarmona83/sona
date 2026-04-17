@@ -11,7 +11,7 @@ from src.config import ALLOWED_CHANNEL_ID, ADMIN_USER_ID, LLM_ENABLED_FOR_ALBUM_
 from src.bot_instance import bot
 import random
 
-from src.playback import queues, now_playing_info, play_next, update_player_embed, _paused
+from src.playback import queues, now_playing_info, play_next, update_player_embed, refresh_player_embed_fresh, _paused
 from src.spotify import (
     _is_spotify_url,
     _get_tracks_from_spotify_url,
@@ -329,6 +329,8 @@ async def play(ctx: commands.Context, *, query: str):
         added_count = len(tracks_to_queue)
         label = tracks_to_queue[0]['title'] if added_count == 1 else f"{added_count} canciones"
         await ctx.send(f"\u2795 {label} anadida(s) a la cola.", delete_after=8)
+        # Bump player embed down when user adds to queue
+        asyncio.ensure_future(refresh_player_embed_fresh(ctx.guild, ctx.channel))
     else:
         await play_next(ctx.guild, vc, ctx.channel)
 
@@ -480,6 +482,8 @@ async def search(ctx: commands.Context, *, query: str):
                 color=0x1DB954
             )
             await selection_msg.edit(embed=embed_confirm, view=None)
+            # Bump player embed down when user adds to queue
+            asyncio.ensure_future(refresh_player_embed_fresh(ctx.guild, ctx.channel))
             return
 
 
