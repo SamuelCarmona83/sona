@@ -42,6 +42,10 @@ def _is_youtube_url(query: str) -> str | None:
     if not _YT_URL_RE.search(query):
         return None
     if re.search(r"[?&]list=", query):
+        # YouTube Radio/Mix playlists (list=RD...) paired with a v= are treated as
+        # single tracks — the Mix list itself is auto-generated and unreliable to expand.
+        if re.search(r"[?&]list=RD", query) and re.search(r"[?&]v=", query):
+            return "track"
         return "playlist"
     if re.search(r"youtu\.be/|[?&]v=|/watch", query):
         return "track"

@@ -61,6 +61,7 @@ poetry.lock
 # dotenv
 .env
 .env.*
+cookies.txt
 
 # mypy
 .mypy_cache/

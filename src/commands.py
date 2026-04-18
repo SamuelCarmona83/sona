@@ -14,6 +14,7 @@ import random
 from src.playback import queues, now_playing_info, play_next, update_player_embed, refresh_player_embed_fresh, _paused
 from src.spotify import (
     _is_spotify_url,
+    _parse_spotify_url,
     _get_tracks_from_spotify_url,
     _get_spotify_query,
     _get_spotify_track_info,
@@ -232,6 +233,15 @@ async def play(ctx: commands.Context, *, query: str):
             return
         # track_infos is now list[dict] with {query, spotify_id, artist_id}
         yt_queries = track_infos
+    elif re.search(r"https?://", query):
+        # Unknown URL (SoundCloud, Tidal, etc.) — reject early
+        await msg.edit(content="No reconozco esa URL. Usa YouTube, Spotify o escribe el nombre de la canción.")
+        await asyncio.sleep(5)
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        return
     else:
         # Regular text search; refine with Spotify
         info = await _get_spotify_track_info(query)
@@ -344,12 +354,53 @@ async def search(ctx: commands.Context, *, query: str):
     voice_channel = ctx.author.voice.channel
     msg = await ctx.send(f"\U0001f50d Buscando **{query}**...", delete_after=60)
 
+    # If a direct YouTube URL is passed to !search, delegate to !play logic
+    if _is_youtube_url(query):
+        yt_tracks = await extract_youtube_tracks(query)
+        if not yt_tracks:
+            await msg.edit(content="No se pudo procesar la URL de YouTube.")
+            return
+        vc = ctx.guild.voice_client
+        if vc is None:
+            vc = await voice_channel.connect()
+        elif vc.channel != voice_channel:
+            await vc.move_to(voice_channel)
+        if ctx.guild.id not in queues:
+            queues[ctx.guild.id] = collections.deque()
+        for t in yt_tracks:
+            queues[ctx.guild.id].append({
+                "title":     t["title"],
+                "yt_query":  t["yt_query"],
+                "url":       t.get("url"),
+                "requester": ctx.author.display_name,
+                "artist":    t.get("uploader") or "Unknown",
+                "duration":  t.get("duration") or 0,
+                "thumbnail": t.get("thumbnail") or "",
+                "acodec":    t.get("acodec", "?"),
+                "abr":       t.get("abr", 0),
+            })
+        await msg.delete()
+        if not (vc.is_playing() or vc.is_paused()):
+            await play_next(ctx.guild, vc, ctx.channel)
+        return
+
     # Resolve Spotify URLs to track name before searching YouTube
     if _is_spotify_url(query):
+        sp_parsed = _parse_spotify_url(query)
+        if sp_parsed and sp_parsed["type"] in ("album", "playlist"):
+            # Album/playlist → silently delegate to !play (enqueues all tracks)
+            await msg.delete()
+            await play(ctx, query=query)
+            return
         spotify_infos = await _get_tracks_from_spotify_url(query)
         if spotify_infos:
             query = spotify_infos[0]["query"]
             await msg.edit(content=f"\U0001f50d Buscando **{query}**...")
+
+    # Unknown URL → reject early with a helpful message
+    elif re.search(r"https?://", query):
+        await msg.edit(content="No reconozco esa URL. Usa YouTube, Spotify o escribe el nombre de la canción.")
+        return
 
     # Get top 5 candidates
     candidates = await get_search_candidates(query)

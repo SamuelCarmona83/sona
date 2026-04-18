@@ -9,6 +9,9 @@ services:
       - ./.env:/app/.env:ro
       # Persist the Spotify OAuth token between restarts
       - ./spotify_cache:/app/.cache
+      # YouTube cookies file (export from browser via "Get cookies.txt LOCALLY" extension)
+      # Not read-only: yt-dlp rewrites cookies file to persist refreshed session tokens
+      - ./cookies.txt:/app/cookies.txt
     environment:
       SPOTIFY_CACHE_PATH: /app/.cache/spotify.cache
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}

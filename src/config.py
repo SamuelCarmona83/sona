@@ -41,14 +41,20 @@ _ytdl_base_options = {
     "noplaylist": True,
     "source_address": "0.0.0.0",
     "ignoreerrors": True,  # Skip unavailable videos in search results instead of failing
+    "extractor_retries": 3,
     # YouTube bot detection workarounds
     "http_headers": {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     },
 }
 
-# Only enable browser cookie extraction if explicitly requested (to avoid CookieLoadError)
-if os.getenv("YTDL_COOKIES_FROM_BROWSER", "").lower() not in ("", "0", "false", "no"):
+# Cookie file support (preferred over browser extraction in Docker environments)
+_cookies_file = os.getenv("YTDL_COOKIES_FILE", "/app/cookies.txt")
+if _cookies_file and os.path.isfile(_cookies_file):
+    _ytdl_base_options["cookiefile"] = _cookies_file
+    logger.info("yt-dlp: using cookies file: %s", _cookies_file)
+elif os.getenv("YTDL_COOKIES_FROM_BROWSER", "").lower() not in ("", "0", "false", "no"):
+    # Only enable browser cookie extraction if explicitly requested (to avoid CookieLoadError)
     _ytdl_base_options["cookiesfrombrowser"] = os.getenv("YTDL_COOKIES_FROM_BROWSER", "firefox,chrome")
 
 YTDL_OPTIONS = _ytdl_base_options

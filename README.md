@@ -1,148 +1,124 @@
-# 🎵 Spoty Scanner - Discord Music Bot
+# 🎵 Spoty Scanner — Discord Music Bot
 
-A Discord music bot that plays songs from Spotify links and searches. It intelligently matches YouTube videos, uses LLM-based tie-breaking, and optimizes API costs.
+Play Spotify/YouTube/search on Discord.
+Solves modern YouTube bot detection. LLM-ranked to reduce costs 70%.
 
-## ✨ Features
+## ✨ What It Does
 
-- **🎶 Spotify Integration** — Play individual tracks, entire albums, or playlists from Spotify URLs
-- **🔍 Smart Search** — Heuristic-based ranking + LLM tie-breaking to find best YouTube matches
-- **⚡ Optimized** — Search caching and limited LLM calls reduce API costs by 70%
-- **📝 Dynamic Queue** — Queue tracks from albums/playlists, play first track immediately
-- **🔊 Voice Channel Status** — Bot shows what's playing in Discord's voice channel status
-- **🎯 Text Search** — Search by song/artist name with Spotify refinement
-
-![Bot Interface](assets/image.png)
+- **URL aware** — Spotify/YouTube/YouTube Music links routed correctly
+- **YouTube JS challenges** — Deno + EJS solve modern signatures
+- **Smart YouTube search** — Heuristic + LLM tie-break finds best match
+- **Cheap** — Search cache + limited LLM calls (first 3 album tracks only)
+- **Queue magic** — Spotify albums/playlists auto-expand
+- **Status flex** — Shows now-playing in voice channel status
 
 ## 🚀 Quick Start
 
-### 1. Setup (First Time)
-
 ```bash
+# Setup (one-time)
 ./setup.sh
-```
 
-This guides you through:
-- Getting Spotify credentials from [Spotify Developer Dashboard](https://developer.spotify.com/dashboard)
-- Setting up environment variables
+# Run in Docker (recommended)
+docker-compose up
 
-### 2. Run the Bot
-
-```bash
+# Or local
 ./run.sh
 ```
 
-This automatically:
-- Creates/activates the Python virtual environment
-- Installs dependencies
-- Starts the bot
-
-### 3. Use in Discord
-
-1. Add the bot to your server (get invite from your bot page in Spotify Dashboard)
-2. Join a voice channel
-3. Use commands in the allowed text channel:
-
+Then in Discord (in your voice channel):
 ```
-!play "artist - song name"         # Search and play
-!play <spotify_url>                # Play from Spotify URL (track, album, or playlist)
-!skip                              # Skip current song
-!pause                             # Pause playback
-!resume                            # Resume playback
-!queue                             # Show queue
-!np                                # Now playing
-!stop                              # Stop and clear queue
-!leave                             # Disconnect bot
+!play <song|spotify|youtube>   # Play directly
+!search <song|spotify>          # Pick from 5 candidates
+!queue / !skip / !pause / !resume
+!np / !stop / !leave
 ```
 
-## 🔧 Environment Setup
+## 🔧 Setup
 
-### Automatic (Recommended)
+### Docker (No Extra Steps)
+- Builds Python 3.12 + Deno + EJS
+- Mounts `cookies.txt` (auto-updated by yt-dlp)
+- Handles FFmpeg + all deps
+
+### Local
 ```bash
-./setup.sh
-```
-
-### Manual
-```bash
-python3 -m venv venv
-source venv/bin/activate
+python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
-
-export BOT_TOKEN="your_discord_bot_token"
-export SPOTIFY_CLIENT_ID="your_client_id"
-export SPOTIFY_CLIENT_SECRET="your_client_secret"
-export SPOTIFY_REDIRECT_URI="http://localhost:8888/callback"
-export ALLOWED_CHANNEL_ID="discord_channel_id"
-export VOICE_CHANNEL_ID="voice_channel_id"
+export BOT_TOKEN="..."
+export SPOTIFY_CLIENT_ID="..."
+export SPOTIFY_CLIENT_SECRET="..."
 ```
 
-## 📊 Optimizations
+**Export browser cookies** to `./cookies.txt` via [cookies.txt extension](https://github.com/salsifis/cookies.txt).
 
-The bot includes 4 cost-reduction strategies:
+## 🎯 URL Routing
 
-1. **Search Cache** — Identical queries reuse cached YouTube results
-2. **Increased LLM Margin** — LLM only called when candidates have <4.5 point spread (was 3.0)
-3. **Limited LLM Tracks** — For albums/playlists, LLM only used on first 3 tracks
-4. **Aggressive Heuristics** — Unwanted variants (live, remix, cover) score more harshly
+| Input | !play | !search |
+|-------|-------|----------|
+| YouTube (track/mix/playlist) | play | play |
+| Spotify track | YouTube search | 5 candidates |
+| Spotify album/playlist | queue all | queue all |
+| Unknown URL (SoundCloud, etc.) | error | error |
+| Text | YouTube search | 5 candidates |
 
-**Result**: 10-track album: ~10 API calls → ~3 calls (70% reduction)
+## 📁 Codebase
 
-## 🎯 Settings
+```
+src/
+├── commands.py      — !play, !search, !queue handlers (robust URL routing)
+├── youtube.py       — URL detection, extraction, ranking
+├── spotify.py       — URL parsing, track fetching
+├── config.py        — YTDL_OPTIONS, LLM settings, Spotify creds
+├── playback.py      — Queue + voice playback
+├── scoring.py       — Heuristic ranking + LLM tie-breaking
+├── radio.py         — Genre-based auto-queue
+└── dj_announcer.py  — TTS between songs
+```
 
-Edit these constants in `bot.py` to customize behavior:
+## ⚙️ Config (`src/config.py`)
 
 ```python
-ALLOWED_CHANNEL_ID = 1163479541029810226  # Only this channel can use commands
-VOICE_CHANNEL_ID = 1397428777876721716    # Connect to this voice channel on startup
-MIN_SEARCH_SCORE = 6.0                    # Minimum quality threshold for YouTube matches
-LLM_SCORE_MARGIN = 4.5                    # How close scores need to be for LLM tie-break
-LLM_ENABLED_FOR_ALBUM_TRACKS = 3          # Use LLM for first N tracks in bulk operations
+YTDL_OPTIONS["cookiefile"] = "/app/cookies.txt"  # yt-dlp refreshes auto
+LLM_SCORE_MARGIN = 4.5         # LLM only if candidates within 4.5 points
+LLM_ENABLED_FOR_ALBUM_TRACKS = 3   # LLM on first 3 tracks only
+MIN_SEARCH_SCORE = 6.0         # Reject YouTube matches below 6.0
+NORMALIZE_AUDIO = "true"       # Real-time loudness (dynaudnorm filter)
+DJ_ANNOUNCER_ENABLED = "true"  # TTS between genre changes
 ```
 
-## 📁 Project Structure
+## 📊 Cost Reduction
 
-```
-spoty-scanner/
-├── bot.py                    # Main Discord music bot
-├── poc_setlistfm.py         # Setlist.fm playlist generator (legacy)
-├── main.py                  # Artist discography generator (legacy)
-├── requirements.txt         # Python dependencies
-├── setup.sh                 # Auto-setup script
-├── run.sh                   # Auto-run script
-└── README.md               # This file
-```
+- **Search cache** — Reuse YouTube results for identical queries
+- **LLM margin** — Only call LLM if top 2 candidates within 4.5 points
+- **Album limit** — LLM on first 3 tracks, heuristic for rest
+- **Aggressive filtering** — "live", "remix", "cover" penalized hard
 
-## 🔐 Getting Spotify Credentials
+**Result**: 10-track album = 10 API calls → 3 calls (70% cut)
 
-1. Go to [Spotify Developer Dashboard](https://developer.spotify.com/dashboard)
-2. Sign in with your Spotify account
-3. Create a new app
-4. Copy **Client ID** and **Client Secret**
-5. Add Redirect URI: `http://localhost:8888/callback`
+## 🔐 Credentials
 
-## 🤖 Getting Discord Bot Token
+### Spotify
+1. [Developer Dashboard](https://developer.spotify.com/dashboard)
+2. Create app → copy ID/Secret
+3. Redirect URI: `http://localhost:8888/callback`
 
-1. Go to [Discord Developer Portal](https://discord.com/developers/applications)
-2. Create a new application
-3. Go to "Bot" tab → "Add Bot"
-4. Copy the token (under "TOKEN")
-5. Set `Privileged Gateway Intents`: Message Content Intent + Voice States Intent
-6. In OAuth2 → URL Generator, select scopes: `bot` and permissions: `Send Messages`, `Connect to Voice`, `Speak`, `Use Voice Activity`
-
-## ⚠️ Limits
-
-- **YouTube throttling** — Stagger searches for large playlists (100+ tracks)
-- **Spotify API** — Standard rate limits apply
-- **LLM costs** — Reduced by 70% via optimizations, but still ~$0.01 per album with LLM enabled
+### Discord
+1. [Developer Portal](https://discord.com/developers/applications)
+2. Create app → Add Bot → copy token
+3. Intents: Message Content, Voice States
+4. OAuth2 scopes: `bot`
+5. Permissions: Send Messages, Connect, Speak, Use Voice Activity
 
 ## 🐛 Troubleshooting
 
-| Issue | Solution |
-|-------|----------|
-| Bot won't start | Run `./setup.sh` to verify all credentials |
-| Commands not working | Verify `ALLOWED_CHANNEL_ID` matches your Discord channel |
-| No audio in voice | Check bot has "Speak" permission in voice channel |
-| YouTube search failing | Bot will fall back to searching for each track individually |
-| "No reliable candidate" warning | Lower `MIN_SEARCH_SCORE` or check if track exists on YouTube |
+| Issue | Fix |
+|-------|-----|
+| "Sign in to confirm you're not a bot" | Update cookies.txt; `pip install --upgrade yt-dlp>=2025.1.0` |
+| Bot won't start (Docker) | `docker-compose build --no-cache` |
+| Commands not working | Check `ALLOWED_CHANNEL_ID` in config |
+| No audio | Check bot "Speak" perms in voice channel |
+| YouTube fails | `deno --version` (must be installed); refresh cookies.txt |
+| "No se encontró nada" | Invalid query; try exact song name |
 
 ## 📝 License
 
