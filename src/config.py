@@ -31,7 +31,8 @@ ADMIN_USER_ID = 221081593790332929
 # YT-DLP
 # ---------------------------------------------------------------------------
 
-YTDL_OPTIONS = {
+# Build yt-dlp options with optional cookie support
+_ytdl_base_options = {
     # Prefer m4a/AAC: one transcode (AAC→Opus) is cleaner than opus→PCM→Opus.
     # Falls back to webm/opus if m4a is not available, then any best audio.
     "format": "bestaudio[ext=m4a]/bestaudio[acodec=opus]/bestaudio/best",
@@ -40,7 +41,17 @@ YTDL_OPTIONS = {
     "noplaylist": True,
     "source_address": "0.0.0.0",
     "ignoreerrors": True,  # Skip unavailable videos in search results instead of failing
+    # YouTube bot detection workarounds
+    "http_headers": {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    },
 }
+
+# Only enable browser cookie extraction if explicitly requested (to avoid CookieLoadError)
+if os.getenv("YTDL_COOKIES_FROM_BROWSER", "").lower() not in ("", "0", "false", "no"):
+    _ytdl_base_options["cookiesfrombrowser"] = os.getenv("YTDL_COOKIES_FROM_BROWSER", "firefox,chrome")
+
+YTDL_OPTIONS = _ytdl_base_options
 
 # -reconnect*        keeps the stream alive on transient network errors.
 # -probesize         10M is enough for audio; 200M was stalling the pipeline.
@@ -133,4 +144,13 @@ bot_token = get_config_value("BOT_TOKEN", dotenv_values)
 if not bot_token:
     raise ValueError("Falta BOT_TOKEN en variables de entorno o en .env.")
 
-sp = build_spotify_client(dotenv_values)
+# Try to initialize Spotify client; disable features if credentials missing
+sp = None
+SPOTIFY_AVAILABLE = False
+try:
+    sp = build_spotify_client(dotenv_values)
+    SPOTIFY_AVAILABLE = True
+    logger.info("Spotify client initialized.")
+except (ValueError, Exception) as exc:
+    logger.warning(f"Spotify unavailable: {exc}. Radio + fun facts will use fallback mode.")
+    SPOTIFY_AVAILABLE = False

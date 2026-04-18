@@ -494,6 +494,7 @@ async def _prefetch_next(guild_id: int):
                 current.get("artist", "Unknown"),
                 _last_cluster.get(guild_id),
                 hour,
+                artist_id=current.get("artist_id"),
             )
             dj_file = await synthesize_dj_audio(comment, guild_id)
             if dj_file:
@@ -528,6 +529,7 @@ async def _prefetch_next(guild_id: int):
                 next_track.get("artist", "Unknown"),
                 cluster,
                 hour,
+                artist_id=next_track.get("artist_id"),
             )
             dj_file = await synthesize_dj_audio(comment, guild_id)
             if dj_file:
@@ -620,6 +622,7 @@ async def play_next(guild: discord.Guild, vc: discord.VoiceClient, text_channel)
                 cluster = _last_cluster.get(guild.id)
                 comment = await generate_fun_fact(
                     track.get("title", ""), track.get("artist", "Unknown"), cluster, hour,
+                    artist_id=track.get("artist_id"),
                 )
                 dj_file = await synthesize_dj_audio(comment, guild.id)
 

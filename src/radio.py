@@ -436,7 +436,7 @@ async def fill_radio_queue(
     automatically (caller is responsible for starting playback).
     """
     from src.playback import queues, now_playing_info, play_next
-    from src.spotify import _get_recommendations
+    from src.spotify import _get_recommendations_hybrid
     from src.youtube import search_youtube
     from src.scoring import _split_query_parts
 
@@ -515,11 +515,11 @@ async def fill_radio_queue(
                         await play_next(guild, vc, text_channel)
                     return
 
-        recs = await _get_recommendations(seed_tracks, seed_genres, limit=needed + 3)
+        recs = await _get_recommendations_hybrid(seed_tracks, seed_genres, limit=needed + 3)
         using_fallback = False
         if not recs:
             logger.warning(
-                "radio.fill: Spotify sin recomendaciones para guild=%s, usando fallback YouTube",
+                "radio.fill: Hybrid recommendations exhausted for guild=%s, usando fallback YouTube",
                 gid,
             )
             recs = await _youtube_fallback_fill(gid, needed + 3)

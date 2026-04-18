@@ -277,6 +277,130 @@ async def _get_recommendations(
     return results[:limit]
 
 
+async def _get_recommendations_hybrid(
+    seed_tracks: list[str] = None,
+    seed_genres: list[str] = None,
+    limit: int = 10,
+) -> list[dict]:
+    """Get recommendations with fallback chain: Spotify → LastFM → YouTube generic.
+    
+    Tries Spotify first (if available), falls back to LastFM similar artists,
+    then YouTube generic search as last resort.
+    
+    Returns list of dicts with keys: query, spotify_id (or None), artist_id (or None).
+    """
+    from src.config import SPOTIFY_AVAILABLE
+    
+    if seed_tracks is None:
+        seed_tracks = []
+    if seed_genres is None:
+        seed_genres = []
+    
+    # Tier 1: Try Spotify if available
+    if SPOTIFY_AVAILABLE and (seed_tracks or seed_genres):
+        try:
+            recs = await _get_recommendations(seed_tracks, seed_genres, limit=limit)
+            if recs:
+                logger.info(
+                    "_get_recommendations_hybrid: Spotify tier worked, %d recs",
+                    len(recs),
+                )
+                return recs
+        except Exception as exc:
+            logger.warning(
+                "_get_recommendations_hybrid: Spotify tier failed: %s",
+                exc,
+            )
+    
+    # Tier 2: LastFM fallback using similar artists + top tracks
+    from src import lastfm
+    recommendations: list[dict] = []
+    seen_queries: set[str] = set()
+    
+    # If we have seed_genres, search for artists in those genres via LastFM
+    if seed_genres:
+        for genre in seed_genres[:3]:  # Limit to 3 genres
+            try:
+                artists = await lastfm.search_artists_by_genre(genre, limit=3)
+                for artist_name in artists:
+                    if len(recommendations) >= limit * 2:
+                        break
+                    try:
+                        tracks = await lastfm.get_top_tracks(artist_name, limit=3)
+                        for track in tracks:
+                            if len(recommendations) >= limit * 2:
+                                break
+                            query = f"{track['artist']} {track['title']}"
+                            if query not in seen_queries:
+                                seen_queries.add(query)
+                                recommendations.append({
+                                    "query": query,
+                                    "spotify_id": None,
+                                    "artist_id": None,
+                                })
+                    except Exception as e:
+                        logger.debug(f"_get_recommendations_hybrid: LastFM tracks for {artist_name} failed: {e}")
+            except Exception as e:
+                logger.debug(f"_get_recommendations_hybrid: LastFM genre search for {genre} failed: {e}")
+    
+    if recommendations:
+        _random.shuffle(recommendations)
+        logger.info(
+            "_get_recommendations_hybrid: LastFM tier worked, %d recs from genres",
+            len(recommendations),
+        )
+        return recommendations[:limit]
+    
+    # If we have seed_tracks (artist info), get similar artists via LastFM
+    if seed_tracks:
+        for track_id in seed_tracks[:3]:
+            try:
+                track = await asyncio.to_thread(lambda tid=track_id: sp.track(tid))
+                artists = track.get("artists") or []
+                if not artists:
+                    continue
+                artist_name = artists[0].get("name", "")
+                if not artist_name:
+                    continue
+                
+                # Get similar artists and their top tracks
+                similar = await lastfm.get_similar_artists(artist_name, limit=5)
+                for similar_artist in similar:
+                    if len(recommendations) >= limit * 2:
+                        break
+                    try:
+                        tracks = await lastfm.get_top_tracks(similar_artist, limit=2)
+                        for track in tracks:
+                            if len(recommendations) >= limit * 2:
+                                break
+                            query = f"{track['artist']} {track['title']}"
+                            if query not in seen_queries:
+                                seen_queries.add(query)
+                                recommendations.append({
+                                    "query": query,
+                                    "spotify_id": None,
+                                    "artist_id": None,
+                                })
+                    except Exception as e:
+                        logger.debug(f"_get_recommendations_hybrid: LastFM tracks for {similar_artist} failed: {e}")
+            except Exception as e:
+                logger.debug(f"_get_recommendations_hybrid: LastFM similar artists failed: {e}")
+    
+    if recommendations:
+        _random.shuffle(recommendations)
+        logger.info(
+            "_get_recommendations_hybrid: LastFM tier worked, %d recs from similar",
+            len(recommendations),
+        )
+        return recommendations[:limit]
+    
+    # Tier 3: Generic YouTube fallback (if all else fails)
+    logger.warning(
+        "_get_recommendations_hybrid: all tiers exhausted, returning empty list for fallback YouTube"
+    )
+    return []
+
+
 async def _ensure_auth(ctx: commands.Context) -> bool:
     global _oauth_code, _oauth_received
     auth_manager = sp.auth_manager

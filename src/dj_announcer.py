@@ -247,18 +247,54 @@ _FUN_FACT_TEMPLATES = [
     "Dato musical: la canción que viene, '{title}', es todo un clásico de {artist}.",
 ]
 
+# Safe templates (metadata-free; never hallucinate without artist/genre data)
+_SAFE_FUN_FACT_TEMPLATES = [
+    "¿Sabían que {artist} se especializa en {cluster}? ¡Disfrútenlo!",
+    "Dato: el {cluster} es uno de los géneros más energéticos. {artist} lo domina.",
+    "Escuchamos: '{title}' de {artist}. ¡Que suene!",
+    "{artist} trayendo {cluster}. ¡Conecten!",
+    "Género: {cluster}. Artista: {artist}. Momento: ahora. ¡Disfruta!",
+]
+
+
+async def _get_artist_metadata(artist_id: str | None) -> dict | None:
+    """Fetch artist metadata from Spotify if available. Return dict or None."""
+    if not artist_id:
+        return None
+    
+    from src.config import SPOTIFY_AVAILABLE
+    if not SPOTIFY_AVAILABLE:
+        return None
+    
+    try:
+        from src.spotify import _get_artist_genres
+        genres = await _get_artist_genres(artist_id)
+        if genres:
+            return {"genres": genres, "genres_str": ", ".join(genres[:3])}
+    except Exception as exc:
+        logger.debug(f"_get_artist_metadata: error fetching for {artist_id}: {exc}")
+    
+    return None
+
 
 async def generate_fun_fact(
     title: str,
     artist: str,
     cluster: str | None,
     hour: int,
+    artist_id: str | None = None,
 ) -> str:
-    """Generate a short interesting fact about the track, artist or genre."""
+    """Generate a short interesting fact about the track, artist or genre.
+    
+    If artist_id available, fetch metadata for enhanced LLM context.
+    If metadata unavailable, use safe templates (never hallucinate).
+    """
     cluster_name = _CLUSTER_NAMES.get(cluster or "", cluster or "música")
     daytime = get_daytime_period(hour)
+    metadata = await _get_artist_metadata(artist_id)
 
-    if ANTHROPIC_API_KEY:
+    if ANTHROPIC_API_KEY and metadata:
+        # Tier 1: LLM with metadata context (less likely to hallucinate)
         try:
             import anthropic
 
@@ -270,8 +306,10 @@ async def generate_fun_fact(
                     system=(
                         "Eres un DJ de radio en español, carismático y conciso. "
                         "Genera UNA frase corta (máximo 2 oraciones) con un dato "
-                        "curioso o interesante sobre el artista, la canción o el "
-                        "género musical. Sé informativo y entretenido. "
+                        "curioso o interesante verificable sobre el artista, la canción o el "
+                        "género musical. SOLO datos que puedas confirmar. "
+                        "No inventes eras, nacionalidad, historia de bandas. "
+                        "Sé informativo y entretenido. "
                         "No uses hashtags ni emojis. Solo texto hablado. "
                         f"Es {daytime} en Buenos Aires."
                     ),
@@ -280,7 +318,8 @@ async def generate_fun_fact(
                         "content": (
                             f"Canción: '{title}' de {artist}. "
                             f"Género: {cluster_name}. "
-                            "Comparte un dato curioso."
+                            f"Géneros confirmados: {metadata.get('genres_str', '')}. "
+                            "Comparte un dato curioso verificable."
                         ),
                     }],
                 ),
@@ -292,8 +331,9 @@ async def generate_fun_fact(
                 return text
         except Exception as exc:
             logger.warning("dj_announcer: fun fact LLM failed: %s", exc)
-
-    return random.choice(_FUN_FACT_TEMPLATES).format(
+    
+    # Tier 3: Safe template (no hallucination risk)
+    return random.choice(_SAFE_FUN_FACT_TEMPLATES).format(
         artist=artist, title=title, cluster=cluster_name,
     )
 
