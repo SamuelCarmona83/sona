@@ -32,6 +32,11 @@ ADMIN_USER_ID = 221081593790332929
 # ---------------------------------------------------------------------------
 
 # Build yt-dlp options with optional cookie support
+_DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+
 _ytdl_base_options = {
     # Prefer m4a/AAC: one transcode (AAC→Opus) is cleaner than opus→PCM→Opus.
     # Falls back to webm/opus if m4a is not available, then any best audio.
@@ -42,9 +47,16 @@ _ytdl_base_options = {
     "source_address": "0.0.0.0",
     "ignoreerrors": True,  # Skip unavailable videos in search results instead of failing
     "extractor_retries": 3,
-    # YouTube bot detection workarounds
+    # YouTube throttles chunks >10MB (see FAQ: https://github.com/yt-dlp/yt-dlp/wiki/FAQ)
+    "http_chunk_size": 10_485_760,
+    # Exponential backoff on HTTP 429 (Too Many Requests) and 5xx errors
+    "retry_sleep_functions": {
+        "extractor": lambda n: 2 ** n,  # 1s, 2s, 4s, 8s...
+        "http": lambda n: 2 ** n,
+    },
+    # YouTube bot detection workarounds — UA must match the browser that exported cookies
     "http_headers": {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent": os.getenv("YTDL_USER_AGENT", _DEFAULT_USER_AGENT),
     },
 }
 
@@ -53,9 +65,19 @@ _cookies_file = os.getenv("YTDL_COOKIES_FILE", "/app/cookies.txt")
 if _cookies_file and os.path.isfile(_cookies_file):
     _ytdl_base_options["cookiefile"] = _cookies_file
     logger.info("yt-dlp: using cookies file: %s", _cookies_file)
+    # Warn if cookies are stale (>24h old) — YouTube session tokens expire silently
+    import time as _time
+    _cookie_age_h = (_time.time() - os.path.getmtime(_cookies_file)) / 3600
+    if _cookie_age_h > 24:
+        logger.warning(
+            "yt-dlp: cookies file is %.0fh old — YouTube tokens may have expired. "
+            "Re-export from browser if you see 403/429 errors.", _cookie_age_h,
+        )
 elif os.getenv("YTDL_COOKIES_FROM_BROWSER", "").lower() not in ("", "0", "false", "no"):
     # Only enable browser cookie extraction if explicitly requested (to avoid CookieLoadError)
     _ytdl_base_options["cookiesfrombrowser"] = os.getenv("YTDL_COOKIES_FROM_BROWSER", "firefox,chrome")
+else:
+    logger.warning("yt-dlp: no cookies file or cookies.txt found — YouTube may block requests with 429/403 errors.")
 
 YTDL_OPTIONS = _ytdl_base_options
 
@@ -79,9 +101,10 @@ FFMPEG_OPTIONS = {
         "-thread_queue_size 4096"
     ),
     "options": (
-        f"-vn -bufsize 512k -af {FFMPEG_NORMALIZE_FILTER}"
+        # -strict -2: enables experimental Opus-in-mp4 support on older ffmpeg builds
+        f"-vn -bufsize 512k -strict -2 -af {FFMPEG_NORMALIZE_FILTER}"
         if _normalize_audio else
-        "-vn -bufsize 512k"
+        "-vn -bufsize 512k -strict -2"
     ),
 }
 

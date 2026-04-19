@@ -61,6 +61,7 @@ poetry.lock
 # dotenv
 .env
 .env.*
+!.env.example
 cookies.txt
 
 # mypy

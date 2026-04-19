@@ -75,15 +75,35 @@ src/
 └── dj_announcer.py  — TTS between songs
 ```
 
-## ⚙️ Config (`src/config.py`)
+## ⚙️ Config
 
-```python
-YTDL_OPTIONS["cookiefile"] = "/app/cookies.txt"  # yt-dlp refreshes auto
-LLM_SCORE_MARGIN = 4.5         # LLM only if candidates within 4.5 points
-LLM_ENABLED_FOR_ALBUM_TRACKS = 3   # LLM on first 3 tracks only
-MIN_SEARCH_SCORE = 6.0         # Reject YouTube matches below 6.0
-NORMALIZE_AUDIO = "true"       # Real-time loudness (dynaudnorm filter)
-DJ_ANNOUNCER_ENABLED = "true"  # TTS between genre changes
+### Via `.env.example`
+
+Copy `.env.example` to `.env` and edit:
+```bash
+cp .env.example .env
+# Edit .env with your credentials
+```
+
+Full reference in [.env.example](.env.example).
+
+### Key Variables
+
+```bash
+# Required
+BOT_TOKEN=discord_token_here
+SPOTIFY_CLIENT_ID=spotify_id_here
+SPOTIFY_CLIENT_SECRET=spotify_secret_here
+
+# YouTube (export cookies from browser via extension)
+YTDL_COOKIES_FILE=./cookies.txt
+YTDL_USER_AGENT=your_browser_ua_here  # Must match cookie browser
+
+# Optional
+NORMALIZE_AUDIO=true              # Loudness normalization
+ANTHROPIC_API_KEY=...             # For LLM tie-breaking
+DJ_ANNOUNCER_ENABLED=true         # TTS between songs
+DJ_VOICE=es-MX-DaliaNeural        # Edge-TTS voice
 ```
 
 ## 📊 Cost Reduction
