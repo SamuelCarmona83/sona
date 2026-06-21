@@ -1,6 +1,10 @@
 import asyncio
+import json
 import logging
+import pathlib
+import random
 import re
+import time
 
 try:
     import anthropic as _anthropic
@@ -12,12 +16,19 @@ import yt_dlp
 
 from src.config import (
     YTDL_OPTIONS,
+    YTDL_OPTIONS_NO_COOKIES,
+    get_cookie_status,
     SEARCH_RESULT_COUNT,
     MIN_SEARCH_SCORE,
     LLM_SCORE_MARGIN,
     LLM_RANKING_TIMEOUT,
     ANTHROPIC_API_KEY,
     ANTHROPIC_MODEL,
+    YTDL_SEARCH_CONCURRENCY,
+    YTDL_SEARCH_DELAY_SEC,
+    YTDL_SEARCH_JITTER_SEC,
+    YOUTUBE_URL_CACHE_TTL_SEC,
+    LIBRARY_ENABLED,
 )
 from src.scoring import _normalize_text, _build_search_queries, _rank_candidates
 
@@ -73,6 +84,9 @@ async def extract_youtube_tracks(url: str) -> list[dict]:
             try:
                 info = ydl.extract_info(url, download=False)
             except yt_dlp.utils.DownloadError as e:
+                err = str(e)
+                maybe_detect_rate_limit(err)
+                maybe_detect_auth_failure(err)
                 logger.warning("extract_youtube_tracks: DownloadError: %s", e)
                 return []
             if not info:
@@ -105,10 +119,235 @@ async def extract_youtube_tracks(url: str) -> list[dict]:
                     break
             return tracks
 
-    return await asyncio.to_thread(_extract)
+    return await _run_rate_limited_yt_request(_extract, f"extract {url_type}")
+
 
 _anthropic_client = None
-_search_cache: dict[str, dict] = {}  # Cache YouTube search results to avoid redundant queries
+_metadata_index: dict[str, dict] = {}
+_url_cache: dict[str, dict] = {}  # normalized query -> {url, expires_at, ...}
+_METADATA_PATH = pathlib.Path(".cache/youtube_metadata.json")
+_METADATA_PATH.parent.mkdir(parents=True, exist_ok=True)
+_search_semaphore = asyncio.Semaphore(YTDL_SEARCH_CONCURRENCY)
+_search_spacing_lock = asyncio.Lock()
+_last_search_start = 0.0
+
+# --- YouTube Rate Limit + Auth Failure Detection ---
+_last_rate_limit_time: float = 0.0
+_rate_limit_cooldown_sec = 3600  # 1 hour
+_rate_limit_message = "This content isn't available, try again later"
+_auth_failed: bool = False
+_AUTH_PATTERNS = (
+    "sign in to confirm you're not a bot",
+    "confirm you're not a bot",
+    "cookies are rotated",
+    "http error 403",
+    "unable to extract data",
+)
+
+
+def set_youtube_rate_limited():
+    global _last_rate_limit_time
+    _last_rate_limit_time = time.time()
+
+
+def is_youtube_rate_limited() -> bool:
+    if _last_rate_limit_time == 0.0:
+        return False
+    return (time.time() - _last_rate_limit_time) < _rate_limit_cooldown_sec
+
+
+def set_youtube_auth_failed() -> None:
+    global _auth_failed
+    _auth_failed = True
+
+
+def clear_youtube_auth_failed() -> None:
+    global _auth_failed
+    _auth_failed = False
+
+
+def is_youtube_auth_failed() -> bool:
+    return _auth_failed
+
+
+def maybe_detect_rate_limit(msg: str) -> bool:
+    if _rate_limit_message in msg:
+        set_youtube_rate_limited()
+        return True
+    return False
+
+
+def maybe_detect_auth_failure(msg: str) -> bool:
+    if maybe_detect_rate_limit(msg):
+        return False
+    lower = msg.lower()
+    if any(pat in lower for pat in _AUTH_PATTERNS):
+        set_youtube_auth_failed()
+        try:
+            from src.cookie_health import record_auth_failure
+            record_auth_failure()
+        except ImportError:
+            pass
+        logger.warning("yt-dlp: [AUTH FAILURE DETECTED] %s", msg[:200])
+        return True
+    return False
+
+
+def _should_try_cookieless() -> bool:
+    if is_youtube_auth_failed():
+        return True
+    status = get_cookie_status()
+    return not status.get("fresh", True)
+
+
+def _load_metadata_index() -> None:
+    global _metadata_index
+    if not _METADATA_PATH.exists():
+        return
+    try:
+        data = json.loads(_METADATA_PATH.read_text())
+        if isinstance(data, dict):
+            _metadata_index = data
+    except Exception as exc:
+        logger.warning("youtube.metadata: load failed: %s", exc)
+
+
+def _save_metadata_index() -> None:
+    try:
+        _METADATA_PATH.write_text(json.dumps(_metadata_index, indent=2))
+    except Exception as exc:
+        logger.warning("youtube.metadata: save failed: %s", exc)
+
+
+def _extract_video_id(url_or_id: str | None) -> str | None:
+    if not url_or_id:
+        return None
+    if re.fullmatch(r"[\w-]{11}", url_or_id):
+        return url_or_id
+    m = re.search(r"(?:v=|youtu\.be/|/shorts/)([\w-]{11})", url_or_id)
+    return m.group(1) if m else None
+
+
+def _store_metadata(cache_key: str, candidate: dict) -> None:
+    video_id = _extract_video_id(candidate.get("webpage_url")) or _extract_video_id(candidate.get("url"))
+    _metadata_index[cache_key] = {
+        "video_id": video_id,
+        "title": candidate.get("title", ""),
+        "duration": candidate.get("duration"),
+        "thumbnail": candidate.get("thumbnail", ""),
+        "uploader": candidate.get("uploader", ""),
+        "acodec": candidate.get("acodec", "?"),
+        "abr": candidate.get("abr", 0),
+        "webpage_url": candidate.get("webpage_url", ""),
+        "cached_at": time.time(),
+    }
+    _save_metadata_index()
+
+
+def _metadata_to_candidate(meta: dict, url: str | None = None) -> dict:
+    return {
+        "title": meta.get("title", ""),
+        "url": url,
+        "duration": meta.get("duration"),
+        "thumbnail": meta.get("thumbnail", ""),
+        "uploader": meta.get("uploader", ""),
+        "channel": meta.get("uploader", ""),
+        "webpage_url": meta.get("webpage_url", ""),
+        "acodec": meta.get("acodec", "?"),
+        "abr": meta.get("abr", 0),
+        "video_id": meta.get("video_id"),
+    }
+
+
+def _get_cached_url(cache_key: str) -> dict | None:
+    cached = _url_cache.get(cache_key)
+    if not cached:
+        return None
+    if time.time() > cached.get("expires_at", 0):
+        _url_cache.pop(cache_key, None)
+        return None
+    return cached
+
+
+def _set_cached_url(cache_key: str, candidate: dict) -> dict:
+    entry = {**candidate, "expires_at": time.time() + YOUTUBE_URL_CACHE_TTL_SEC}
+    _url_cache[cache_key] = entry
+    return entry
+
+
+def _extract_video_sync(video_id: str, base_opts: dict) -> dict | None:
+    opts = {**base_opts, "logger": _YtDlpLogger()}
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        try:
+            info = ydl.extract_info(
+                f"https://www.youtube.com/watch?v={video_id}",
+                download=False,
+            )
+        except yt_dlp.utils.DownloadError as e:
+            err = str(e)
+            maybe_detect_rate_limit(err)
+            maybe_detect_auth_failure(err)
+            logger.warning("youtube.refresh_url: DownloadError for %s: %s", video_id, e)
+            return None
+    if not info or not info.get("url"):
+        return None
+    return {
+        "title": info.get("title", ""),
+        "url": info["url"],
+        "duration": info.get("duration"),
+        "thumbnail": info.get("thumbnail", ""),
+        "uploader": info.get("uploader") or "",
+        "webpage_url": info.get("webpage_url") or f"https://www.youtube.com/watch?v={video_id}",
+        "acodec": info.get("acodec") or "?",
+        "abr": info.get("abr") or 0,
+        "video_id": video_id,
+    }
+
+
+async def _refresh_url_from_video_id(video_id: str) -> dict | None:
+    if is_youtube_rate_limited():
+        return None
+
+    def _extract():
+        result = _extract_video_sync(video_id, YTDL_OPTIONS)
+        if result or is_youtube_rate_limited():
+            return result
+        if _should_try_cookieless():
+            logger.info("youtube.refresh_url: cookieless retry for %s", video_id)
+            return _extract_video_sync(video_id, YTDL_OPTIONS_NO_COOKIES)
+        return result
+
+    return await _run_rate_limited_yt_request(_extract, f"refresh {video_id}")
+
+
+_load_metadata_index()
+
+
+async def _throttle_youtube_request(reason: str) -> None:
+    """Space out yt-dlp requests so queue fills do not look like bot bursts."""
+    global _last_search_start
+    async with _search_spacing_lock:
+        jitter = random.uniform(0.0, YTDL_SEARCH_JITTER_SEC) if YTDL_SEARCH_JITTER_SEC > 0 else 0.0
+        target_delay = YTDL_SEARCH_DELAY_SEC + jitter
+        if target_delay > 0:
+            now = time.monotonic()
+            wait_for = target_delay - (now - _last_search_start)
+            if wait_for > 0:
+                logger.info(
+                    "youtube.throttle: waiting %.2fs before %s (base=%.2fs, jitter=%.2fs)",
+                    wait_for,
+                    reason,
+                    YTDL_SEARCH_DELAY_SEC,
+                    jitter,
+                )
+                await asyncio.sleep(wait_for)
+        _last_search_start = time.monotonic()
+
+
+async def _run_rate_limited_yt_request(func, reason: str):
+    async with _search_semaphore:
+        await _throttle_youtube_request(reason)
+        return await asyncio.to_thread(func)
 
 
 class _YtDlpLogger:
@@ -133,10 +372,20 @@ class _YtDlpLogger:
         if key in _YtDlpLogger._warned_once:
             return
         _YtDlpLogger._warned_once.add(key)
-        logger.warning("yt-dlp: %s", msg)
+        if maybe_detect_rate_limit(msg):
+            logger.warning("yt-dlp: [RATE-LIMIT DETECTED] %s", msg)
+        elif maybe_detect_auth_failure(msg):
+            pass
+        else:
+            logger.warning("yt-dlp: %s", msg)
 
     def error(self, msg: str) -> None:
-        logger.warning("yt-dlp: %s", msg)
+        if maybe_detect_rate_limit(msg):
+            logger.warning("yt-dlp: [RATE-LIMIT DETECTED] %s", msg)
+        elif maybe_detect_auth_failure(msg):
+            pass
+        else:
+            logger.warning("yt-dlp: %s", msg)
 
 
 async def _llm_pick_best(query: str, candidates: list[dict]) -> dict | None:
@@ -188,43 +437,69 @@ async def _llm_pick_best(query: str, candidates: list[dict]) -> dict | None:
         return None
 
 
+def _parse_search_entries(query: str, info: dict | None) -> list[dict]:
+    if not info or not info.get("entries"):
+        return []
+    candidates = []
+    for entry in info["entries"]:
+        if not entry or not entry.get("url"):
+            continue
+        if entry.get("availability") in ("needs_auth", "subscriber_only", "premium_only", "unavailable"):
+            logger.info(
+                "_search_candidates: omitiendo video no disponible '%s' (%s)",
+                entry.get("id"), entry.get("availability"),
+            )
+            continue
+        candidates.append({
+            "title": entry.get("title", query),
+            "url": entry["url"],
+            "duration": entry.get("duration"),
+            "uploader": entry.get("uploader") or "",
+            "channel": entry.get("channel") or "",
+            "webpage_url": entry.get("webpage_url") or "",
+            "thumbnail": entry.get("thumbnail") or "",
+            "acodec": entry.get("acodec") or "?",
+            "abr": entry.get("abr") or 0,
+            "video_id": entry.get("id"),
+        })
+    return candidates
+
+
+def _search_sync(query: str, base_opts: dict) -> list[dict]:
+    opts = {**base_opts, "logger": _YtDlpLogger()}
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        try:
+            info = ydl.extract_info(f"ytsearch{SEARCH_RESULT_COUNT}:{query}", download=False)
+        except yt_dlp.utils.DownloadError as e:
+            err = str(e)
+            maybe_detect_rate_limit(err)
+            maybe_detect_auth_failure(err)
+            logger.warning("_search_candidates: DownloadError buscando '%s': %s", query, e)
+            return []
+    return _parse_search_entries(query, info)
+
+
 async def _search_youtube_candidates(query: str) -> list[dict]:
     def _search():
-        opts = {**YTDL_OPTIONS, "logger": _YtDlpLogger()}
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            try:
-                info = ydl.extract_info(f"ytsearch{SEARCH_RESULT_COUNT}:{query}", download=False)
-            except yt_dlp.utils.DownloadError as e:
-                logger.warning(f"_search_candidates: DownloadError buscando '{query}': {e}")
-                return []
-            if not info or not info.get("entries"):
-                return []
-            candidates = []
-            for entry in info["entries"]:
-                if not entry or not entry.get("url"):
-                    continue
-                # Skip entries marked as unavailable by yt-dlp
-                if entry.get("availability") in ("needs_auth", "subscriber_only", "premium_only", "unavailable"):
-                    logger.info(f"_search_candidates: omitiendo video no disponible '{entry.get('id')}' ({entry.get('availability')})")
-                    continue
-                candidates.append({
-                    "title": entry.get("title", query),
-                    "url": entry["url"],
-                    "duration": entry.get("duration"),
-                    "uploader": entry.get("uploader") or "",
-                    "channel": entry.get("channel") or "",
-                    "webpage_url": entry.get("webpage_url") or "",
-                    "thumbnail": entry.get("thumbnail") or "",
-                    "acodec": entry.get("acodec") or "?",
-                    "abr": entry.get("abr") or 0,
-                })
+        candidates = _search_sync(query, YTDL_OPTIONS)
+        if candidates or is_youtube_rate_limited():
             return candidates
+        if _should_try_cookieless():
+            logger.info("_search_candidates: retrying '%s' without cookies", query[:60])
+            fallback = _search_sync(query, YTDL_OPTIONS_NO_COOKIES)
+            if fallback:
+                logger.info("_search_candidates: cookieless fallback found %d results", len(fallback))
+            return fallback
+        return candidates
 
-    return await asyncio.to_thread(_search)
+    return await _run_rate_limited_yt_request(_search, f"search {query[:60]}")
 
 
 async def get_search_candidates(query: str) -> list[dict]:
     """Get top 5 search candidates for user selection (no auto-selection)."""
+    if is_youtube_rate_limited():
+        logger.info("get_search_candidates: omitiendo busqueda (rate-limited) para '%s'", query)
+        return []
     for candidate_query in _build_search_queries(query):
         candidates = await _search_youtube_candidates(candidate_query)
         if not candidates:
@@ -253,12 +528,32 @@ async def search_youtube(query: str, enable_llm: bool = True, *, trusted: bool =
     MIN_SEARCH_SCORE — as long as it exceeds a lower safety floor.
     """
     TRUSTED_FLOOR = 3.0  # absolute minimum even for trusted queries
-
-    # Check cache first (reduces redundant YouTube searches)
     cache_key = _normalize_text(query)
-    if cache_key in _search_cache:
-        logger.info(f"search_youtube: usando resultado en cache para '{query}'")
-        return _search_cache[cache_key]
+
+    cached_url = _get_cached_url(cache_key)
+    if cached_url and cached_url.get("url"):
+        logger.info("search_youtube: usando URL en cache para '%s'", query)
+        return cached_url
+
+    meta = _metadata_index.get(cache_key)
+    if meta and meta.get("video_id"):
+        refreshed = await _refresh_url_from_video_id(meta["video_id"])
+        if refreshed and refreshed.get("url"):
+            result = _set_cached_url(cache_key, refreshed)
+            if LIBRARY_ENABLED:
+                from src.library import enqueue_download
+                await enqueue_download(
+                    {"title": refreshed["title"], "yt_query": query, **refreshed},
+                    refreshed["video_id"],
+                )
+            return result
+        if is_youtube_rate_limited():
+            logger.info("search_youtube: rate-limited, metadata sin URL para '%s'", query)
+            return _metadata_to_candidate(meta, url=None)
+
+    if is_youtube_rate_limited():
+        logger.info("search_youtube: omitiendo busqueda (rate-limited) para '%s'", query)
+        return None
 
     best_overall: dict | None = None  # track the best candidate across all queries
 
@@ -308,9 +603,15 @@ async def search_youtube(query: str, enable_llm: bool = True, *, trusted: bool =
             best.get("abr", "?"),
         )
 
-        # Cache the result for future queries
-        _search_cache[cache_key] = best
-        return best
+        _store_metadata(cache_key, best)
+        result = _set_cached_url(cache_key, best)
+        if LIBRARY_ENABLED:
+            from src.library import enqueue_download
+            await enqueue_download(
+                {"title": best["title"], "yt_query": query, **best},
+                best.get("webpage_url") or best.get("video_id"),
+            )
+        return result
 
     # Trusted fallback: accept best candidate above the safety floor
     if trusted and best_overall and best_overall["score"] >= TRUSTED_FLOOR:
@@ -320,8 +621,15 @@ async def search_youtube(query: str, enable_llm: bool = True, *, trusted: bool =
             query,
             best_overall["score"],
         )
-        _search_cache[cache_key] = best_overall
-        return best_overall
+        _store_metadata(cache_key, best_overall)
+        result = _set_cached_url(cache_key, best_overall)
+        if LIBRARY_ENABLED:
+            from src.library import enqueue_download
+            await enqueue_download(
+                {"title": best_overall["title"], "yt_query": query, **best_overall},
+                best_overall.get("webpage_url") or best_overall.get("video_id"),
+            )
+        return result
 
     logger.warning(f"search_youtube: no hubo candidato confiable para '{query}'")
     return None

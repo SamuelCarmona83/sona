@@ -4,11 +4,13 @@ import logging
 import random
 import time
 
+
 import discord
 
-from src.config import FFMPEG_OPTIONS, DJ_ANNOUNCER_ENABLED, DJ_FUN_FACT_INTERVAL
+from src.config import FFMPEG_OPTIONS, FFMPEG_LOCAL_OPTIONS, DJ_ANNOUNCER_ENABLED, DJ_FUN_FACT_INTERVAL
 from src.dj_announcer import get_buenos_aires_hour
-from src.youtube import search_youtube
+from src.youtube import search_youtube, is_youtube_rate_limited
+from src.library import resolve_local_track, record_play, enqueue_download
 from src.bot_instance import bot
 
 logger = logging.getLogger(__name__)
@@ -446,8 +448,18 @@ async def refresh_player_embed_fresh(guild: discord.Guild, channel):
 
 async def _resolve_url(track: dict) -> dict | None:
     """Ensure track['url'] is populated. Returns None if YouTube search fails or video is unavailable."""
-    if track.get("url"):
+    if track.get("url") and track.get("local"):
         return track
+    if track.get("url") and not is_youtube_rate_limited():
+        return track
+
+    local = resolve_local_track(track)
+    if local:
+        return local
+
+    if is_youtube_rate_limited():
+        return None
+
     try:
         yt_info = await search_youtube(track["yt_query"])
     except Exception as exc:
@@ -455,8 +467,17 @@ async def _resolve_url(track: dict) -> dict | None:
         return None
     if not yt_info:
         return None
-    track["url"]   = yt_info["url"]
+    if not yt_info.get("url"):
+        local = resolve_local_track(track)
+        if local:
+            return local
+        return None
+    track["url"] = yt_info["url"]
     track["title"] = yt_info["title"]
+    if yt_info.get("video_id"):
+        track["video_id"] = yt_info["video_id"]
+    if yt_info.get("webpage_url"):
+        track["webpage_url"] = yt_info["webpage_url"]
     return track
 
 
@@ -539,6 +560,26 @@ async def _prefetch_next(guild_id: int):
         logger.debug("_prefetch_next: DJ pre-gen failed: %s", exc)
 
 
+_last_rate_limit_notify: dict[int, float] = {}
+_RATE_LIMIT_NOTIFY_COOLDOWN = 3600
+_RATE_LIMIT_MESSAGE = (
+    ":warning: El bot ha sido temporalmente bloqueado por YouTube por exceder el límite de "
+    "búsquedas/descargas. Debes esperar hasta 1 hora para que se levante el bloqueo. "
+    "Intenta más tarde o reduce la frecuencia de búsquedas."
+)
+
+
+async def maybe_notify_rate_limited(guild_id: int, text_channel) -> None:
+    if not is_youtube_rate_limited():
+        return
+    now = time.time()
+    last_notify = _last_rate_limit_notify.get(guild_id, 0)
+    if now - last_notify <= _RATE_LIMIT_NOTIFY_COOLDOWN:
+        return
+    await text_channel.send(_RATE_LIMIT_MESSAGE)
+    _last_rate_limit_notify[guild_id] = now
+
+
 async def play_next(guild: discord.Guild, vc: discord.VoiceClient, text_channel):
     # Cancel any pending prefetch for this guild
     task = _prefetch_tasks.pop(guild.id, None)
@@ -566,7 +607,11 @@ async def play_next(guild: discord.Guild, vc: discord.VoiceClient, text_channel)
     # Resolve YouTube URL if not yet fetched (lazy playlist items)
     track = await _resolve_url(track)
     if not track:
-        await text_channel.send("No se encontro en YouTube, saltando...", delete_after=5)
+        if is_youtube_rate_limited():
+            await maybe_notify_rate_limited(guild.id, text_channel)
+            await text_channel.send("No hay copia local y YouTube está bloqueado, saltando...", delete_after=8)
+        else:
+            await text_channel.send("No se encontro en YouTube, saltando...", delete_after=5)
         await play_next(guild, vc, text_channel)
         return
 
@@ -576,6 +621,7 @@ async def play_next(guild: discord.Guild, vc: discord.VoiceClient, text_channel)
     # Record in radio history (lazy import to avoid circular)
     from src import radio as _radio
     asyncio.ensure_future(_radio.record_played(guild.id, track))
+    record_play(track)
 
     # If radio is active and queue is running low, trigger a background fill
     from src.config import RADIO_QUEUE_MIN
@@ -640,24 +686,33 @@ async def play_next(guild: discord.Guild, vc: discord.VoiceClient, text_channel)
         cleanup_dj_audio(dj_file)
         dj_file = None
 
+    ffmpeg_opts = FFMPEG_LOCAL_OPTIONS if track.get("local") else FFMPEG_OPTIONS
     try:
-        # Use FFmpegOpusAudio directly (no probe) to avoid an extra HTTP round-trip
-        # on token-authenticated YouTube stream URLs.
-        source = discord.FFmpegOpusAudio(track["url"], **FFMPEG_OPTIONS)
+        source = discord.FFmpegOpusAudio(track["url"], **ffmpeg_opts)
         logger.info(
-            "play_next: reproduciendo '%s' (codec=%s, abr=%s)",
+            "play_next: reproduciendo '%s' (local=%s, codec=%s, abr=%s)",
             track["title"],
+            track.get("local", False),
             track.get("acodec", "?"),
             track.get("abr", "?"),
         )
     except Exception as e:
         logger.warning(f"play_next: video no disponible '{track['title']}': {e}, saltando...")
-        # Evict the stale URL from the search cache so re-search works next time
-        from src.youtube import _search_cache
+        await maybe_notify_rate_limited(guild.id, text_channel)
+        from src.youtube import _url_cache
         from src.scoring import _normalize_text as _n
-        _search_cache.pop(_n(track.get("yt_query", "")), None)
+        _url_cache.pop(_n(track.get("yt_query", "")), None)
         await play_next(guild, vc, text_channel)
         return
+
+    if not track.get("local"):
+        try:
+            await enqueue_download(
+                track,
+                track.get("video_id") or track.get("webpage_url"),
+            )
+        except Exception as exc:
+            logger.warning("play_next: background download enqueue failed: %s", exc)
 
     def after(error):
         if error:
@@ -674,7 +729,7 @@ async def play_next(guild: discord.Guild, vc: discord.VoiceClient, text_channel)
                 logger.warning("play_next: DJ TTS playback error: %s", error)
             # Now play the actual song
             try:
-                song_source = discord.FFmpegOpusAudio(track["url"], **FFMPEG_OPTIONS)
+                song_source = discord.FFmpegOpusAudio(track["url"], **ffmpeg_opts)
                 vc.play(song_source, after=after)
             except Exception as e:
                 logger.warning("play_next: song source failed after DJ: %s", e)

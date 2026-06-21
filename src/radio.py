@@ -435,10 +435,11 @@ async def fill_radio_queue(
     If *auto_play* is False, tracks are queued but playback is NOT started
     automatically (caller is responsible for starting playback).
     """
-    from src.playback import queues, now_playing_info, play_next
+    from src.playback import queues, now_playing_info, play_next, maybe_notify_rate_limited
     from src.spotify import _get_recommendations_hybrid
-    from src.youtube import search_youtube
+    from src.youtube import search_youtube, is_youtube_rate_limited
     from src.scoring import _split_query_parts
+    from src.library import get_radio_candidates, resolve_local_track, track_id, get_entry, track_from_entry
 
     gid = guild.id
     if _filling.get(gid):
@@ -457,6 +458,25 @@ async def fill_radio_queue(
             gid, get_mood(gid), seed_tracks, seed_genres, needed,
         )
 
+        if is_youtube_rate_limited():
+            local_tracks = await get_radio_candidates(gid, get_mood(gid), needed)
+            if local_tracks:
+                if gid not in queues:
+                    queues[gid] = collections.deque()
+                for track in local_tracks:
+                    queues[gid].append(track)
+                logger.info(
+                    "radio.fill: %d canciones locales (YouTube bloqueado) para guild=%s",
+                    len(local_tracks), gid,
+                )
+                await maybe_notify_rate_limited(gid, text_channel)
+                if auto_play and not (vc and (vc.is_playing() or vc.is_paused())):
+                    await play_next(guild, vc, text_channel)
+                return
+            logger.warning("radio.fill: YouTube bloqueado y biblioteca local vacia para guild=%s", gid)
+            await maybe_notify_rate_limited(gid, text_channel)
+            return
+
         # --- Liked-tracks priority ---
         from src import likes as _likes_mod
         liked_tracks = []
@@ -472,8 +492,28 @@ async def fill_radio_queue(
         if liked_tracks:
             from src.youtube import search_youtube as _syt
             async def _fetch_liked(info: dict) -> dict | None:
+                stub = {
+                    "title": info.get("title", info["query"]),
+                    "yt_query": info["query"],
+                    "spotify_id": info.get("spotify_id"),
+                    "artist_id": info.get("artist_id"),
+                    "artist": info.get("artist", "Unknown"),
+                }
+                local = resolve_local_track(stub)
+                if local:
+                    local["requester"] = f"📻 Radio ❤️×{info['_like_count']}"
+                    return local
+                tid = track_id(stub)
+                entry = get_entry(tid)
+                if entry:
+                    t = track_from_entry(tid, entry, requester=f"📻 Radio ❤️×{info['_like_count']}")
+                    return t
                 yt_info = await _syt(info["query"], enable_llm=False, trusted=True)
-                if not yt_info:
+                if not yt_info or not yt_info.get("url"):
+                    local = resolve_local_track(stub)
+                    if local:
+                        local["requester"] = f"📻 Radio ❤️×{info['_like_count']}"
+                        return local
                     return None
                 return {
                     "title":      yt_info["title"],
@@ -485,6 +525,8 @@ async def fill_radio_queue(
                     "thumbnail":  yt_info.get("thumbnail") or "",
                     "spotify_id": info.get("spotify_id"),
                     "artist_id":  info.get("artist_id"),
+                    "video_id":   yt_info.get("video_id"),
+                    "webpage_url": yt_info.get("webpage_url"),
                 }
             liked_results = await asyncio.gather(*(_fetch_liked(t) for t in liked_tracks))
             played_set_lk = set(_played_ids.get(gid, []))

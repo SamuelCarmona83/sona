@@ -37,8 +37,22 @@ Then in Discord (in your voice channel):
 
 ### Docker (No Extra Steps)
 - Builds Python 3.12 + Deno + EJS
-- Mounts `cookies.txt` (auto-updated by yt-dlp)
+- Mounts `cookies.txt` into the container
 - Handles FFmpeg + all deps
+
+### Cookie maintenance (zero-cron)
+
+The bot monitors `cookies.txt` and reloads it automatically when it changes (yt-dlp token writeback or host refresh). No cron required.
+
+1. Stay logged into YouTube in Chrome (one-time)
+2. Day-to-day: zero maintenance — fallbacks (cookieless clients + local library) keep playback going
+3. If the bot alerts you (or `!cookies` shows stale cookies), run once on the Mac:
+
+```bash
+./refresh_cookies.sh chrome
+```
+
+The bot picks up the new file without restarting Docker. Use `./refresh_cookies.sh chrome --restart` only if you want to force a container restart.
 
 ### Local
 ```bash
@@ -133,12 +147,25 @@ DJ_VOICE=es-MX-DaliaNeural        # Edge-TTS voice
 
 | Issue | Fix |
 |-------|-----|
-| "Sign in to confirm you're not a bot" | Update cookies.txt; `pip install --upgrade yt-dlp>=2025.1.0` |
+| "Sign in to confirm you're not a bot" | Run `./refresh_cookies.sh chrome` on the Mac; bot auto-reloads cookies |
+| Stale cookies (`!cookies` admin) | Same as above; check `.cache/cookie_refresh.log` for history |
 | Bot won't start (Docker) | `docker-compose build --no-cache` |
 | Commands not working | Check `ALLOWED_CHANNEL_ID` in config |
 | No audio | Check bot "Speak" perms in voice channel |
 | YouTube fails | `deno --version` (must be installed); refresh cookies.txt |
-| "No se encontró nada" | Invalid query; try exact song name |
+| Rate-limited by YouTube (~1h block) | Bot notifies in Discord; increase `YTDL_SEARCH_DELAY_SEC` (try 10.0); radio falls back to local library |
+| "No se encontró nada" | Invalid query; try exact song name; if rate-limited, only cached/local tracks work |
+| Local library empty | Play songs normally first — bot auto-downloads after playback to `.cache/library/` |
+
+### Local Library
+
+The bot caches audio after successful playback so frequently played songs don't need re-searching:
+
+- **Index:** `.cache/library_index.json` (play counts, metadata)
+- **Audio files:** `.cache/library/` (persisted via Docker `spotify_cache` volume)
+- **Offline radio:** When YouTube rate-limits the bot, radio mode plays from the local library
+- **Stats:** `!library` shows cached track count and top plays
+- **Tuning:** `LIBRARY_MAX_TRACKS`, `LIBRARY_MAX_MB`, `LIBRARY_MIN_PLAYS_TO_PIN` in `.env`
 
 ## 📝 License
 

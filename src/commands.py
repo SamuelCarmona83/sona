@@ -11,7 +11,12 @@ from src.config import ALLOWED_CHANNEL_ID, ADMIN_USER_ID, LLM_ENABLED_FOR_ALBUM_
 from src.bot_instance import bot
 import random
 
-from src.playback import queues, now_playing_info, play_next, update_player_embed, refresh_player_embed_fresh, _paused
+from src.playback import (
+    queues, now_playing_info, play_next, update_player_embed,
+    refresh_player_embed_fresh, _paused, maybe_notify_rate_limited,
+)
+from src.library import record_request, get_stats
+from src.youtube import is_youtube_rate_limited
 from src.spotify import (
     _is_spotify_url,
     _parse_spotify_url,
@@ -79,7 +84,9 @@ async def only_allowed_channel(ctx: commands.Context) -> bool:
 @bot.event
 async def on_ready():
     from src.playback import PlayerView
+    from src.cookie_health import start_cookie_watchdog
     bot.add_view(PlayerView(0))
+    start_cookie_watchdog()
     logger.info(f"Bot conectado como {bot.user} (id={bot.user.id})")
     logger.info(f"Guilds: {[g.name for g in bot.guilds]}")
     try:
@@ -153,6 +160,36 @@ async def ping(ctx: commands.Context):
     await ctx.send(f"Pong! Latencia: {round(bot.latency * 1000)}ms")
 
 
+@bot.command(name="cookies", help="Estado de cookies de YouTube. Solo admin.")
+async def cookies_cmd(ctx: commands.Context):
+    if ctx.author.id != ADMIN_USER_ID:
+        await ctx.send("Solo el administrador puede usar este comando.", delete_after=8)
+        return
+    from src.cookie_health import get_health_summary
+    s = get_health_summary()
+    age = s.get("age_h")
+    age_str = f"{age:.1f}h" if age is not None else "n/a"
+    fresh = "si" if s.get("fresh") else "no"
+    embed = discord.Embed(title="Estado de cookies YouTube", color=0xFFAA00 if s.get("fresh") else 0xFF5555)
+    embed.add_field(name="Archivo", value=f"`{s.get('path')}`", inline=False)
+    embed.add_field(name="Edad", value=age_str, inline=True)
+    embed.add_field(name="Frescas", value=fresh, inline=True)
+    embed.add_field(name="Cookies exportadas", value=str(s.get("count", 0)), inline=True)
+    embed.add_field(name="Auth fallida", value="si" if s.get("auth_failed") else "no", inline=True)
+    embed.add_field(name="Rate-limited", value="si" if s.get("rate_limited") else "no", inline=True)
+    embed.add_field(
+        name="Biblioteca local",
+        value=f"{s.get('library_on_disk', 0)} canciones ({s.get('library_size_mb', 0)} MB)",
+        inline=False,
+    )
+    embed.add_field(
+        name="Si necesitas refrescar",
+        value="En el Mac: `./refresh_cookies.sh chrome`\nEl bot detecta el cambio sin reiniciar Docker.",
+        inline=False,
+    )
+    await ctx.send(embed=embed, delete_after=60)
+
+
 @bot.command(name="auth", help="Inicia o renueva la autenticacion de Spotify. Solo admin.")
 async def auth_cmd(ctx: commands.Context):
     if ctx.author.id != ADMIN_USER_ID:
@@ -195,7 +232,7 @@ async def play(ctx: commands.Context, *, query: str):
 
         truncated = len(yt_tracks) >= 50  # hit the cap
         for t in yt_tracks:
-            queues[ctx.guild.id].append({
+            track = {
                 "title":     t["title"],
                 "yt_query":  t["yt_query"],
                 "url":       t.get("url"),
@@ -205,7 +242,9 @@ async def play(ctx: commands.Context, *, query: str):
                 "thumbnail": t.get("thumbnail") or "",
                 "acodec":    t.get("acodec", "?"),
                 "abr":       t.get("abr", 0),
-            })
+            }
+            record_request(track)
+            queues[ctx.guild.id].append(track)
 
         try:
             await msg.delete()
@@ -308,13 +347,20 @@ async def play(ctx: commands.Context, *, query: str):
             t.pop("_order", None)
 
     if not tracks_to_queue:
-        await msg.edit(content=f"No se encontro nada para: **{query}**")
+        if is_youtube_rate_limited():
+            await maybe_notify_rate_limited(ctx.guild.id, ctx.channel)
+            await msg.edit(content=f"YouTube bloqueado y sin copia local para: **{query}**")
+        else:
+            await msg.edit(content=f"No se encontro nada para: **{query}**")
         return
 
     try:
         await msg.delete()
     except Exception:
         pass
+
+    for track in tracks_to_queue:
+        record_request(track)
 
     # Add all tracks to queue
     # Radio mode: user requests go to the front (right after the current song)
@@ -949,6 +995,8 @@ async def help_cmd(ctx: commands.Context):
         ("!mood create <nombre> <query>", "Crea un mood custom basado en un artista/cancion."),
         ("!mood delete <nombre>", "Elimina un mood custom."),
         ("⚙️ Otros", None),
+        ("!library", "Muestra estadisticas de la biblioteca local cacheada."),
+        ("!cookies", "Estado de cookies de YouTube (solo admin)."),
         ("!auth", "Autenticacion de Spotify (solo admin)."),
         ("!ping", "Verifica que el bot este vivo."),
     ]
@@ -1049,6 +1097,33 @@ async def playlist_cmd(ctx: commands.Context, *, url: str):
     # Start playing if nothing is currently playing
     if not (vc.is_playing() or vc.is_paused()):
         await play_next(ctx.guild, vc, ctx.channel)
+
+
+@bot.command(name="library", help="Muestra estadisticas de la biblioteca local cacheada.")
+async def library_cmd(ctx: commands.Context):
+    stats = get_stats()
+    embed = discord.Embed(
+        title="Biblioteca local",
+        description=(
+            f"**{stats['on_disk']}** canciones en disco "
+            f"({stats['size_mb']} MB) · **{stats['pinned']}** fijadas por popularidad"
+        ),
+        color=0x1DB954,
+    )
+    if stats["top_plays"]:
+        lines = [
+            f"`{plays:>3}` {title[:60]}"
+            for _tid, title, plays in stats["top_plays"]
+        ]
+        embed.add_field(name="Mas reproducidas", value="\n".join(lines), inline=False)
+    else:
+        embed.add_field(
+            name="Mas reproducidas",
+            value="Aun vacia — se llena al reproducir canciones.",
+            inline=False,
+        )
+    embed.set_footer(text="La radio usa la biblioteca local cuando YouTube bloquea el bot")
+    await ctx.send(embed=embed, delete_after=45)
 
 
 @bot.command(name="likes", help="Muestra tus canciones con ❤️ en este servidor.")
