@@ -1,6 +1,7 @@
 import random as _random
 import asyncio
 import logging
+import pathlib
 import re
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -8,8 +9,10 @@ from urllib.parse import parse_qs, urlparse
 
 import discord
 from discord.ext import commands
+from spotipy.oauth2 import SpotifyOauthError
 
 from src.config import (
+    CACHE_PATH,
     OAUTH_PORT,
     ADMIN_USER_ID,
     MIN_SPOTIFY_REFINEMENT_SCORE,
@@ -20,22 +23,55 @@ from src.scoring import _format_spotify_track_query, _score_spotify_match
 logger = logging.getLogger(__name__)
 
 _oauth_code: str | None = None
+_oauth_state: str | None = None
 _oauth_received = threading.Event()
 
 # In-memory cache: artist_id -> list of genre strings (avoids repeated API calls per artist)
 _artist_genres_cache: dict[str, list[str]] = {}
 
 
+def clear_spotify_token_cache() -> bool:
+    """Delete the cached OAuth token file. Returns True if a file was removed."""
+    path = pathlib.Path(CACHE_PATH)
+    if path.is_file():
+        path.unlink()
+        logger.info("spotify: cleared stale token cache at %s", path)
+        return True
+    return False
+
+
+def _is_stale_token_error(exc: SpotifyOauthError) -> bool:
+    message = str(exc).lower()
+    return "invalid_client" in message or "invalid_grant" in message
+
+
+async def _safe_validate_token(auth_manager) -> bool:
+    """Validate or refresh the cached token, clearing stale cache on auth errors."""
+    cached = await asyncio.to_thread(auth_manager.cache_handler.get_cached_token)
+    if not cached:
+        return False
+    try:
+        return bool(await asyncio.to_thread(auth_manager.validate_token, cached))
+    except SpotifyOauthError as exc:
+        if _is_stale_token_error(exc):
+            clear_spotify_token_cache()
+            logger.warning("spotify: token refresh failed (%s), cache cleared", exc)
+            return False
+        raise
+
+
 class _CallbackHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        global _oauth_code
+        global _oauth_code, _oauth_state
         params = parse_qs(urlparse(self.path).query)
         code = params.get("code", [None])[0]
+        state = params.get("state", [None])[0]
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.end_headers()
         if code:
             _oauth_code = code
+            _oauth_state = state
             _oauth_received.set()
             self.wfile.write(b"<h1>Autorizado!</h1><p>Puedes cerrar esta pagina.</p>")
         else:
@@ -49,6 +85,85 @@ def _run_callback_server():
     server = HTTPServer(("0.0.0.0", OAUTH_PORT), _CallbackHandler)
     server.handle_request()
     server.server_close()
+
+
+async def _complete_oauth_from_callback(expected_state: str) -> bool:
+    """Exchange the OAuth code captured by the callback server."""
+    global _oauth_code, _oauth_state
+    if not _oauth_code:
+        return False
+    if _oauth_state and _oauth_state != expected_state:
+        logger.warning(
+            "spotify: OAuth state mismatch (expected=%s got=%s)",
+            expected_state,
+            _oauth_state,
+        )
+        return False
+
+    code = _oauth_code
+    if expected_state == "admin":
+        if sp is None:
+            return False
+        await asyncio.to_thread(
+            lambda: sp.auth_manager.get_access_token(code, as_dict=False, check_cache=False)
+        )
+        return True
+
+    if expected_state.startswith("user:"):
+        from src.spotify_users import complete_user_oauth
+        discord_user_id = int(expected_state.split(":", 1)[1])
+        await complete_user_oauth(discord_user_id, code)
+        return True
+
+    return False
+
+
+async def run_oauth_flow(
+    ctx: commands.Context,
+    *,
+    expected_state: str,
+    authorize_url: str,
+    success_message: str,
+    timeout_message: str = "Tiempo agotado. Intenta de nuevo.",
+) -> bool:
+    """Shared OAuth waiter used by admin auth and per-user Spotify linking."""
+    global _oauth_code, _oauth_state, _oauth_received
+
+    _oauth_code = None
+    _oauth_state = None
+    _oauth_received.clear()
+
+    try:
+        await ctx.author.send(
+            "Autorizacion de Spotify requerida. Abre este enlace:\n"
+            f"{authorize_url}"
+        )
+        await ctx.send("Te envie el enlace de autenticacion por DM.", delete_after=10)
+    except discord.Forbidden:
+        await ctx.send("No pude enviarte un DM. Habilita los mensajes directos en Discord.")
+        return False
+
+    threading.Thread(target=_run_callback_server, daemon=True).start()
+    received = await asyncio.to_thread(_oauth_received.wait, 300)
+    if not received or not _oauth_code:
+        await ctx.author.send(timeout_message)
+        return False
+
+    try:
+        if not await _complete_oauth_from_callback(expected_state):
+            await ctx.author.send("Fallo la autenticacion de Spotify. Intenta de nuevo.")
+            return False
+    except SpotifyOauthError as exc:
+        logger.error("spotify: OAuth token exchange failed: %s", exc)
+        await ctx.author.send(
+            "Fallo la autenticacion de Spotify.\n"
+            "Verifica `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET` y el Redirect URI "
+            "`http://127.0.0.1:8888/callback` en el dashboard de Spotify."
+        )
+        return False
+
+    await ctx.send(success_message)
+    return True
 
 
 def _is_spotify_url(query: str) -> bool:
@@ -132,10 +247,10 @@ async def _get_spotify_track_info(query: str) -> dict:
     """
     fallback = {"query": query, "spotify_id": None, "artist_id": None}
     try:
+        if sp is None:
+            return fallback
         auth_manager = sp.auth_manager
-        cached = await asyncio.to_thread(auth_manager.cache_handler.get_cached_token)
-        valid  = await asyncio.to_thread(auth_manager.validate_token, cached)
-        if not valid:
+        if not await _safe_validate_token(auth_manager):
             return fallback
         results = await asyncio.to_thread(lambda: sp.search(q=query, type="track", limit=5))
         items = results.get("tracks", {}).get("items", [])
@@ -402,42 +517,28 @@ async def _get_recommendations_hybrid(
 
 
 async def _ensure_auth(ctx: commands.Context) -> bool:
-    global _oauth_code, _oauth_received
+    if sp is None:
+        await ctx.send(
+            "Spotify no esta configurado. Revisa `SPOTIFY_CLIENT_ID` y `SPOTIFY_CLIENT_SECRET` en `.env`."
+        )
+        return False
+
     auth_manager = sp.auth_manager
-    cached = await asyncio.to_thread(auth_manager.cache_handler.get_cached_token)
-    valid  = await asyncio.to_thread(auth_manager.validate_token, cached)
-    if valid:
+    if await _safe_validate_token(auth_manager):
         return True
 
     # Only the admin can kick off the OAuth flow
     if ctx.author.id != ADMIN_USER_ID:
-        await ctx.send("Spotify no esta autenticado. Pide al admin que ejecute `!auth`.")
-        return False
-
-    _oauth_code = None
-    _oauth_received.clear()
-    auth_url = auth_manager.get_authorize_url()
-
-    # Send URL via DM so it is never visible in the channel
-    try:
-        await ctx.author.send(
-            f"Autenticacion de Spotify requerida. Abre este enlace y autoriza:\n{auth_url}"
-        )
-        await ctx.send("Te envie el enlace de autenticacion por DM.")
-    except discord.Forbidden:
         await ctx.send(
-            "No pude enviarte un DM. Habilita los mensajes directos en Discord."
+            "Spotify no esta autenticado o el token expiro. Pide al admin que ejecute `!auth`."
         )
         return False
 
-    threading.Thread(target=_run_callback_server, daemon=True).start()
-    received = await asyncio.to_thread(_oauth_received.wait, 300)
-    if not received or not _oauth_code:
-        await ctx.author.send("Tiempo agotado. Usa `!auth` para reintentar.")
-        return False
-    code = _oauth_code
-    await asyncio.to_thread(
-        lambda: auth_manager.get_access_token(code, as_dict=False, check_cache=False)
+    auth_url = auth_manager.get_authorize_url(state="admin")
+    return await run_oauth_flow(
+        ctx,
+        expected_state="admin",
+        authorize_url=auth_url,
+        success_message="Spotify autenticado correctamente.",
+        timeout_message="Tiempo agotado. Usa `!auth` para reintentar.",
     )
-    await ctx.send("Spotify autenticado correctamente.")
-    return False

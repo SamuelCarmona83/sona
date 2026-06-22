@@ -18,8 +18,13 @@ SCOPES = (
     "user-modify-playback-state "
     "user-read-playback-state "
     "user-read-currently-playing "
-    "playlist-read-private"
+    "playlist-read-private "
+    "user-library-read "
+    "user-top-read "
+    "user-read-recently-played"
 )
+
+TASTE_CACHE_TTL_SEC = max(300, int(get_config_value("TASTE_CACHE_TTL_SEC", dotenv_values, "21600")))
 
 ALLOWED_CHANNEL_ID = 1163479541029810226
 VOICE_CHANNEL_ID   = 1397428777876721716
@@ -314,23 +319,27 @@ PREFERRED_CHANNEL_HINTS = ("topic", "vevo", "official", "records", "music")
 MIN_SPOTIFY_REFINEMENT_SCORE = 7.5
 
 
-def build_spotify_client(dotenv_values: dict) -> spotipy.Spotify:
+def build_spotify_auth_manager(cache_path: str) -> SpotifyOAuth:
     client_id     = get_config_value("SPOTIFY_CLIENT_ID",     dotenv_values)
     client_secret = get_config_value("SPOTIFY_CLIENT_SECRET", dotenv_values)
     redirect_uri  = get_config_value("SPOTIFY_REDIRECT_URI",  dotenv_values, "http://localhost:8888/callback")
     if not client_id or not client_secret:
         raise ValueError("Faltan credenciales Spotify (SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET).")
-    os.makedirs(os.path.dirname(CACHE_PATH) or ".", exist_ok=True)
-    return spotipy.Spotify(
-        auth_manager=SpotifyOAuth(
-            client_id=client_id,
-            client_secret=client_secret,
-            redirect_uri=redirect_uri,
-            scope=SCOPES,
-            cache_path=CACHE_PATH,
-            open_browser=False,
-        )
+    cache_dir = os.path.dirname(cache_path) or "."
+    os.makedirs(cache_dir, exist_ok=True)
+    return SpotifyOAuth(
+        client_id=client_id,
+        client_secret=client_secret,
+        redirect_uri=redirect_uri,
+        scope=SCOPES,
+        cache_path=cache_path,
+        open_browser=False,
     )
+
+
+def build_spotify_client(dotenv_values: dict) -> spotipy.Spotify:
+    del dotenv_values  # kept for call-site compatibility
+    return spotipy.Spotify(auth_manager=build_spotify_auth_manager(CACHE_PATH))
 
 
 bot_token = get_config_value("BOT_TOKEN", dotenv_values)

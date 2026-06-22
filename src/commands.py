@@ -7,7 +7,7 @@ import discord
 from discord.ext import commands
 from discord.ui import Button, View
 
-from src.config import ALLOWED_CHANNEL_ID, ADMIN_USER_ID, LLM_ENABLED_FOR_ALBUM_TRACKS, sp
+from src.config import ALLOWED_CHANNEL_ID, ADMIN_USER_ID, LIBRARY_ENABLED, LLM_ENABLED_FOR_ALBUM_TRACKS, sp
 from src.bot_instance import bot
 import random
 
@@ -15,7 +15,7 @@ from src.playback import (
     queues, now_playing_info, play_next, update_player_embed,
     refresh_player_embed_fresh, _paused, maybe_notify_rate_limited,
 )
-from src.library import record_request, get_stats
+from src.library import record_request, get_stats, search_index, entry_to_queue_track
 from src.youtube import is_youtube_rate_limited
 from src.spotify import (
     _is_spotify_url,
@@ -77,6 +77,87 @@ class SearchSelectionView(View):
         self.stop()
 
 
+class LibrarySearchSelectionView(View):
+    """Interactive view for selecting one library index match."""
+    def __init__(self, candidates: list[tuple[str, dict]], query: str, ctx: commands.Context):
+        super().__init__(timeout=30)
+        self.candidates = candidates
+        self.query = query
+        self.ctx = ctx
+        self.selected: tuple[str, dict] | None = None
+
+        for idx in range(min(5, len(candidates))):
+            button = Button(
+                label=str(idx + 1),
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"library_search_select_{idx}",
+            )
+            button.callback = self._make_callback(idx)
+            self.add_item(button)
+
+    def _make_callback(self, idx: int):
+        async def callback(interaction: discord.Interaction):
+            if interaction.user.id != self.ctx.author.id:
+                await interaction.response.send_message(
+                    "Solo quien hizo la búsqueda puede seleccionar.",
+                    ephemeral=True,
+                )
+                return
+            self.selected = self.candidates[idx]
+            self.stop()
+            await interaction.response.defer()
+
+        return callback
+
+    async def on_timeout(self):
+        self.stop()
+
+
+class LibraryActionView(View):
+    """Play or seed radio from a selected library track."""
+    def __init__(self, tid: str, entry: dict, ctx: commands.Context):
+        super().__init__(timeout=30)
+        self.tid = tid
+        self.entry = entry
+        self.ctx = ctx
+        self.action: str | None = None
+
+        play_btn = Button(
+            label="Reproducir",
+            emoji="▶️",
+            style=discord.ButtonStyle.success,
+            custom_id="library_action_play",
+        )
+        play_btn.callback = self._make_callback("play")
+        self.add_item(play_btn)
+
+        radio_btn = Button(
+            label="Radio",
+            emoji="📻",
+            style=discord.ButtonStyle.primary,
+            custom_id="library_action_radio",
+        )
+        radio_btn.callback = self._make_callback("radio")
+        self.add_item(radio_btn)
+
+    def _make_callback(self, action: str):
+        async def callback(interaction: discord.Interaction):
+            if interaction.user.id != self.ctx.author.id:
+                await interaction.response.send_message(
+                    "Solo quien hizo la búsqueda puede seleccionar.",
+                    ephemeral=True,
+                )
+                return
+            self.action = action
+            self.stop()
+            await interaction.response.defer()
+
+        return callback
+
+    async def on_timeout(self):
+        self.stop()
+
+
 @bot.check
 async def only_allowed_channel(ctx: commands.Context) -> bool:
     return ctx.channel.id == ALLOWED_CHANNEL_ID
@@ -112,6 +193,23 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
     if isinstance(error, commands.MissingRequiredArgument):
         await ctx.send(f"Faltan argumentos. Uso: `!{ctx.command.name} {ctx.command.signature}`")
         return
+    cause = error
+    if isinstance(error, commands.CommandInvokeError) and error.original:
+        cause = error.original
+    try:
+        from spotipy.oauth2 import SpotifyOauthError
+        if isinstance(cause, SpotifyOauthError):
+            from src.spotify import clear_spotify_token_cache
+            if "invalid_client" in str(cause).lower() or "invalid_grant" in str(cause).lower():
+                clear_spotify_token_cache()
+            await ctx.send(
+                "Spotify rechazo la autenticacion (token expirado o invalido).\n"
+                "El admin debe ejecutar `!auth` y completar el enlace de autorizacion."
+            )
+            logger.error("[ERROR] %s: SpotifyOauthError: %s", ctx.command, cause)
+            return
+    except ImportError:
+        pass
     await ctx.send(f"Error inesperado: `{error}`")
     logger.error(f"[ERROR] {ctx.command}: {error}")
 
@@ -192,12 +290,16 @@ async def cookies_cmd(ctx: commands.Context):
 
 @bot.command(name="auth", help="Inicia o renueva la autenticacion de Spotify. Solo admin.")
 async def auth_cmd(ctx: commands.Context):
+    from src.config import sp as _sp
+    from src.spotify import _safe_validate_token
+
     if ctx.author.id != ADMIN_USER_ID:
         await ctx.send("Solo el administrador puede usar este comando.")
         return
-    if not await _ensure_auth(ctx):
+    if _sp and await _safe_validate_token(_sp.auth_manager):
+        await ctx.send("Spotify ya esta autenticado.")
         return
-    await ctx.send("Spotify ya esta autenticado.")
+    await _ensure_auth(ctx)
 
 
 @bot.command(name="play", help="Reproduce una cancion en tu canal de voz. Uso: !play <busqueda>")
@@ -736,11 +838,98 @@ async def remove_cmd(ctx: commands.Context, pos: int):
         pass
 
 
-@bot.command(name="radio", help="Activa/desactiva el modo radio 24/7. Uso: !radio [on|off|<mood>]")
-async def radio_cmd(ctx: commands.Context, action: str = ""):
+async def _radio_profile_cmd(ctx: commands.Context, args: str) -> None:
+    from src import radio as _radio
+    from src.spotify_taste import parse_playlist_id
+
+    gid = ctx.guild.id
+    parts = args.strip().split(None, 1)
+    sub = parts[0].lower() if parts else ""
+    rest = parts[1].strip() if len(parts) > 1 else ""
+
+    if not sub:
+        embed = discord.Embed(
+            title="Perfil de radio Spotify",
+            description=(
+                f"Modo actual: **{_radio.describe_profile_mode(gid)}**\n\n"
+                "**Comandos:**\n"
+                "`!radio profile admin` — gustos de la cuenta del admin (`!auth`)\n"
+                "`!radio profile voice` — gustos de usuarios en el VC (`!spotify link`)\n"
+                "`!radio profile playlist <url>` — canciones de una playlist\n"
+                "`!radio profile off` — volver al historial del servidor"
+            ),
+            color=0x1DB954,
+        )
+        await ctx.send(embed=embed, delete_after=45)
+        return
+
+    if sub == "off":
+        _radio.set_profile_mode(gid, "off")
+        await ctx.send("Perfil de Spotify desactivado. La radio usa el historial del servidor.", delete_after=12)
+        return
+
+    if sub == "admin":
+        _radio.set_profile_mode(gid, "admin")
+        mode_desc = "perfil del admin"
+    elif sub == "voice":
+        _radio.set_profile_mode(gid, "voice")
+        mode_desc = "usuarios en el canal de voz"
+    elif sub == "playlist":
+        if not rest:
+            await ctx.send("Uso: `!radio profile playlist <url de Spotify>`", delete_after=8)
+            return
+        playlist_id = parse_playlist_id(rest)
+        if not playlist_id:
+            await ctx.send("URL o ID de playlist de Spotify invalido.", delete_after=8)
+            return
+        _radio.set_profile_mode(gid, "playlist", playlist_id=playlist_id)
+        mode_desc = f"playlist `{playlist_id}`"
+    else:
+        await ctx.send(
+            "Subcomando desconocido. Usa `!radio profile` para ver opciones.",
+            delete_after=10,
+        )
+        return
+
+    _radio.set_radio_active(gid, True)
+    embed = discord.Embed(
+        title="Perfil de radio activado",
+        description=(
+            f"Fuente: **{mode_desc}**\n"
+            "La radio mezclara canciones del perfil y recomendaciones derivadas.\n"
+            "Ejecuta `!auth` (admin) o `!spotify link` (usuarios) si aun no vinculaste Spotify."
+        ),
+        color=0x1DB954,
+    )
+    await ctx.send(embed=embed, delete_after=20)
+    vc = ctx.guild.voice_client
+    if vc is None and ctx.author.voice:
+        vc = await ctx.author.voice.channel.connect()
+        if gid not in queues:
+            queues[gid] = collections.deque()
+    if vc:
+        from src.playback import start_radio_with_welcome
+        asyncio.ensure_future(start_radio_with_welcome(ctx.guild, vc, ctx.channel))
+
+
+@bot.command(
+    name="radio",
+    help="Radio 24/7. Uso: !radio [on|off|<mood>|profile ...]",
+)
+async def radio_cmd(ctx: commands.Context, *, args: str = ""):
     from src import radio as _radio
     gid = ctx.guild.id
-    action = action.strip().lower()
+    parts = args.strip().split(None, 1)
+    action = parts[0].lower() if parts else ""
+    rest = parts[1] if len(parts) > 1 else ""
+
+    if action == "profile":
+        await _radio_profile_cmd(ctx, rest)
+        try:
+            await ctx.message.delete()
+        except Exception:
+            pass
+        return
 
     # Check if action is a known mood name → activate radio with that mood
     all_moods = {**_radio.MOODS, **_radio._custom_moods.get(gid, {})}
@@ -759,12 +948,16 @@ async def radio_cmd(ctx: commands.Context, action: str = ""):
         _radio.set_radio_active(gid, active)
 
     if active:
+        profile_line = ""
+        if _radio.get_profile_mode(gid) != "off":
+            profile_line = f"Perfil: **{_radio.describe_profile_mode(gid)}**\n"
         embed = discord.Embed(
             title="📻 Radio activado",
             description=(
                 f"Mood actual: **{_radio.get_mood(gid).capitalize()}**\n"
+                f"{profile_line}"
                 "La cola se rellena automaticamente con recomendaciones.\n"
-                "Usa `!mood <nombre>` para cambiar el estilo."
+                "Usa `!mood <nombre>` o `!radio profile` para personalizar."
             ),
             color=0x1DB954,
         )
@@ -788,6 +981,60 @@ async def radio_cmd(ctx: commands.Context, action: str = ""):
         await ctx.message.delete()
     except Exception:
         pass
+
+
+@bot.command(name="spotify", help="Vincula tu cuenta Spotify. Uso: !spotify link | unlink | status")
+async def spotify_cmd(ctx: commands.Context, *, args: str = ""):
+    from src.spotify import run_oauth_flow
+    from src.spotify_users import (
+        get_authorize_url,
+        is_user_linked,
+        unlink_user,
+        validate_user_token,
+    )
+
+    parts = args.strip().split(None, 1)
+    sub = parts[0].lower() if parts else "status"
+
+    if sub == "link":
+        if await validate_user_token(ctx.author.id):
+            await ctx.send("Tu Spotify ya esta vinculado. Usa `!spotify unlink` para desvincular.", delete_after=12)
+            return
+        auth_url = get_authorize_url(ctx.author.id)
+        ok = await run_oauth_flow(
+            ctx,
+            expected_state=f"user:{ctx.author.id}",
+            authorize_url=auth_url,
+            success_message="Spotify vinculado correctamente. La radio en modo `voice` usara tus gustos.",
+            timeout_message="Tiempo agotado. Usa `!spotify link` para reintentar.",
+        )
+        if not ok:
+            return
+        return
+
+    if sub == "unlink":
+        if unlink_user(ctx.author.id):
+            await ctx.send("Spotify desvinculado.", delete_after=10)
+        else:
+            await ctx.send("No tenias Spotify vinculado.", delete_after=10)
+        return
+
+    if sub == "status":
+        if await validate_user_token(ctx.author.id):
+            await ctx.send("Tu cuenta de Spotify esta vinculada.", delete_after=10)
+        elif is_user_linked(ctx.author.id):
+            await ctx.send(
+                "Tu token de Spotify expiro. Ejecuta `!spotify link` para renovar.",
+                delete_after=12,
+            )
+        else:
+            await ctx.send(
+                "No tienes Spotify vinculado. Usa `!spotify link` para conectar tu cuenta.",
+                delete_after=12,
+            )
+        return
+
+    await ctx.send("Uso: `!spotify link` | `!spotify unlink` | `!spotify status`", delete_after=10)
 
 
 @bot.command(name="mood", help="Cambia el mood del radio. Uso: !mood <nombre> | !mood create <nombre> <query> | !mood delete <nombre>")
@@ -991,11 +1238,14 @@ async def help_cmd(ctx: commands.Context):
         ("!priority <pos>", "Mueve una cancion al tope de la cola."),
         ("📻 Radio", None),
         ("!radio [on|off]", "Activa/desactiva el modo radio 24/7 con recomendaciones."),
+        ("!radio profile [admin|voice|playlist <url>|off]", "Radio basada en perfil Spotify."),
+        ("!spotify link", "Vincula tu cuenta Spotify para el modo radio `voice`."),
         ("!mood [nombre]", "Lista moods disponibles o cambia el mood del radio."),
         ("!mood create <nombre> <query>", "Crea un mood custom basado en un artista/cancion."),
         ("!mood delete <nombre>", "Elimina un mood custom."),
         ("⚙️ Otros", None),
         ("!library", "Muestra estadisticas de la biblioteca local cacheada."),
+        ("!library search <busqueda>", "Busca en la biblioteca local y elige reproducir o iniciar radio."),
         ("!cookies", "Estado de cookies de YouTube (solo admin)."),
         ("!auth", "Autenticacion de Spotify (solo admin)."),
         ("!ping", "Verifica que el bot este vivo."),
@@ -1099,8 +1349,189 @@ async def playlist_cmd(ctx: commands.Context, *, url: str):
         await play_next(ctx.guild, vc, ctx.channel)
 
 
-@bot.command(name="library", help="Muestra estadisticas de la biblioteca local cacheada.")
-async def library_cmd(ctx: commands.Context):
+def _library_entry_field_value(entry: dict) -> str:
+    import pathlib
+
+    artist = entry.get("artist", "Unknown")
+    duration = entry.get("duration") or 0
+    dur_str = f"{duration // 60}:{duration % 60:02d}" if duration else "?"
+    plays = entry.get("play_count", 0)
+    cached = "💾 " if pathlib.Path(entry.get("file_path", "")).is_file() else ""
+    return f"{cached}{artist}\n`[{dur_str}]` · `{plays}` reproducciones"
+
+
+async def _library_search(ctx: commands.Context, query: str) -> None:
+    if not ctx.author.voice:
+        await ctx.send("Debes estar en un canal de voz para usar este comando.", delete_after=5)
+        return
+    if not LIBRARY_ENABLED:
+        await ctx.send("La biblioteca local no está habilitada.", delete_after=8)
+        return
+
+    stats = get_stats()
+    if stats["total_indexed"] == 0:
+        await ctx.send(
+            "La biblioteca está vacía. Reproduce canciones con `!play` para empezar a indexarlas.",
+            delete_after=10,
+        )
+        return
+
+    msg = await ctx.send(f"📚 Buscando en la biblioteca: **{query}**...", delete_after=60)
+    candidates = search_index(query)
+    if not candidates:
+        await msg.edit(content=f"No se encontró nada en la biblioteca para: **{query}**")
+        return
+
+    voice_channel = ctx.author.voice.channel
+    vc = ctx.guild.voice_client
+    if vc is None:
+        vc = await voice_channel.connect()
+    elif vc.channel != voice_channel:
+        await vc.move_to(voice_channel)
+    if ctx.guild.id not in queues:
+        queues[ctx.guild.id] = collections.deque()
+
+    while candidates:
+        embed = discord.Embed(
+            title="📚 Elige una canción de la biblioteca",
+            description=f"Buscaste: **{query}**\n\nSelecciona una opción (válido por 30 segundos)",
+            color=0x1DB954,
+        )
+        for idx, (_tid, entry) in enumerate(candidates):
+            title = entry.get("title", "Unknown")
+            embed.add_field(
+                name=f"{idx + 1}️⃣ {title}",
+                value=_library_entry_field_value(entry),
+                inline=False,
+            )
+
+        select_view = LibrarySearchSelectionView(candidates, query, ctx)
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        selection_msg = await ctx.send(embed=embed, view=select_view)
+        await select_view.wait()
+
+        if select_view.selected is None:
+            await selection_msg.edit(content="⏱️ Tiempo agotado. Búsqueda cancelada.", embed=None, view=None)
+            return
+
+        tid, entry = select_view.selected
+        title = entry.get("title", "Unknown")
+        artist = entry.get("artist", "Unknown")
+
+        action_embed = discord.Embed(
+            title="¿Qué quieres hacer?",
+            description=f"**{title}**\n{artist}",
+            color=0x1DB954,
+        )
+        action_view = LibraryActionView(tid, entry, ctx)
+        await selection_msg.edit(embed=action_embed, view=action_view)
+        await action_view.wait()
+
+        if action_view.action is None:
+            await selection_msg.edit(content="⏱️ Tiempo agotado. Búsqueda cancelada.", embed=None, view=None)
+            return
+
+        if action_view.action == "play":
+            track = entry_to_queue_track(tid, entry, requester=ctx.author.display_name)
+            record_request(track)
+
+            from src import radio as _radio
+            if _radio.is_radio_active(ctx.guild.id) and (vc.is_playing() or vc.is_paused()):
+                items = list(queues[ctx.guild.id])
+                insert_idx = next(
+                    (i for i, t in enumerate(items) if t.get("requester") == "📻 Radio"),
+                    len(items),
+                )
+                items.insert(insert_idx, track)
+                queues[ctx.guild.id] = collections.deque(items)
+            else:
+                queues[ctx.guild.id].append(track)
+
+            if not (vc.is_playing() or vc.is_paused()):
+                try:
+                    await play_next(ctx.guild, vc, ctx.channel)
+                    confirm = discord.Embed(
+                        title="✅ Reproduciendo",
+                        description=f"**{title}**\n{artist}",
+                        color=0x1DB954,
+                    )
+                    await selection_msg.edit(embed=confirm, view=None)
+                    return
+                except Exception as exc:
+                    logger.error("library search play error: %s", exc)
+                    items = [t for t in queues[ctx.guild.id] if t.get("track_id") != tid]
+                    queues[ctx.guild.id] = collections.deque(items)
+                    candidates = [(c_tid, c_entry) for c_tid, c_entry in candidates if c_tid != tid]
+                    if candidates:
+                        retry_embed = discord.Embed(
+                            title="⚠️ No disponible",
+                            description=f"**{title}** no pudo reproducirse.\n\nElige otra opción.",
+                            color=0xFF9500,
+                        )
+                        await selection_msg.edit(embed=retry_embed, view=None)
+                        await asyncio.sleep(2)
+                        msg = selection_msg
+                        continue
+                    await selection_msg.edit(
+                        content="❌ No quedan opciones disponibles.",
+                        embed=None,
+                        view=None,
+                    )
+                    return
+            else:
+                confirm = discord.Embed(
+                    title="✅ Canción agregada a la cola",
+                    description=f"**{title}**\n{artist}",
+                    color=0x1DB954,
+                )
+                await selection_msg.edit(embed=confirm, view=None)
+                asyncio.ensure_future(refresh_player_embed_fresh(ctx.guild, ctx.channel))
+                return
+
+        # Radio: seed recommendations without playing the selected track
+        from src import radio as _radio
+        from src.playback import start_radio_with_welcome
+
+        track = entry_to_queue_track(tid, entry, requester=ctx.author.display_name)
+        was_active = _radio.is_radio_active(ctx.guild.id)
+        _radio.set_radio_active(ctx.guild.id, True)
+        await _radio.record_played(ctx.guild.id, track)
+        if was_active:
+            _radio.flush_radio_tracks(ctx.guild.id)
+
+        if not (vc.is_playing() or vc.is_paused()):
+            asyncio.ensure_future(start_radio_with_welcome(ctx.guild, vc, ctx.channel))
+        else:
+            await _radio.fill_radio_queue(ctx.guild, vc, ctx.channel, auto_play=False)
+
+        confirm = discord.Embed(
+            title="📻 Radio activado",
+            description=f"Semilla: **{title}**\n{artist}\n\nLa cola se rellena con recomendaciones.",
+            color=0x1DB954,
+        )
+        await selection_msg.edit(embed=confirm, view=None)
+        return
+
+
+@bot.command(
+    name="library",
+    help="Estadisticas de la biblioteca local. Uso: !library | !library search <busqueda>",
+)
+async def library_cmd(ctx: commands.Context, *, args: str = ""):
+    parts = args.strip().split(None, 1)
+    subcommand = parts[0].lower() if parts else ""
+
+    if subcommand == "search":
+        query = parts[1].strip() if len(parts) > 1 else ""
+        if not query:
+            await ctx.send("Uso: `!library search <busqueda>`", delete_after=8)
+            return
+        await _library_search(ctx, query)
+        return
+
     stats = get_stats()
     embed = discord.Embed(
         title="Biblioteca local",
@@ -1122,7 +1553,7 @@ async def library_cmd(ctx: commands.Context):
             value="Aun vacia — se llena al reproducir canciones.",
             inline=False,
         )
-    embed.set_footer(text="La radio usa la biblioteca local cuando YouTube bloquea el bot")
+    embed.set_footer(text="Usa `!library search <busqueda>` para buscar y reproducir o iniciar radio")
     await ctx.send(embed=embed, delete_after=45)
 
 

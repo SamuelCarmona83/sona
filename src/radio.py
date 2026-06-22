@@ -118,6 +118,10 @@ _played_ids: dict[int, list[str]] = {}
 _CUSTOM_MOODS_PATH = pathlib.Path(".cache/custom_moods.json")
 _custom_moods: dict[int, dict[str, list[str]]] = {}
 
+# Radio profile source per guild: off | admin | voice | playlist
+_PROFILE_PATH = pathlib.Path(".cache/radio_profiles.json")
+_radio_profiles: dict[int, dict] = {}
+
 # Ensure cache directory exists
 _PLAYED_IDS_PATH.parent.mkdir(parents=True, exist_ok=True)
 
@@ -160,8 +164,141 @@ def _save_custom_moods() -> None:
         logger.warning("radio: could not save custom_moods: %s", exc)
 
 
+def _load_radio_profiles() -> None:
+    if _PROFILE_PATH.exists():
+        try:
+            data = json.loads(_PROFILE_PATH.read_text())
+            for gid_str, profile in data.items():
+                _radio_profiles[int(gid_str)] = profile
+        except Exception:
+            pass
+
+
+def _save_radio_profiles() -> None:
+    try:
+        data = {str(gid): profile for gid, profile in _radio_profiles.items()}
+        _PROFILE_PATH.write_text(json.dumps(data, indent=2))
+    except Exception as exc:
+        logger.warning("radio: could not save radio_profiles: %s", exc)
+
+
 _load_played_ids()
 _load_custom_moods()
+_load_radio_profiles()
+
+
+def get_profile_mode(guild_id: int) -> str:
+    return _radio_profiles.get(guild_id, {}).get("mode", "off")
+
+
+def get_profile_playlist_id(guild_id: int) -> str | None:
+    return _radio_profiles.get(guild_id, {}).get("playlist_id")
+
+
+def set_profile_mode(guild_id: int, mode: str, *, playlist_id: str | None = None) -> None:
+    if mode not in ("off", "admin", "voice", "playlist"):
+        raise ValueError(f"Modo de perfil desconocido: {mode}")
+    if mode == "playlist" and not playlist_id:
+        raise ValueError("El modo playlist requiere una playlist de Spotify.")
+    if mode == "off":
+        _radio_profiles.pop(guild_id, None)
+    else:
+        profile = {"mode": mode}
+        if mode == "playlist":
+            profile["playlist_id"] = playlist_id
+        _radio_profiles[guild_id] = profile
+    _save_radio_profiles()
+
+
+def describe_profile_mode(guild_id: int) -> str:
+    mode = get_profile_mode(guild_id)
+    if mode == "off":
+        return "desactivado (historial del servidor)"
+    if mode == "admin":
+        return "perfil del admin (`!auth`)"
+    if mode == "voice":
+        return "perfiles Spotify de usuarios en el canal de voz (`!spotify link`)"
+    if mode == "playlist":
+        playlist_id = get_profile_playlist_id(guild_id) or "?"
+        return f"playlist Spotify (`{playlist_id}`)"
+    return mode
+
+
+async def _resolve_taste_profile(guild: discord.Guild) -> "TasteProfile | None":
+    from src.config import sp, SPOTIFY_AVAILABLE
+    from src.spotify_taste import (
+        TasteProfile,
+        build_playlist_taste_profile,
+        build_user_taste_profile,
+        get_cached_profile,
+        merge_taste_profiles,
+        parse_playlist_id,
+    )
+    from src.spotify_users import get_valid_user_client, linked_users_in
+
+    gid = guild.id
+    mode = get_profile_mode(gid)
+    if mode == "off" or not SPOTIFY_AVAILABLE:
+        return None
+
+    if mode == "admin":
+        if sp is None:
+            return None
+        from src.spotify import _safe_validate_token
+        if not await _safe_validate_token(sp.auth_manager):
+            return None
+        return await get_cached_profile(
+            f"guild_{gid}_admin",
+            lambda: build_user_taste_profile(sp, label="admin"),
+        )
+
+    if mode == "playlist":
+        playlist_id = get_profile_playlist_id(gid)
+        if not playlist_id or sp is None:
+            return None
+        from src.spotify import _safe_validate_token
+        if not await _safe_validate_token(sp.auth_manager):
+            return None
+        pid = playlist_id
+        return await get_cached_profile(
+            f"guild_{gid}_playlist_{pid}",
+            lambda: build_playlist_taste_profile(sp, pid, label="playlist"),
+        )
+
+    if mode == "voice":
+        vc = guild.voice_client
+        channel = getattr(vc, "channel", None)
+        if channel is None:
+            return None
+        connected_ids = [m.id for m in channel.members if not m.bot]
+        linked = await linked_users_in(connected_ids)
+        if not linked:
+            if sp is not None:
+                from src.spotify import _safe_validate_token
+                if await _safe_validate_token(sp.auth_manager):
+                    logger.info("radio.profile: voice mode sin usuarios vinculados, fallback admin guild=%s", gid)
+                    return await get_cached_profile(
+                        f"guild_{gid}_admin_fallback",
+                        lambda: build_user_taste_profile(sp, label="admin"),
+                    )
+            return None
+
+        profiles = []
+        for uid in linked:
+            client = await get_valid_user_client(uid)
+            if client is None:
+                continue
+            profile = await get_cached_profile(
+                f"user_{uid}",
+                lambda c=client: build_user_taste_profile(c, label=f"user:{uid}"),
+            )
+            if profile.direct_tracks or profile.seed_track_ids:
+                profiles.append(profile)
+        if not profiles:
+            return None
+        return merge_taste_profiles(profiles, label="voice")
+
+    return None
 
 
 def is_radio_active(guild_id: int) -> bool:
@@ -452,10 +589,15 @@ async def fill_radio_queue(
         if needed <= 0:
             return
 
-        seed_tracks, seed_genres = _build_diversity_seeds(gid)
+        taste_profile = await _resolve_taste_profile(guild)
+        if taste_profile and (taste_profile.seed_track_ids or taste_profile.seed_genres):
+            seed_tracks = taste_profile.seed_track_ids[:5]
+            seed_genres = taste_profile.seed_genres[:2]
+        else:
+            seed_tracks, seed_genres = _build_diversity_seeds(gid)
         logger.info(
-            "radio.fill: guild=%s mood=%s seed_tracks=%s seed_genres=%s needed=%s",
-            gid, get_mood(gid), seed_tracks, seed_genres, needed,
+            "radio.fill: guild=%s mood=%s profile=%s seed_tracks=%s seed_genres=%s needed=%s",
+            gid, get_mood(gid), get_profile_mode(gid), seed_tracks, seed_genres, needed,
         )
 
         if is_youtube_rate_limited():
@@ -476,6 +618,86 @@ async def fill_radio_queue(
             logger.warning("radio.fill: YouTube bloqueado y biblioteca local vacia para guild=%s", gid)
             await maybe_notify_rate_limited(gid, text_channel)
             return
+
+        # --- Spotify profile direct mix ---
+        if taste_profile and taste_profile.direct_tracks:
+            import random as _random
+            from src.youtube import search_youtube as _syt_profile
+
+            profile_label = taste_profile.source_label or get_profile_mode(gid)
+            requester = f"📻 Radio 🎧 {profile_label}"
+            profile_pool = list(taste_profile.direct_tracks)
+            _random.shuffle(profile_pool)
+            profile_needed = max(1, min(needed, len(profile_pool), needed // 2 + 1))
+            profile_candidates = profile_pool[: profile_needed * 2]
+
+            async def _fetch_profile(info: dict) -> dict | None:
+                stub = {
+                    "title": info.get("title", info["query"]),
+                    "yt_query": info["query"],
+                    "spotify_id": info.get("spotify_id"),
+                    "artist_id": info.get("artist_id"),
+                    "artist": info.get("artist", "Unknown"),
+                }
+                local = resolve_local_track(stub)
+                if local:
+                    local["requester"] = requester
+                    return local
+                tid = track_id(stub)
+                entry = get_entry(tid)
+                if entry:
+                    return track_from_entry(tid, entry, requester=requester)
+                yt_info = await _syt_profile(info["query"], enable_llm=False, trusted=True)
+                if not yt_info or not yt_info.get("url"):
+                    local = resolve_local_track(stub)
+                    if local:
+                        local["requester"] = requester
+                        return local
+                    return None
+                return {
+                    "title": yt_info["title"],
+                    "yt_query": info["query"],
+                    "url": yt_info["url"],
+                    "requester": requester,
+                    "artist": info.get("artist", "Unknown"),
+                    "duration": yt_info.get("duration") or 0,
+                    "thumbnail": yt_info.get("thumbnail") or "",
+                    "spotify_id": info.get("spotify_id"),
+                    "artist_id": info.get("artist_id"),
+                    "video_id": yt_info.get("video_id"),
+                    "webpage_url": yt_info.get("webpage_url"),
+                }
+
+            profile_results = await asyncio.gather(*(_fetch_profile(t) for t in profile_candidates))
+            played_set_profile = set(_played_ids.get(gid, []))
+            seen_urls_profile: set[str] = set()
+            profile_tracks = []
+            for track in profile_results:
+                if track is None:
+                    continue
+                sid = track.get("spotify_id")
+                url = track.get("url", "")
+                dedup_key = sid if sid else f"url_{url}"
+                if dedup_key in played_set_profile or url in seen_urls_profile:
+                    continue
+                seen_urls_profile.add(url)
+                profile_tracks.append(track)
+                if len(profile_tracks) >= profile_needed:
+                    break
+            if profile_tracks:
+                if gid not in queues:
+                    queues[gid] = collections.deque()
+                for track in profile_tracks:
+                    queues[gid].append(track)
+                needed -= len(profile_tracks)
+                logger.info(
+                    "radio.fill: %d canciones de perfil Spotify (%s) para guild=%s",
+                    len(profile_tracks), profile_label, gid,
+                )
+                if needed <= 0:
+                    if auto_play and not (vc and (vc.is_playing() or vc.is_paused())):
+                        await play_next(guild, vc, text_channel)
+                    return
 
         # --- Liked-tracks priority ---
         from src import likes as _likes_mod

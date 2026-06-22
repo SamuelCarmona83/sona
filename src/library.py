@@ -110,6 +110,64 @@ def track_from_entry(tid: str, entry: dict, *, requester: str = "📻 Radio") ->
     }
 
 
+def _normalize_search_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text.lower().strip())
+
+
+def search_index(query: str, limit: int = 5) -> list[tuple[str, dict]]:
+    """Return top library index matches for a text query."""
+    q = _normalize_search_text(query)
+    if not q or not _index:
+        return []
+
+    words = q.split()
+    scored: list[tuple[int, str, dict]] = []
+
+    for tid, entry in _index.items():
+        haystack = _normalize_search_text(
+            f"{entry.get('title', '')} {entry.get('artist', '')} {entry.get('yt_query', '')}"
+        )
+        if not all(word in haystack for word in words):
+            continue
+
+        title = _normalize_search_text(entry.get("title", ""))
+        artist = _normalize_search_text(entry.get("artist", ""))
+        score = 0
+        if q in title:
+            score += 50
+        elif title.startswith(q):
+            score += 30
+        if q in artist:
+            score += 40
+        if pathlib.Path(entry.get("file_path", "")).is_file():
+            score += 5
+        score += entry.get("play_count", 0) * 2 + entry.get("request_count", 0)
+        scored.append((score, tid, entry))
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return [(tid, entry) for _score, tid, entry in scored[:limit]]
+
+
+def entry_to_queue_track(tid: str, entry: dict, *, requester: str) -> dict:
+    """Build a queue-ready track dict from a library index entry."""
+    file_path = entry.get("file_path")
+    if file_path and pathlib.Path(file_path).is_file():
+        return track_from_entry(tid, entry, requester=requester)
+    return {
+        "title": entry.get("title", "?"),
+        "yt_query": entry.get("yt_query", entry.get("title", "")),
+        "url": None,
+        "requester": requester,
+        "artist": entry.get("artist", "Unknown"),
+        "duration": entry.get("duration", 0),
+        "thumbnail": entry.get("thumbnail", ""),
+        "spotify_id": entry.get("spotify_id"),
+        "artist_id": entry.get("artist_id"),
+        "video_id": entry.get("video_id"),
+        "track_id": tid,
+    }
+
+
 def resolve_local_track(track: dict) -> dict | None:
     """Return track with local file URL if cached on disk."""
     if not LIBRARY_ENABLED:

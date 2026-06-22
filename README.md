@@ -165,6 +165,18 @@ The bot caches audio after successful playback so frequently played songs don't 
 - **Audio files:** `.cache/library/` (persisted via Docker `spotify_cache` volume)
 - **Offline radio:** When YouTube rate-limits the bot, radio mode plays from the local library
 - **Stats:** `!library` shows cached track count and top plays
+- **Search:** `!library search <query>` finds indexed tracks and lets you play or seed radio
+
+### Personalized Radio (Spotify profile)
+
+The radio can use real Spotify taste data instead of only server history:
+
+- `!radio profile admin` — liked songs, top tracks, and recents from the admin account (`!auth`)
+- `!radio profile voice` — blend tastes of linked users in the voice channel (`!spotify link`)
+- `!radio profile playlist <url>` — rotate tracks from a Spotify playlist
+- `!radio profile off` — back to guild history only
+
+After changing OAuth scopes, run `!auth` again. Users run `!spotify link` for voice mode.
 - **Tuning:** `LIBRARY_MAX_TRACKS`, `LIBRARY_MAX_MB`, `LIBRARY_MIN_PLAYS_TO_PIN` in `.env`
 
 ## 📝 License
