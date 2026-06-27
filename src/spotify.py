@@ -12,9 +12,9 @@ from discord.ext import commands
 from spotipy.oauth2 import SpotifyOauthError
 
 from src.config import (
-    CACHE_PATH,
-    OAUTH_PORT,
-    ADMIN_USER_ID,
+    OAUTH_ADMIN_USER_ID,
+    SPOTIFY_OAUTH_PORT,
+    SPOTIFY_TOKEN_CACHE_PATH,
     MIN_SPOTIFY_REFINEMENT_SCORE,
     sp,
 )
@@ -32,7 +32,7 @@ _artist_genres_cache: dict[str, list[str]] = {}
 
 def clear_spotify_token_cache() -> bool:
     """Delete the cached OAuth token file. Returns True if a file was removed."""
-    path = pathlib.Path(CACHE_PATH)
+    path = pathlib.Path(SPOTIFY_TOKEN_CACHE_PATH)
     if path.is_file():
         path.unlink()
         logger.info("spotify: cleared stale token cache at %s", path)
@@ -82,7 +82,7 @@ class _CallbackHandler(BaseHTTPRequestHandler):
 
 
 def _run_callback_server():
-    server = HTTPServer(("0.0.0.0", OAUTH_PORT), _CallbackHandler)
+    server = HTTPServer(("0.0.0.0", SPOTIFY_OAUTH_PORT), _CallbackHandler)
     server.handle_request()
     server.server_close()
 
@@ -528,7 +528,7 @@ async def _ensure_auth(ctx: commands.Context) -> bool:
         return True
 
     # Only the admin can kick off the OAuth flow
-    if ctx.author.id != ADMIN_USER_ID:
+    if ctx.author.id != OAUTH_ADMIN_USER_ID:
         await ctx.send(
             "Spotify no esta autenticado o el token expiro. Pide al admin que ejecute `!auth`."
         )

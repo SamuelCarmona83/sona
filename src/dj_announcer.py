@@ -1,10 +1,3 @@
-"""DJ Announcer – generates and synthesizes radio transition comments.
-
-When radio mode detects a genre cluster change between tracks, this module:
-1. Generates a short DJ comment via Anthropic LLM (with template fallback).
-2. Synthesizes it to an audio file via edge-tts.
-3. Returns the file path for playback before the next song.
-"""
 import asyncio
 import logging
 import os
@@ -20,9 +13,9 @@ from src.config import (
     ANTHROPIC_API_KEY,
     ANTHROPIC_MODEL,
     DJ_VOICE,
-    DJ_ANNOUNCE_COOLDOWN,
+    DJ_ANNOUNCE_COOLDOWN_SEC,
     DJ_VOLUME,
-    DJ_FUN_FACT_INTERVAL,
+    DJ_FUN_FACT_INTERVAL_TRACKS,
 )
 
 logger = logging.getLogger(__name__)
@@ -97,7 +90,7 @@ _WELCOME_TEMPLATES_NIGHT = [
 def check_cooldown(guild_id: int) -> bool:
     """Return True if enough time has passed since last announcement."""
     last = _last_announce.get(guild_id, 0)
-    return (time.time() - last) >= DJ_ANNOUNCE_COOLDOWN
+    return (time.time() - last) >= DJ_ANNOUNCE_COOLDOWN_SEC
 
 
 def mark_announced(guild_id: int) -> None:

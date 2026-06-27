@@ -1,9 +1,9 @@
-import src.commands  # noqa: F401 — registers all commands and events as side effect
+import src.commands  # noqa: F401
 from src.bot_instance import bot
 from src.config import bot_token
 
 
-def main():
+def main() -> None:
     bot.run(bot_token)
 
 

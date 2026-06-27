@@ -1,11 +1,3 @@
-"""Smart Radio Mode
-
-Per-guild state for 24/7 radio. When active:
-  - Queue auto-fills to RADIO_QUEUE_MIN tracks using Spotify recommendations.
-  - Recommendations are seeded by a diversity-aware mix of play history + active mood.
-  - User !play requests are front-queued (handled in commands.py).
-  - Bot stays connected when the queue empties (fill triggers instead of disconnect).
-"""
 import asyncio
 import collections
 import json
@@ -14,13 +6,13 @@ import pathlib
 
 import discord
 
-from src.config import RADIO_QUEUE_MIN, RADIO_FILL_COUNT, LLM_ENABLED_FOR_ALBUM_TRACKS
+from src.config import (
+    LLM_ALBUM_TRACK_RANKING_LIMIT,
+    RADIO_QUEUE_REFILL_THRESHOLD,
+    RADIO_QUEUE_TARGET_SIZE,
+)
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Mood → Spotify genre seeds
-# ---------------------------------------------------------------------------
 
 MOODS: dict[str, list[str]] = {
     "neutral":  [],
@@ -566,7 +558,7 @@ async def fill_radio_queue(
 ) -> None:
     """Fetch Spotify recommendations and add them to the queue.
 
-    Called when queue length drops below RADIO_QUEUE_MIN, or when radio is
+    Called when queue length drops below RADIO_QUEUE_REFILL_THRESHOLD, or when radio is
     first activated. Guarded by _filling to prevent concurrent fills.
 
     If *auto_play* is False, tracks are queued but playback is NOT started
@@ -585,7 +577,7 @@ async def fill_radio_queue(
 
     try:
         q = queues.get(gid, collections.deque())
-        needed = RADIO_FILL_COUNT - len(q)
+        needed = RADIO_QUEUE_TARGET_SIZE - len(q)
         if needed <= 0:
             return
 
@@ -799,7 +791,7 @@ async def fill_radio_queue(
             if using_fallback:
                 yt_info = info.get("yt_info")
             else:
-                enable_llm = idx < LLM_ENABLED_FOR_ALBUM_TRACKS
+                enable_llm = idx < LLM_ALBUM_TRACK_RANKING_LIMIT
                 yt_info = await search_youtube(info["query"], enable_llm=enable_llm, trusted=True)
             if not yt_info:
                 return None

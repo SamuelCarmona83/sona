@@ -4,10 +4,10 @@ import re
 import unicodedata
 
 from src.config import (
-    NOISE_TERMS,
-    VARIANT_TERMS,
-    PREFERRED_CHANNEL_HINTS,
     MIN_SEARCH_SCORE,
+    YOUTUBE_PREFERRED_CHANNEL_HINTS,
+    YOUTUBE_TITLE_NOISE_TERMS,
+    YOUTUBE_TITLE_VARIANT_TERMS,
 )
 
 logger = logging.getLogger(__name__)
@@ -36,7 +36,7 @@ def _canonical_token(token: str) -> str:
 
 def _extract_variant_preferences(query: str) -> set[str]:
     normalized = _normalize_text(query)
-    return {term for term in VARIANT_TERMS if term in normalized.split()}
+    return {term for term in YOUTUBE_TITLE_VARIANT_TERMS if term in normalized.split()}
 
 
 def _tokenize(value: str, *, keep_variants: bool = False) -> list[str]:
@@ -45,9 +45,9 @@ def _tokenize(value: str, *, keep_variants: bool = False) -> list[str]:
         token = _canonical_token(raw_token)
         if not token:
             continue
-        if token in NOISE_TERMS:
+        if token in YOUTUBE_TITLE_NOISE_TERMS:
             continue
-        if not keep_variants and token in VARIANT_TERMS:
+        if not keep_variants and token in YOUTUBE_TITLE_VARIANT_TERMS:
             continue
         tokens.append(token)
     return tokens
@@ -56,12 +56,12 @@ def _tokenize(value: str, *, keep_variants: bool = False) -> list[str]:
 def _clean_title_for_match(title: str, requested_variants: set[str]) -> str:
     cleaned = _normalize_text(title)
     if requested_variants:
-        for term in VARIANT_TERMS - requested_variants:
+        for term in YOUTUBE_TITLE_VARIANT_TERMS - requested_variants:
             cleaned = re.sub(rf"\b{re.escape(term)}\b", " ", cleaned)
     else:
-        for term in VARIANT_TERMS:
+        for term in YOUTUBE_TITLE_VARIANT_TERMS:
             cleaned = re.sub(rf"\b{re.escape(term)}\b", " ", cleaned)
-    for term in NOISE_TERMS:
+    for term in YOUTUBE_TITLE_NOISE_TERMS:
         cleaned = re.sub(rf"\b{re.escape(term)}\b", " ", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned)
     return cleaned.strip()
@@ -189,7 +189,7 @@ def _score_candidate(query: str, candidate: dict) -> float:
             score += 1.5
 
     if not requested_variants:
-        for term in VARIANT_TERMS:
+        for term in YOUTUBE_TITLE_VARIANT_TERMS:
             if re.search(rf"\b{re.escape(term)}\b", normalized_blob):
                 score -= 5.0  # More aggressively filter unwanted variants
 
@@ -205,7 +205,7 @@ def _score_candidate(query: str, candidate: dict) -> float:
             score -= 2.0
 
     uploader_normalized = _normalize_text(candidate_uploader)
-    if any(hint in uploader_normalized for hint in PREFERRED_CHANNEL_HINTS):
+    if any(hint in uploader_normalized for hint in YOUTUBE_PREFERRED_CHANNEL_HINTS):
         score += 1.5
 
     return score

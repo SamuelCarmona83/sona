@@ -6,8 +6,8 @@ import time
 import discord
 
 from src.config import (
-    ADMIN_USER_ID,
-    ALLOWED_CHANNEL_ID,
+    BOT_TEXT_CHANNEL_ID,
+    OAUTH_ADMIN_USER_ID,
     COOKIE_ALERT_COOLDOWN_SEC,
     COOKIE_HEALTH_CHECK_INTERVAL_SEC,
     YTDL_COOKIE_MAX_AGE_HOURS,
@@ -69,7 +69,7 @@ async def _send_admin_alert(message: str) -> None:
     _last_alert_time = now
 
     try:
-        admin = await bot.fetch_user(ADMIN_USER_ID)
+        admin = await bot.fetch_user(OAUTH_ADMIN_USER_ID)
         await admin.send(message)
         logger.info("cookie_health: alert sent to admin")
         return
@@ -77,7 +77,7 @@ async def _send_admin_alert(message: str) -> None:
         logger.warning("cookie_health: could not DM admin: %s", exc)
 
     try:
-        channel = await bot.fetch_channel(ALLOWED_CHANNEL_ID)
+        channel = await bot.fetch_channel(BOT_TEXT_CHANNEL_ID)
         await channel.send(message)
         logger.info("cookie_health: alert sent to allowed channel")
     except Exception as exc:
