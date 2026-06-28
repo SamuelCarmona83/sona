@@ -3,6 +3,7 @@ import collections
 import logging
 import random
 import time
+from dataclasses import dataclass, field
 
 
 import discord
@@ -22,22 +23,118 @@ from src.bot_instance import bot
 
 logger = logging.getLogger(__name__)
 
-queues: dict[int, collections.deque] = {}
-now_playing_info: dict[int, dict | None] = {}
-_prefetch_tasks: dict[int, asyncio.Task | None] = {}
-_player_messages: dict[int, discord.Message | None] = {}
-_player_channels: dict[int, discord.abc.Messageable | None] = {}
-_player_refresh_tasks: dict[int, asyncio.Task | None] = {}
-_player_update_locks: dict[int, asyncio.Lock] = {}
-_paused: dict[int, bool] = {}
-_dj_last_genre_cluster: dict[int, str | None] = {}
-_prefetched_dj_audio: dict[int, str | None] = {}
-_radio_welcome_in_progress: dict[int, bool] = {}
-_tracks_since_dj_comment: dict[int, int] = {}
-_player_embed_recreated_at: dict[int, float] = {}
-
 PLAYER_REFRESH_INTERVAL = 4.0
 PLAYER_EMBED_RECREATE_INTERVAL_SEC = 60.0
+
+
+@dataclass
+class GuildPlaybackSession:
+    queue: collections.deque = field(default_factory=collections.deque)
+    now_playing: dict | None = None
+    paused: bool = False
+    prefetch_task: asyncio.Task | None = None
+    player_message: discord.Message | None = None
+    player_channel: discord.abc.Messageable | None = None
+    player_refresh_task: asyncio.Task | None = None
+    player_update_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    dj_last_genre_cluster: str | None = None
+    prefetched_dj_audio: str | None = None
+    radio_welcome_in_progress: bool = False
+    tracks_since_dj_comment: int = 0
+    player_embed_recreated_at: float = 0.0
+    last_rate_limit_notify: float = 0.0
+
+    def embed_recreate_due(self) -> bool:
+        return time.time() - self.player_embed_recreated_at >= PLAYER_EMBED_RECREATE_INTERVAL_SEC
+
+    def cancel_prefetch(self) -> None:
+        task = self.prefetch_task
+        self.prefetch_task = None
+        if task and not task.done():
+            task.cancel()
+
+    def reset_playback(self) -> None:
+        self.queue = collections.deque()
+        self.now_playing = None
+        self.paused = False
+
+
+_sessions: dict[int, GuildPlaybackSession] = {}
+
+
+def guild_session(guild_id: int) -> GuildPlaybackSession:
+    return _sessions.setdefault(guild_id, GuildPlaybackSession())
+
+
+class _SessionField:
+    def __init__(self, attr: str):
+        self._attr = attr
+
+    def get(self, guild_id: int, default=None):
+        session = _sessions.get(guild_id)
+        if session is None:
+            return default
+        value = getattr(session, self._attr)
+        return default if value is None and default is not None else value
+
+    def __getitem__(self, guild_id: int):
+        return getattr(guild_session(guild_id), self._attr)
+
+    def __setitem__(self, guild_id: int, value) -> None:
+        setattr(guild_session(guild_id), self._attr, value)
+
+    def setdefault(self, guild_id: int, default=None):
+        session = guild_session(guild_id)
+        value = getattr(session, self._attr)
+        if value is None and default is not None:
+            setattr(session, self._attr, default)
+            value = default
+        return value
+
+    def pop(self, guild_id: int, *default):
+        session = _sessions.get(guild_id)
+        if session is None:
+            if default:
+                return default[0]
+            raise KeyError(guild_id)
+        value = getattr(session, self._attr)
+        reset = _SESSION_FIELD_RESET.get(self._attr)
+        if reset is not None:
+            setattr(session, self._attr, reset() if callable(reset) else reset)
+        if value is None and default:
+            return default[0]
+        return value
+
+
+_SESSION_FIELD_RESET = {
+    "prefetch_task": None,
+    "prefetched_dj_audio": None,
+    "dj_last_genre_cluster": None,
+    "player_message": None,
+    "player_refresh_task": None,
+    "radio_welcome_in_progress": False,
+    "tracks_since_dj_comment": 0,
+    "player_embed_recreated_at": 0.0,
+    "last_rate_limit_notify": 0.0,
+}
+
+
+queues = _SessionField("queue")
+now_playing_info = _SessionField("now_playing")
+_prefetch_tasks = _SessionField("prefetch_task")
+_player_messages = _SessionField("player_message")
+_player_channels = _SessionField("player_channel")
+_player_refresh_tasks = _SessionField("player_refresh_task")
+_player_update_locks = _SessionField("player_update_lock")
+_paused = _SessionField("paused")
+_dj_last_genre_cluster = _SessionField("dj_last_genre_cluster")
+_prefetched_dj_audio = _SessionField("prefetched_dj_audio")
+_prefetch_dj = _prefetched_dj_audio
+_last_cluster = _dj_last_genre_cluster
+_radio_welcome_in_progress = _SessionField("radio_welcome_in_progress")
+_tracks_since_dj_comment = _SessionField("tracks_since_dj_comment")
+_player_embed_recreated_at = _SessionField("player_embed_recreated_at")
+_last_rate_limit_notify = _SessionField("last_rate_limit_notify")
 
 
 def _is_automated_radio_requester(requester: str) -> bool:
@@ -66,16 +163,12 @@ def _format_player_title_line(track: dict) -> str:
     return title
 
 
-def _embed_recreate_due(guild_id: int) -> bool:
-    last_recreate = _player_embed_recreated_at.get(guild_id, 0)
-    return time.time() - last_recreate >= PLAYER_EMBED_RECREATE_INTERVAL_SEC
-
-
 def _build_v2_payload(guild_id: int) -> dict:
     from discord.http import Route  # noqa: F401
-    track = now_playing_info.get(guild_id)
-    q = queues.get(guild_id, collections.deque())
-    paused = _paused.get(guild_id, False)
+    session = guild_session(guild_id)
+    track = session.now_playing
+    q = session.queue
+    paused = session.paused
     from src import radio as _radio
     radio_on = _radio.is_radio_active(guild_id)
     mood = _radio.get_mood(guild_id)
@@ -154,39 +247,41 @@ def _resolve_interaction_guild(interaction: discord.Interaction, fallback_gid: i
 
 
 async def _player_refresh_loop(guild_id: int):
+    session = guild_session(guild_id)
     try:
         while True:
             await asyncio.sleep(PLAYER_REFRESH_INTERVAL)
             guild = bot.get_guild(guild_id)
-            channel = _player_channels.get(guild_id)
+            channel = session.player_channel
             vc = guild.voice_client if guild else None
-            active = bool(now_playing_info.get(guild_id) or queues.get(guild_id))
+            active = bool(session.now_playing or session.queue)
             if not guild or channel is None or not active and not (vc and (vc.is_playing() or vc.is_paused())):
                 break
             try:
-                if _embed_recreate_due(guild_id):
+                if session.embed_recreate_due():
                     await refresh_player_embed_fresh(guild, channel)
                 else:
                     await update_player_embed(guild, channel)
             except Exception as exc:
                 logger.debug("_player_refresh_loop: embed refresh failed for guild=%s: %s", guild_id, exc)
     finally:
-        _player_refresh_tasks.pop(guild_id, None)
+        session.player_refresh_task = None
 
 
 def _ensure_player_refresh(guild: discord.Guild, channel) -> None:
-    _player_channels[guild.id] = channel
-    task = _player_refresh_tasks.get(guild.id)
+    session = guild_session(guild.id)
+    session.player_channel = channel
+    task = session.player_refresh_task
     if task and not task.done():
         return
-    _player_refresh_tasks[guild.id] = asyncio.create_task(_player_refresh_loop(guild.id))
+    session.player_refresh_task = asyncio.create_task(_player_refresh_loop(guild.id))
 
 
 class PlayerView(discord.ui.View):
     def __init__(self, guild_id: int):
         super().__init__(timeout=None)
         self.guild_id = guild_id
-        paused = _paused.get(guild_id, False)
+        paused = guild_session(guild_id).paused
         self.toggle_btn.label = "\u25b6 Reanudar" if paused else "\u23f8 Pausar"
         self.toggle_btn.style = (
             discord.ButtonStyle.success if paused else discord.ButtonStyle.secondary
@@ -205,13 +300,14 @@ class PlayerView(discord.ui.View):
             await interaction.response.send_message("No pude encontrar este servidor.", ephemeral=True)
             return
         self.guild_id = gid
+        session = guild_session(gid)
         vc = guild.voice_client
         if vc and vc.is_playing():
             vc.pause()
-            _paused[gid] = True
+            session.paused = True
         elif vc and vc.is_paused():
             vc.resume()
-            _paused[gid] = False
+            session.paused = False
         await interaction.response.defer()
         await refresh_player_embed_fresh(guild, interaction.channel)
 
@@ -236,9 +332,7 @@ class PlayerView(discord.ui.View):
             await interaction.response.send_message("No pude encontrar este servidor.", ephemeral=True)
             return
         self.guild_id = gid
-        queues[gid] = collections.deque()
-        now_playing_info[gid] = None
-        _paused[gid] = False
+        guild_session(gid).reset_playback()
         vc = guild.voice_client
         if vc:
             vc.stop()
@@ -253,11 +347,11 @@ class PlayerView(discord.ui.View):
             await interaction.response.send_message("No pude encontrar este servidor.", ephemeral=True)
             return
         self.guild_id = gid
-        q = queues.get(gid)
-        if q and len(q) > 1:
-            items = list(q)
+        session = guild_session(gid)
+        if len(session.queue) > 1:
+            items = list(session.queue)
             random.shuffle(items)
-            queues[gid] = collections.deque(items)
+            session.queue = collections.deque(items)
         await interaction.response.defer()
         await refresh_player_embed_fresh(guild, interaction.channel)
 
@@ -269,7 +363,7 @@ class PlayerView(discord.ui.View):
             return
         if guild:
             self.guild_id = gid
-        q = queues.get(gid, collections.deque())
+        q = guild_session(gid).queue
         if not q:
             await interaction.response.send_message("La cola esta vacia.", ephemeral=True)
             return
@@ -292,7 +386,7 @@ class PlayerView(discord.ui.View):
             await interaction.response.send_message("No pude encontrar este servidor.", ephemeral=True)
             return
         self.guild_id = gid
-        track = now_playing_info.get(gid)
+        track = guild_session(gid).now_playing
         if not track:
             await interaction.response.send_message("Nada reproduciéndose ahora.", ephemeral=True)
             return
@@ -384,14 +478,13 @@ class PlayerView(discord.ui.View):
 
 async def update_player_embed(guild: discord.Guild, channel):
     from discord.http import Route
-    gid = guild.id
-    _player_channels[gid] = channel
+    session = guild_session(guild.id)
+    session.player_channel = channel
     _ensure_player_refresh(guild, channel)
-    lock = _player_update_locks.setdefault(gid, asyncio.Lock())
 
-    async with lock:
-        payload = _build_v2_payload(gid)
-        old = _player_messages.get(gid)
+    async with session.player_update_lock:
+        payload = _build_v2_payload(guild.id)
+        old = session.player_message
 
         if old:
             try:
@@ -403,49 +496,46 @@ async def update_player_embed(guild: discord.Guild, channel):
                 )
                 data = await bot.http.request(route, json=payload)
                 msg = discord.Message(state=bot._connection, channel=old.channel, data=data)
-                _player_messages[gid] = msg
+                session.player_message = msg
                 return
             except Exception:
-                logger.debug("update_player_embed: patch failed for guild=%s; creating fresh message", gid)
+                logger.debug("update_player_embed: patch failed for guild=%s; creating fresh message", guild.id)
 
         route = Route("POST", "/channels/{channel_id}/messages", channel_id=channel.id)
         data = await bot.http.request(route, json=payload)
         msg = discord.Message(state=bot._connection, channel=channel, data=data)
-        _player_messages[gid] = msg
+        session.player_message = msg
 
 
 async def refresh_player_embed_fresh(guild: discord.Guild, channel):
     from discord.http import Route
-    gid = guild.id
-    _player_channels[gid] = channel
+    session = guild_session(guild.id)
+    session.player_channel = channel
     _ensure_player_refresh(guild, channel)
-    lock = _player_update_locks.setdefault(gid, asyncio.Lock())
 
-    async with lock:
-        old = _player_messages.get(gid)
+    async with session.player_update_lock:
+        old = session.player_message
         if old:
             try:
                 await old.delete()
             except Exception as exc:
-                logger.debug("refresh_player_embed_fresh: delete failed for guild=%s: %s", gid, exc)
-            _player_messages[gid] = None
+                logger.debug("refresh_player_embed_fresh: delete failed for guild=%s: %s", guild.id, exc)
+            session.player_message = None
 
-        payload = _build_v2_payload(gid)
+        payload = _build_v2_payload(guild.id)
         try:
             route = Route("POST", "/channels/{channel_id}/messages", channel_id=channel.id)
             data = await bot.http.request(route, json=payload)
             msg = discord.Message(state=bot._connection, channel=channel, data=data)
-            _player_messages[gid] = msg
-            _player_embed_recreated_at[gid] = time.time()
-            logger.debug("refresh_player_embed_fresh: recreated embed for guild=%s", gid)
+            session.player_message = msg
+            session.player_embed_recreated_at = time.time()
+            logger.debug("refresh_player_embed_fresh: recreated embed for guild=%s", guild.id)
         except Exception as exc:
-            logger.error("refresh_player_embed_fresh: failed to create new message for guild=%s: %s", gid, exc)
+            logger.error("refresh_player_embed_fresh: failed to create new message for guild=%s: %s", guild.id, exc)
 
 
 def _cancel_guild_prefetch(guild_id: int) -> None:
-    task = _prefetch_tasks.pop(guild_id, None)
-    if task and not task.done():
-        task.cancel()
+    guild_session(guild_id).cancel_prefetch()
 
 
 async def _handle_empty_playback_queue(
@@ -500,6 +590,7 @@ async def _resolve_url(track: dict) -> dict | None:
 async def _prefetch_dj_audio_for_up_next(guild_id: int, next_track: dict) -> None:
     if not DJ_ANNOUNCER_ENABLED:
         return
+    session = guild_session(guild_id)
     from src import radio as _radio
     try:
         from src.dj_announcer import (
@@ -510,24 +601,24 @@ async def _prefetch_dj_audio_for_up_next(guild_id: int, next_track: dict) -> Non
         )
 
         hour = get_buenos_aires_hour()
-        current = now_playing_info.get(guild_id)
+        current = session.now_playing
         if current and _is_user_requested_track(current):
             comment = await generate_fun_fact(
                 current.get("title", ""),
                 current.get("artist", "Unknown"),
-                _dj_last_genre_cluster.get(guild_id),
+                session.dj_last_genre_cluster,
                 hour,
                 artist_id=current.get("artist_id"),
             )
             dj_file = await synthesize_dj_audio(comment, guild_id)
             if dj_file:
-                _prefetched_dj_audio[guild_id] = dj_file
+                session.prefetched_dj_audio = dj_file
                 logger.info("_prefetch_next: pre-generated user-pick fun-fact TTS for guild=%s", guild_id)
             return
 
-        tracks_since_comment = _tracks_since_dj_comment.get(guild_id, 0)
+        tracks_since_comment = session.tracks_since_dj_comment
         if _radio.is_radio_active(guild_id) and check_cooldown(guild_id):
-            prev_cluster = _dj_last_genre_cluster.get(guild_id)
+            prev_cluster = session.dj_last_genre_cluster
             if prev_cluster:
                 new_cluster = await _radio.get_track_cluster(next_track)
                 if new_cluster and new_cluster != prev_cluster:
@@ -540,7 +631,7 @@ async def _prefetch_dj_audio_for_up_next(guild_id: int, next_track: dict) -> Non
                     )
                     dj_file = await synthesize_dj_audio(comment, guild_id)
                     if dj_file:
-                        _prefetched_dj_audio[guild_id] = dj_file
+                        session.prefetched_dj_audio = dj_file
                         logger.info("_prefetch_next: pre-generated DJ transition TTS for guild=%s", guild_id)
                     return
 
@@ -555,17 +646,17 @@ async def _prefetch_dj_audio_for_up_next(guild_id: int, next_track: dict) -> Non
             )
             dj_file = await synthesize_dj_audio(comment, guild_id)
             if dj_file:
-                _prefetched_dj_audio[guild_id] = dj_file
+                session.prefetched_dj_audio = dj_file
                 logger.info("_prefetch_next: pre-generated DJ fun-fact TTS for guild=%s", guild_id)
     except Exception as exc:
         logger.debug("_prefetch_next: DJ pre-gen failed: %s", exc)
 
 
 async def _prefetch_next(guild_id: int):
-    q = queues.get(guild_id)
-    if not q:
+    session = guild_session(guild_id)
+    if not session.queue:
         return
-    next_track = q[0]
+    next_track = session.queue[0]
     try:
         await _resolve_url(next_track)
     except Exception as e:
@@ -586,12 +677,12 @@ _RATE_LIMIT_MESSAGE = (
 async def maybe_notify_rate_limited(guild_id: int, text_channel) -> None:
     if not is_youtube_rate_limited():
         return
+    session = guild_session(guild_id)
     now = time.time()
-    last_notify = _last_rate_limit_notify.get(guild_id, 0)
-    if now - last_notify <= _RATE_LIMIT_NOTIFY_COOLDOWN:
+    if now - session.last_rate_limit_notify <= _RATE_LIMIT_NOTIFY_COOLDOWN:
         return
     await text_channel.send(_RATE_LIMIT_MESSAGE)
-    _last_rate_limit_notify[guild_id] = now
+    session.last_rate_limit_notify = now
 
 
 async def _resolve_dj_audio_before_track(
@@ -602,6 +693,7 @@ async def _resolve_dj_audio_before_track(
     if not DJ_ANNOUNCER_ENABLED or _is_user_requested_track(track):
         return None
 
+    session = guild_session(guild_id)
     dj_file = prefetched_audio
     try:
         from src import radio as _radio
@@ -617,8 +709,8 @@ async def _resolve_dj_audio_before_track(
         if _radio.is_radio_active(guild_id):
             new_cluster = await _radio.get_track_cluster(track)
             if new_cluster:
-                prev_cluster = _dj_last_genre_cluster.get(guild_id)
-                _dj_last_genre_cluster[guild_id] = new_cluster
+                prev_cluster = session.dj_last_genre_cluster
+                session.dj_last_genre_cluster = new_cluster
                 if not dj_file and prev_cluster and prev_cluster != new_cluster and check_cooldown(guild_id):
                     hour = get_buenos_aires_hour()
                     comment = await generate_dj_comment(
@@ -630,12 +722,12 @@ async def _resolve_dj_audio_before_track(
                     )
                     dj_file = await synthesize_dj_audio(comment, guild_id)
 
-        if not dj_file and _tracks_since_dj_comment.get(guild_id, 0) >= DJ_FUN_FACT_INTERVAL_TRACKS:
+        if not dj_file and session.tracks_since_dj_comment >= DJ_FUN_FACT_INTERVAL_TRACKS:
             hour = get_buenos_aires_hour()
             comment = await generate_fun_fact(
                 track.get("title", ""),
                 track.get("artist", "Unknown"),
-                _dj_last_genre_cluster.get(guild_id),
+                session.dj_last_genre_cluster,
                 hour,
                 artist_id=track.get("artist_id"),
             )
@@ -643,7 +735,7 @@ async def _resolve_dj_audio_before_track(
 
         if dj_file:
             mark_announced(guild_id)
-            _tracks_since_dj_comment[guild_id] = 0
+            session.tracks_since_dj_comment = 0
         return dj_file
     except Exception as exc:
         logger.warning("play_next: DJ announcer error: %s", exc)
@@ -653,18 +745,18 @@ async def _resolve_dj_audio_before_track(
 
 
 async def play_next(guild: discord.Guild, vc: discord.VoiceClient, text_channel):
-    _cancel_guild_prefetch(guild.id)
+    session = guild_session(guild.id)
+    session.cancel_prefetch()
 
-    q = queues.get(guild.id)
-    if not q:
-        now_playing_info[guild.id] = None
-        _paused[guild.id] = False
+    if not session.queue:
+        session.now_playing = None
+        session.paused = False
         await _update_status(guild, None)
         await update_player_embed(guild, text_channel)
         await _handle_empty_playback_queue(guild, vc, text_channel)
         return
 
-    track = q.popleft()
+    track = session.queue.popleft()
     track = await _resolve_url(track)
     if not track:
         if is_youtube_rate_limited():
@@ -675,21 +767,22 @@ async def play_next(guild: discord.Guild, vc: discord.VoiceClient, text_channel)
         await play_next(guild, vc, text_channel)
         return
 
-    now_playing_info[guild.id] = track
-    _paused[guild.id] = False
+    session.now_playing = track
+    session.paused = False
 
     from src import radio as _radio
     asyncio.ensure_future(_radio.record_played(guild.id, track))
     record_play(track)
 
-    if _radio.is_radio_active(guild.id) and len(q) < RADIO_QUEUE_REFILL_THRESHOLD:
+    if _radio.is_radio_active(guild.id) and len(session.queue) < RADIO_QUEUE_REFILL_THRESHOLD:
         asyncio.ensure_future(_radio.fill_radio_queue(guild, vc, text_channel))
 
-    if q:
-        _prefetch_tasks[guild.id] = asyncio.create_task(_prefetch_next(guild.id))
+    if session.queue:
+        session.prefetch_task = asyncio.create_task(_prefetch_next(guild.id))
 
-    prefetched_dj = _prefetched_dj_audio.pop(guild.id, None)
-    _tracks_since_dj_comment[guild.id] = _tracks_since_dj_comment.get(guild.id, 0) + 1
+    prefetched_dj = session.prefetched_dj_audio
+    session.prefetched_dj_audio = None
+    session.tracks_since_dj_comment += 1
 
     if _is_user_requested_track(track):
         if prefetched_dj:
@@ -765,12 +858,13 @@ async def start_radio_with_welcome(
     text_channel,
 ) -> None:
     from src import radio as _radio
+    session = guild_session(guild.id)
     gid = guild.id
 
-    if _radio_welcome_in_progress.get(gid):
+    if session.radio_welcome_in_progress:
         logger.info("start_radio_with_welcome: already active for guild=%s, skipping", gid)
         return
-    _radio_welcome_in_progress[gid] = True
+    session.radio_welcome_in_progress = True
 
     dj_file: str | None = None
 
@@ -822,8 +916,7 @@ async def start_radio_with_welcome(
         await fill_task
 
         if not (vc.is_playing() or vc.is_paused()):
-            q = queues.get(gid)
-            if q:
+            if session.queue:
                 await play_next(guild, vc, text_channel)
             elif _radio.is_radio_active(gid):
                 logger.info("start_radio_with_welcome: queue empty after fill, retrying")
@@ -831,7 +924,7 @@ async def start_radio_with_welcome(
     except Exception as exc:
         logger.warning("start_radio_with_welcome: error: %s", exc)
     finally:
-        _radio_welcome_in_progress.pop(gid, None)
+        session.radio_welcome_in_progress = False
 
 
 async def _update_status(guild: discord.Guild, title: str | None):

@@ -1,0 +1,717 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Spoty Scanner — Explorador de datos</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #121212;
+      --surface: #181818;
+      --surface2: #282828;
+      --text: #fff;
+      --muted: #b3b3b3;
+      --dim: #717171;
+      --accent: #1db954;
+      --accent-dim: rgba(29, 185, 84, 0.15);
+      --danger: #ff6b6b;
+      --radius: 8px;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      line-height: 1.5;
+    }
+
+    .header {
+      padding: 24px 32px 16px;
+      border-bottom: 1px solid var(--surface2);
+    }
+
+    .header h1 {
+      font-size: 1.5rem;
+      color: var(--accent);
+      margin-bottom: 4px;
+    }
+
+    .header p {
+      color: var(--muted);
+      font-size: 0.875rem;
+    }
+
+    .cache-badge {
+      display: inline-block;
+      margin-top: 8px;
+      padding: 4px 10px;
+      background: var(--accent-dim);
+      color: var(--accent);
+      border-radius: 12px;
+      font-size: 0.75rem;
+    }
+
+    .banner {
+      margin: 16px 32px 0;
+      padding: 12px 16px;
+      border-radius: var(--radius);
+      font-size: 0.875rem;
+    }
+
+    .banner.error {
+      background: rgba(255, 107, 107, 0.12);
+      border: 1px solid rgba(255, 107, 107, 0.3);
+      color: var(--danger);
+    }
+
+    .banner.info {
+      background: var(--accent-dim);
+      border: 1px solid rgba(29, 185, 84, 0.25);
+      color: var(--accent);
+    }
+
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: 12px;
+      padding: 20px 32px;
+    }
+
+    .stat-card {
+      background: var(--surface);
+      border: 1px solid var(--surface2);
+      border-radius: var(--radius);
+      padding: 16px;
+    }
+
+    .stat-card .value {
+      font-size: 1.75rem;
+      font-weight: 700;
+      color: var(--accent);
+    }
+
+    .stat-card .label {
+      font-size: 0.75rem;
+      color: var(--dim);
+      margin-top: 4px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      align-items: center;
+      padding: 0 32px 16px;
+    }
+
+    .toolbar input[type="search"] {
+      flex: 1;
+      min-width: 200px;
+      padding: 10px 14px;
+      background: var(--surface);
+      border: 1px solid var(--surface2);
+      border-radius: 20px;
+      color: var(--text);
+      font-size: 0.875rem;
+      outline: none;
+    }
+
+    .toolbar input[type="search"]:focus {
+      border-color: var(--accent);
+    }
+
+    .toolbar select {
+      padding: 10px 14px;
+      background: var(--surface);
+      border: 1px solid var(--surface2);
+      border-radius: 20px;
+      color: var(--text);
+      font-size: 0.875rem;
+      cursor: pointer;
+    }
+
+    .tabs {
+      display: flex;
+      gap: 4px;
+      padding: 0 32px;
+      border-bottom: 1px solid var(--surface2);
+    }
+
+    .tab {
+      padding: 12px 20px;
+      background: none;
+      border: none;
+      color: var(--muted);
+      font-size: 0.875rem;
+      font-weight: 600;
+      cursor: pointer;
+      border-bottom: 2px solid transparent;
+      margin-bottom: -1px;
+      transition: color 0.15s;
+    }
+
+    .tab:hover { color: var(--text); }
+
+    .tab.active {
+      color: var(--accent);
+      border-bottom-color: var(--accent);
+    }
+
+    .content {
+      padding: 24px 32px 48px;
+    }
+
+    .panel { display: none; }
+    .panel.active { display: block; }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+      gap: 16px;
+    }
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--surface2);
+      border-radius: var(--radius);
+      overflow: hidden;
+      transition: border-color 0.15s;
+    }
+
+    .card:hover { border-color: var(--accent); }
+
+    .card-thumb {
+      width: 100%;
+      aspect-ratio: 16 / 9;
+      background: var(--surface2);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+    }
+
+    .card-thumb img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+
+    .card-thumb .placeholder {
+      font-size: 2rem;
+      color: var(--dim);
+    }
+
+    .card-body { padding: 14px; }
+
+    .card-title {
+      font-size: 0.9rem;
+      font-weight: 600;
+      margin-bottom: 4px;
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+    }
+
+    .card-query {
+      font-size: 0.75rem;
+      color: var(--accent);
+      margin-bottom: 8px;
+      font-style: italic;
+      display: -webkit-box;
+      -webkit-line-clamp: 1;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+    }
+
+    .card-meta {
+      font-size: 0.75rem;
+      color: var(--dim);
+      margin-bottom: 4px;
+    }
+
+    .card-links {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 10px;
+    }
+
+    .card-links a {
+      font-size: 0.75rem;
+      color: var(--accent);
+      text-decoration: none;
+    }
+
+    .card-links a:hover { text-decoration: underline; }
+
+    .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 10px;
+      font-size: 0.7rem;
+      font-weight: 600;
+      background: var(--accent-dim);
+      color: var(--accent);
+    }
+
+    .badge.plays {
+      background: rgba(255, 255, 255, 0.08);
+      color: var(--muted);
+    }
+
+    .empty {
+      text-align: center;
+      padding: 48px 24px;
+      color: var(--dim);
+      font-size: 0.9rem;
+    }
+
+    .loading {
+      text-align: center;
+      padding: 48px;
+      color: var(--dim);
+    }
+
+    .spinner {
+      display: inline-block;
+      width: 14px;
+      height: 14px;
+      border: 2px solid var(--accent);
+      border-top-color: transparent;
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+      vertical-align: middle;
+      margin-right: 8px;
+    }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .count-label {
+      font-size: 0.8rem;
+      color: var(--dim);
+      margin-bottom: 16px;
+    }
+  </style>
+</head>
+<body>
+  <header class="header">
+    <h1>Spoty Scanner</h1>
+    <p>Explorador de búsquedas y datos del bot</p>
+    <span class="cache-badge" id="cacheBadge">Cargando caché…</span>
+  </header>
+
+  <div id="banner" class="banner" style="display:none"></div>
+
+  <div class="stats" id="stats">
+    <div class="stat-card"><div class="value" id="statSearches">—</div><div class="label">Búsquedas</div></div>
+    <div class="stat-card"><div class="value" id="statLibrary">—</div><div class="label">Biblioteca</div></div>
+    <div class="stat-card"><div class="value" id="statLikes">—</div><div class="label">Likes</div></div>
+    <div class="stat-card"><div class="value" id="statPlayed">—</div><div class="label">Radio (IDs)</div></div>
+  </div>
+
+  <div class="toolbar">
+    <input type="search" id="searchInput" placeholder="Filtrar por título, búsqueda, artista…" autocomplete="off">
+    <select id="sortSelect">
+      <option value="recent">Más reciente</option>
+      <option value="alpha">Alfabético</option>
+      <option value="duration">Duración</option>
+      <option value="plays">Más reproducidas</option>
+    </select>
+  </div>
+
+  <nav class="tabs">
+    <button class="tab active" data-tab="searches">Búsquedas</button>
+    <button class="tab" data-tab="library">Biblioteca</button>
+    <button class="tab" data-tab="likes">Likes</button>
+  </nav>
+
+  <main class="content">
+    <section class="panel active" id="panel-searches">
+      <p class="count-label" id="countSearches"></p>
+      <div class="grid" id="gridSearches"></div>
+    </section>
+    <section class="panel" id="panel-library">
+      <p class="count-label" id="countLibrary"></p>
+      <div class="grid" id="gridLibrary"></div>
+    </section>
+    <section class="panel" id="panel-likes">
+      <p class="count-label" id="countLikes"></p>
+      <div class="grid" id="gridLikes"></div>
+    </section>
+  </main>
+
+  <script>
+    const CACHE_DIRS = [".cache", "spotify_cache"];
+    let cacheDir = null;
+    let activeTab = "searches";
+
+    let searches = [];
+    let library = [];
+    let likes = [];
+    let playedCount = 0;
+
+    async function loadCacheJson(filename) {
+      for (const dir of CACHE_DIRS) {
+        try {
+          const res = await fetch(`/${dir}/${filename}`);
+          if (res.ok) {
+            cacheDir = dir;
+            return await res.json();
+          }
+        } catch (_) { /* try next dir */ }
+      }
+      return null;
+    }
+
+    function formatDuration(sec) {
+      if (!sec || sec < 0) return "—";
+      const m = Math.floor(sec / 60);
+      const s = sec % 60;
+      return `${m}:${String(s).padStart(2, "0")}`;
+    }
+
+    function formatTimestamp(unix) {
+      if (!unix) return "—";
+      return new Date(unix * 1000).toLocaleString("es", {
+        day: "2-digit", month: "short", year: "numeric",
+        hour: "2-digit", minute: "2-digit",
+      });
+    }
+
+    function spotifyUrl(id) {
+      return id ? `https://open.spotify.com/track/${id}` : null;
+    }
+
+    function youtubeUrl(entry) {
+      if (entry.webpage_url) return entry.webpage_url;
+      if (entry.video_id) return `https://www.youtube.com/watch?v=${entry.video_id}`;
+      return null;
+    }
+
+    function escapeHtml(str) {
+      const d = document.createElement("div");
+      d.textContent = str ?? "";
+      return d.innerHTML;
+    }
+
+    function thumbHtml(thumbnail, alt) {
+      if (thumbnail) {
+        return `<img src="${escapeHtml(thumbnail)}" alt="${escapeHtml(alt)}" loading="lazy">`;
+      }
+      return `<span class="placeholder">♪</span>`;
+    }
+
+    function linkHtml(href, label) {
+      if (!href) return "";
+      return `<a href="${escapeHtml(href)}" target="_blank" rel="noopener">${escapeHtml(label)}</a>`;
+    }
+
+    function transformSearches(raw) {
+      if (!raw || typeof raw !== "object") return [];
+      return Object.entries(raw).map(([query, meta]) => ({
+        query,
+        title: meta.title || query,
+        thumbnail: meta.thumbnail,
+        duration: meta.duration || 0,
+        uploader: meta.uploader || "—",
+        webpage_url: meta.webpage_url,
+        video_id: meta.video_id,
+        cached_at: meta.cached_at || 0,
+      }));
+    }
+
+    function transformLibrary(raw) {
+      if (!raw || typeof raw !== "object") return [];
+      return Object.entries(raw).map(([trackId, entry]) => ({
+        trackId,
+        title: entry.title || trackId,
+        artist: entry.artist || "—",
+        thumbnail: entry.thumbnail,
+        yt_query: entry.yt_query,
+        spotify_id: entry.spotify_id,
+        video_id: entry.video_id,
+        webpage_url: entry.webpage_url,
+        play_count: entry.play_count || 0,
+        request_count: entry.request_count || 0,
+        last_played: entry.last_played || 0,
+        file_path: entry.file_path,
+        on_disk: !!entry.file_path,
+      }));
+    }
+
+    function transformLikes(raw) {
+      if (!raw || typeof raw !== "object") return [];
+      const flat = [];
+      for (const [guildId, users] of Object.entries(raw)) {
+        if (!users || typeof users !== "object") continue;
+        for (const [userId, tracks] of Object.entries(users)) {
+          if (!Array.isArray(tracks)) continue;
+          for (const t of tracks) {
+            flat.push({
+              guildId,
+              userId,
+              track_id: t.track_id,
+              title: t.title || "—",
+              artist: t.artist || "—",
+              yt_query: t.yt_query,
+              spotify_id: t.spotify_id,
+              thumbnail: t.thumbnail,
+              liked_at: t.liked_at || 0,
+            });
+          }
+        }
+      }
+      return flat;
+    }
+
+    function countPlayedIds(raw) {
+      if (!raw || typeof raw !== "object") return 0;
+      let total = 0;
+      for (const ids of Object.values(raw)) {
+        if (Array.isArray(ids)) total += ids.length;
+      }
+      return total;
+    }
+
+    function getFilterText() {
+      return document.getElementById("searchInput").value.trim().toLowerCase();
+    }
+
+    function matchesFilter(item, fields) {
+      const q = getFilterText();
+      if (!q) return true;
+      return fields.some((f) => (f || "").toLowerCase().includes(q));
+    }
+
+    function getSortKey() {
+      return document.getElementById("sortSelect").value;
+    }
+
+    function sortItems(items, tab) {
+      const key = getSortKey();
+      const sorted = [...items];
+      if (tab === "searches") {
+        if (key === "alpha") sorted.sort((a, b) => a.title.localeCompare(b.title));
+        else if (key === "duration") sorted.sort((a, b) => b.duration - a.duration);
+        else sorted.sort((a, b) => b.cached_at - a.cached_at);
+      } else if (tab === "library") {
+        if (key === "alpha") sorted.sort((a, b) => a.title.localeCompare(b.title));
+        else if (key === "duration") sorted.sort((a, b) => (b.duration || 0) - (a.duration || 0));
+        else if (key === "plays") sorted.sort((a, b) => b.play_count - a.play_count);
+        else sorted.sort((a, b) => b.play_count - a.play_count);
+      } else if (tab === "likes") {
+        if (key === "alpha") sorted.sort((a, b) => a.title.localeCompare(b.title));
+        else sorted.sort((a, b) => b.liked_at - a.liked_at);
+      }
+      return sorted;
+    }
+
+    function renderSearchCard(item) {
+      const yt = youtubeUrl(item);
+      return `
+        <article class="card">
+          <div class="card-thumb">${thumbHtml(item.thumbnail, item.title)}</div>
+          <div class="card-body">
+            <div class="card-title">${escapeHtml(item.title)}</div>
+            <div class="card-query">"${escapeHtml(item.query)}"</div>
+            <div class="card-meta">${escapeHtml(item.uploader)} · ${formatDuration(item.duration)}</div>
+            <div class="card-meta">Cacheado: ${formatTimestamp(item.cached_at)}</div>
+            <div class="card-links">
+              ${linkHtml(yt, "YouTube")}
+            </div>
+          </div>
+        </article>`;
+    }
+
+    function renderLibraryCard(item) {
+      const yt = youtubeUrl(item);
+      const sp = spotifyUrl(item.spotify_id);
+      return `
+        <article class="card">
+          <div class="card-thumb">${thumbHtml(item.thumbnail, item.title)}</div>
+          <div class="card-body">
+            <div class="card-title">${escapeHtml(item.title)}</div>
+            <div class="card-meta">${escapeHtml(item.artist)}</div>
+            <div class="card-meta">
+              <span class="badge plays">${item.play_count} reproducciones</span>
+              ${item.on_disk ? '<span class="badge">En disco</span>' : ""}
+            </div>
+            <div class="card-links">
+              ${linkHtml(yt, "YouTube")}
+              ${linkHtml(sp, "Spotify")}
+            </div>
+          </div>
+        </article>`;
+    }
+
+    function renderLikeCard(item) {
+      const sp = spotifyUrl(item.spotify_id);
+      return `
+        <article class="card">
+          <div class="card-thumb">${thumbHtml(item.thumbnail, item.title)}</div>
+          <div class="card-body">
+            <div class="card-title">${escapeHtml(item.title)}</div>
+            <div class="card-meta">${escapeHtml(item.artist)}</div>
+            ${item.yt_query ? `<div class="card-query">"${escapeHtml(item.yt_query)}"</div>` : ""}
+            <div class="card-meta">Like: ${formatTimestamp(item.liked_at)}</div>
+            <div class="card-links">
+              ${linkHtml(sp, "Spotify")}
+            </div>
+          </div>
+        </article>`;
+    }
+
+    function renderPanel(tab) {
+      const filter = getFilterText();
+      let items, gridId, countId, renderFn, filterFields;
+
+      if (tab === "searches") {
+        items = searches.filter((i) => matchesFilter(i, [i.query, i.title, i.uploader]));
+        gridId = "gridSearches";
+        countId = "countSearches";
+        renderFn = renderSearchCard;
+        filterFields = null;
+      } else if (tab === "library") {
+        items = library.filter((i) => matchesFilter(i, [i.title, i.artist, i.yt_query]));
+        gridId = "gridLibrary";
+        countId = "countLibrary";
+        renderFn = renderLibraryCard;
+      } else {
+        items = likes.filter((i) => matchesFilter(i, [i.title, i.artist, i.yt_query]));
+        gridId = "gridLikes";
+        countId = "countLikes";
+        renderFn = renderLikeCard;
+      }
+
+      items = sortItems(items, tab);
+      const grid = document.getElementById(gridId);
+      const countEl = document.getElementById(countId);
+
+      if (items.length === 0) {
+        const emptyMsg = filter
+          ? "Ningún resultado coincide con el filtro."
+          : tab === "library"
+            ? "Sin pistas en biblioteca. El bot crea este índice al reproducir y cachear audio."
+            : tab === "likes"
+              ? "Sin likes guardados aún."
+              : "Sin búsquedas cacheadas aún.";
+        countEl.textContent = "";
+        grid.innerHTML = `<div class="empty">${emptyMsg}</div>`;
+        return;
+      }
+
+      countEl.textContent = `${items.length} resultado${items.length !== 1 ? "s" : ""}${filter ? " (filtrado)" : ""}`;
+      grid.innerHTML = items.map(renderFn).join("");
+    }
+
+    function renderAll() {
+      renderPanel("searches");
+      renderPanel("library");
+      renderPanel("likes");
+    }
+
+    function updateStats() {
+      document.getElementById("statSearches").textContent = searches.length;
+      document.getElementById("statLibrary").textContent = library.length;
+      document.getElementById("statLikes").textContent = likes.length;
+      document.getElementById("statPlayed").textContent = playedCount;
+    }
+
+    function showBanner(msg, type) {
+      const el = document.getElementById("banner");
+      el.textContent = msg;
+      el.className = `banner ${type}`;
+      el.style.display = "block";
+    }
+
+    function setCacheBadge() {
+      const el = document.getElementById("cacheBadge");
+      el.textContent = cacheDir ? `Caché: /${cacheDir}/` : "Sin caché encontrada";
+    }
+
+    function updateSortOptions() {
+      const sel = document.getElementById("sortSelect");
+      const playsOpt = sel.querySelector('option[value="plays"]');
+      const durOpt = sel.querySelector('option[value="duration"]');
+      if (activeTab === "library") {
+        playsOpt.hidden = false;
+        durOpt.hidden = false;
+      } else if (activeTab === "searches") {
+        playsOpt.hidden = true;
+        durOpt.hidden = false;
+        if (sel.value === "plays") sel.value = "recent";
+      } else {
+        playsOpt.hidden = true;
+        durOpt.hidden = true;
+        if (sel.value === "plays" || sel.value === "duration") sel.value = "recent";
+      }
+    }
+
+    document.querySelectorAll(".tab").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        activeTab = btn.dataset.tab;
+        document.querySelectorAll(".tab").forEach((t) => t.classList.remove("active"));
+        document.querySelectorAll(".panel").forEach((p) => p.classList.remove("active"));
+        btn.classList.add("active");
+        document.getElementById(`panel-${activeTab}`).classList.add("active");
+        updateSortOptions();
+        renderPanel(activeTab);
+      });
+    });
+
+    document.getElementById("searchInput").addEventListener("input", renderAll);
+    document.getElementById("sortSelect").addEventListener("change", renderAll);
+
+    async function init() {
+      const grids = ["gridSearches", "gridLibrary", "gridLikes"];
+      grids.forEach((id) => {
+        document.getElementById(id).innerHTML =
+          '<div class="loading"><span class="spinner"></span>Cargando datos…</div>';
+      });
+
+      const [ytMeta, libIndex, likesRaw, playedRaw] = await Promise.all([
+        loadCacheJson("youtube_metadata.json"),
+        loadCacheJson("library_index.json"),
+        loadCacheJson("likes.json"),
+        loadCacheJson("played_ids.json"),
+      ]);
+
+      if (!cacheDir) {
+        showBanner(
+          "No se encontró carpeta de caché (.cache/ ni spotify_cache/). " +
+          "Con Docker: docker compose up -d explorer. Sin Docker: ./serve_explorer.sh desde la raíz del repo.",
+          "error"
+        );
+        grids.forEach((id) => {
+          document.getElementById(id).innerHTML =
+            '<div class="empty">Sin datos disponibles.</div>';
+        });
+        setCacheBadge();
+        return;
+      }
+
+      setCacheBadge();
+
+      searches = transformSearches(ytMeta);
+      library = transformLibrary(libIndex);
+      likes = transformLikes(likesRaw);
+      playedCount = countPlayedIds(playedRaw);
+
+      updateStats();
+      renderAll();
+
+      if (searches.length === 0 && library.length === 0 && likes.length === 0) {
+        showBanner("La carpeta de caché existe pero aún no hay datos. Usa !play o !search en Discord.", "info");
+      }
+    }
+
+    init();
+  </script>
+</body>
+</html>

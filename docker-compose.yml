@@ -23,3 +23,14 @@ services:
       YTDL_SEARCH_JITTER_SEC: 3.0
       LIBRARY_ENABLED: "true"
       LIBRARY_PATH: /app/.cache/library
+
+  explorer:
+    image: python:3.12-slim
+    restart: unless-stopped
+    working_dir: /app
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./web:/app/web:ro
+      - ./spotify_cache:/app/.cache:ro
+    command: python3 -m http.server 8080 --bind 0.0.0.0
