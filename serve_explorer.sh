@@ -13,4 +13,6 @@ echo "  docker compose up -d explorer"
 echo "  http://localhost:8080/web/explorer.html"
 echo ""
 echo "  Ctrl+C para detener"
-exec python3 -m http.server "$PORT"
+export EXPLORER_PORT="$PORT"
+export EXPLORER_HOST="127.0.0.1"
+exec python3 web/server.py

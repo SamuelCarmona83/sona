@@ -18,12 +18,14 @@ Solves modern YouTube bot detection. LLM-ranked to reduce costs 70%.
 # Setup (one-time)
 ./setup.sh
 
-# Run in Docker (recommended)
-docker-compose up
+# Run in Docker (recommended) — bot + data explorer
+docker compose up -d
 
 # Or local
 ./run.sh
 ```
+
+**Data explorer (optional):** http://localhost:8080/web/explorer.html — browse searches, library, likes, and disk usage.
 
 Then in Discord (in your voice channel):
 ```
@@ -36,8 +38,10 @@ Then in Discord (in your voice channel):
 ## 🔧 Setup
 
 ### Docker (No Extra Steps)
+- **`bot`** — Discord bot (port 8888 for Spotify OAuth)
+- **`explorer`** — data explorer UI (port 8080)
 - Builds Python 3.12 + Deno + EJS
-- Mounts `cookies.txt` into the container
+- Mounts `cookies.txt` and `spotify_cache/` (persisted cache + library audio)
 - Handles FFmpeg + all deps
 
 ### Cookie maintenance (zero-cron)
@@ -86,7 +90,14 @@ src/
 ├── playback.py      — Queue + voice playback
 ├── scoring.py       — Heuristic ranking + LLM tie-breaking
 ├── radio.py         — Genre-based auto-queue
+├── library.py       — Local audio cache, dedup-safe track IDs
 └── dj_announcer.py  — TTS between songs
+web/
+├── explorer.html    — Static UI (Tailwind) to browse cached JSON data
+├── server.py        — Static server + disk/dedupe API
+└── dedupe_library.py — Library deduplication logic
+scripts/
+└── dedupe_library.py — CLI to preview/apply deduplication
 ```
 
 ## ⚙️ Config
@@ -156,16 +167,86 @@ DJ_VOICE=es-MX-DaliaNeural        # Edge-TTS voice
 | Rate-limited by YouTube (~1h block) | Bot notifies in Discord; increase `YTDL_SEARCH_DELAY_SEC` (try 10.0); radio falls back to local library |
 | "No se encontró nada" | Invalid query; try exact song name; if rate-limited, only cached/local tracks work |
 | Local library empty | Play songs normally first — bot auto-downloads after playback to `.cache/library/` |
+| Duplicate songs in library / disk too large | Run `python3 scripts/dedupe_library.py --apply` (stop bot first) or use **Limpiar duplicados** in the explorer |
+| Explorer shows no data | Ensure `spotify_cache/` exists and the bot has run at least once; use `docker compose up -d explorer` |
+| Explorer dedupe button fails | Recreate explorer after code changes: `docker compose up -d --force-recreate explorer` |
 
 ### Local Library
 
 The bot caches audio after successful playback so frequently played songs don't need re-searching:
 
 - **Index:** `.cache/library_index.json` (play counts, metadata)
-- **Audio files:** `.cache/library/` (persisted via Docker `spotify_cache` volume)
+- **Audio files:** `.cache/library/` (persisted via Docker `spotify_cache` volume on the host)
 - **Offline radio:** When YouTube rate-limits the bot, radio mode plays from the local library
 - **Stats:** `!library` shows cached track count and top plays
 - **Search:** `!library search <query>` finds indexed tracks and lets you play or seed radio
+- **Track IDs:** YouTube tracks use stable IDs (`yt_{video_id}`) so the same song is not re-downloaded after bot restarts
+
+### Data Explorer
+
+A lightweight web UI to inspect everything the bot has cached on disk. No extra dependencies — served by a small Python stdlib server.
+
+| Service | URL | Docker service |
+|---------|-----|----------------|
+| Explorer | http://localhost:8080/web/explorer.html | `explorer` |
+| Spotify OAuth | http://localhost:8888/callback | `bot` |
+
+**Docker (recommended):**
+
+```bash
+docker compose up -d          # starts bot + explorer
+docker compose up -d explorer # explorer only
+```
+
+**Local (without Docker):**
+
+```bash
+./serve_explorer.sh
+# open http://localhost:8080/web/explorer.html
+```
+
+**What you can browse:**
+
+| Tab | Data source | Shows |
+|-----|-------------|-------|
+| Búsquedas | `youtube_metadata.json` | Cached YouTube search results |
+| Biblioteca | `library_index.json` + `library/` | Tracks, play counts, file size on disk |
+| Likes | `likes.json` | Per-user liked tracks |
+
+**Views:** card grid or sortable table (click column headers). Library table supports **Agrupado** (one row per `video_id`) and **Detallado** (raw index entries).
+
+**API endpoints** (used by the UI):
+
+- `GET /api/disk-usage` — total bytes and per-file sizes in `library/`
+- `GET /api/library/dedupe-preview` — duplicate groups and reclaimable space
+- `POST /api/library/dedupe` — merge duplicates and delete extra `.m4a` files
+
+Cache path resolution: `.cache/` (inside Docker) or `spotify_cache/` (host volume) — whichever has data.
+
+### Library deduplication
+
+Older bot versions used Python's `hash()` for track IDs, which changes on every restart and caused the same YouTube video to be downloaded multiple times. Current code uses `yt_{video_id}` and skips download when the file already exists.
+
+If you upgraded from an older build, clean up existing duplicates:
+
+```bash
+# Preview (dry run)
+python3 scripts/dedupe_library.py
+
+# Apply — stop the bot first to avoid index races
+docker compose stop bot
+python3 scripts/dedupe_library.py --apply
+docker compose up -d bot
+```
+
+Or from the explorer UI: open **Biblioteca** → **Tabla** → **Limpiar duplicados** (calls `POST /api/library/dedupe`).
+
+The script:
+
+- Groups entries by `video_id`
+- Keeps the copy with the most plays (merges play/request counts)
+- Deletes duplicate `.m4a` files and rewrites `library_index.json`
+- Updates `likes.json` and `played_ids.json` ID references
 
 ### Personalized Radio (Spotify profile)
 

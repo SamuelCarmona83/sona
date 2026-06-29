@@ -1,5 +1,6 @@
 """Local music library — persistent audio cache, popularity tracking, offline radio."""
 import asyncio
+import hashlib
 import json
 import logging
 import pathlib
@@ -31,12 +32,39 @@ _download_sem = asyncio.Semaphore(1)
 _pending_downloads: set[str] = set()
 
 
+def _stable_query_hash(key: str) -> str:
+    normalized = _normalize_search_text(key)
+    digest = hashlib.sha256(normalized.encode()).hexdigest()[:8]
+    return f"yt_{digest}"
+
+
+def track_video_id(track: dict, video_ref: str | None = None) -> str | None:
+    return (
+        _extract_video_id(track.get("video_id"))
+        or _extract_video_id(track.get("webpage_url"))
+        or _extract_video_id(video_ref)
+    )
+
+
 def track_id(track: dict) -> str:
     sid = track.get("spotify_id")
     if sid:
         return sid
+    video_id = track_video_id(track)
+    if video_id:
+        return f"yt_{video_id}"
     key = track.get("yt_query") or track.get("title", "")
-    return f"yt_{hash(key) & 0x7fffffff:08x}"
+    return _stable_query_hash(key)
+
+
+def _find_tid_by_video_id(video_id: str) -> str | None:
+    canonical = f"yt_{video_id}"
+    if canonical in _index and get_local_path(canonical):
+        return canonical
+    for tid, entry in _index.items():
+        if entry.get("video_id") == video_id and get_local_path(tid):
+            return tid
+    return None
 
 
 def _load_index() -> None:
@@ -175,6 +203,13 @@ def resolve_local_track(track: dict) -> dict | None:
     tid = track_id(track)
     path = get_local_path(tid)
     if not path:
+        video_id = track_video_id(track)
+        if video_id:
+            existing_tid = _find_tid_by_video_id(video_id)
+            if existing_tid:
+                tid = existing_tid
+                path = get_local_path(tid)
+    if not path:
         return None
     resolved = dict(track)
     resolved["url"] = str(path)
@@ -237,10 +272,23 @@ def _extract_video_id(url_or_id: str | None) -> str | None:
     return m.group(1) if m else None
 
 
-def _upsert_entry_from_track(track: dict, file_path: str, video_id: str | None) -> None:
-    tid = track_id(track)
-    entry = _index.setdefault(tid, {})
-    entry.update({
+def _file_size_bytes(path: str) -> int | None:
+    file = pathlib.Path(path)
+    if file.is_file():
+        return file.stat().st_size
+    return None
+
+
+def _upsert_entry_from_track(
+    track: dict,
+    file_path: str,
+    video_id: str | None,
+    *,
+    tid: str | None = None,
+) -> None:
+    resolved_tid = tid or track_id(track)
+    entry = _index.setdefault(resolved_tid, {})
+    update = {
         "file_path": file_path,
         "title": track.get("title", entry.get("title", "?")),
         "artist": track.get("artist", entry.get("artist", "Unknown")),
@@ -253,7 +301,11 @@ def _upsert_entry_from_track(track: dict, file_path: str, video_id: str | None) 
         "cached_at": time.time(),
         "play_count": entry.get("play_count", 0),
         "request_count": entry.get("request_count", 0),
-    })
+    }
+    file_size = _file_size_bytes(file_path)
+    if file_size is not None:
+        update["file_size_bytes"] = file_size
+    entry.update(update)
     _save_index()
 
 
@@ -322,16 +374,22 @@ def _download_sync(video_id: str, tid: str, track: dict) -> str | None:
 async def enqueue_download(track: dict, video_ref: str | None = None) -> None:
     if not LIBRARY_ENABLED or not LIBRARY_AUTO_DOWNLOAD:
         return
+
+    video_id = track_video_id(track, video_ref)
+    if not video_id:
+        return
+
+    existing_tid = _find_tid_by_video_id(video_id)
+    if existing_tid:
+        local_path = get_local_path(existing_tid)
+        if local_path:
+            _upsert_entry_from_track(track, str(local_path), video_id, tid=existing_tid)
+            return
+
     tid = track_id(track)
     if get_local_path(tid):
         return
     if tid in _pending_downloads:
-        return
-
-    video_id = _extract_video_id(video_ref) or _extract_video_id(track.get("video_id"))
-    if not video_id:
-        video_id = _extract_video_id(track.get("webpage_url"))
-    if not video_id:
         return
 
     _pending_downloads.add(tid)

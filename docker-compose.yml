@@ -32,5 +32,8 @@ services:
       - "8080:8080"
     volumes:
       - ./web:/app/web:ro
-      - ./spotify_cache:/app/.cache:ro
-    command: python3 -m http.server 8080 --bind 0.0.0.0
+      - ./spotify_cache:/app/.cache
+    command: python3 web/server.py
+    environment:
+      EXPLORER_PORT: "8080"
+      EXPLORER_HOST: "0.0.0.0"
