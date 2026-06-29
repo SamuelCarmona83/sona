@@ -295,6 +295,8 @@ async def _get_artist_genres(artist_id: str) -> list[str]:
     """Return Spotify genre tags for an artist, with in-memory caching."""
     if artist_id in _artist_genres_cache:
         return _artist_genres_cache[artist_id]
+    if not await _spotify_api_ready():
+        return []
     try:
         artist = await asyncio.to_thread(lambda: sp.artist(artist_id))
         genres = artist.get("genres") or []
@@ -303,6 +305,12 @@ async def _get_artist_genres(artist_id: str) -> list[str]:
         genres = []
     _artist_genres_cache[artist_id] = genres
     return genres
+
+
+async def _spotify_api_ready() -> bool:
+    if sp is None:
+        return False
+    return await _safe_validate_token(sp.auth_manager)
 
 
 async def _get_recommendations(
@@ -322,6 +330,9 @@ async def _get_recommendations(
     Results are deduplicated and shuffled before returning.
     """
     if not seed_tracks and not seed_genres:
+        return []
+    if not await _spotify_api_ready():
+        logger.warning("_get_recommendations: Spotify no autorizado, omitiendo")
         return []
 
     seen_ids: set[str] = set()
@@ -411,8 +422,8 @@ async def _get_recommendations_hybrid(
     if seed_genres is None:
         seed_genres = []
     
-    # Tier 1: Try Spotify if available
-    if SPOTIFY_AVAILABLE and (seed_tracks or seed_genres):
+    # Tier 1: Try Spotify if available and authorized
+    if SPOTIFY_AVAILABLE and (seed_tracks or seed_genres) and await _spotify_api_ready():
         try:
             recs = await _get_recommendations(seed_tracks, seed_genres, limit=limit)
             if recs:
@@ -467,7 +478,7 @@ async def _get_recommendations_hybrid(
         return recommendations[:limit]
     
     # If we have seed_tracks (artist info), get similar artists via LastFM
-    if seed_tracks:
+    if seed_tracks and await _spotify_api_ready():
         for track_id in seed_tracks[:3]:
             try:
                 track = await asyncio.to_thread(lambda tid=track_id: sp.track(tid))

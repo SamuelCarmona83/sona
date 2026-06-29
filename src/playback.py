@@ -80,6 +80,9 @@ class _SessionField:
     def __getitem__(self, guild_id: int):
         return getattr(guild_session(guild_id), self._attr)
 
+    def __contains__(self, guild_id: int) -> bool:
+        return guild_id in _sessions
+
     def __setitem__(self, guild_id: int, value) -> None:
         setattr(guild_session(guild_id), self._attr, value)
 
@@ -219,12 +222,13 @@ def _build_v2_payload(guild_id: int) -> dict:
     ]})
 
     from src import likes as _likes_mod
+    from src.library import track_id as library_track_id
+
     guild_likes = _likes_mod._likes.get(guild_id, {})
+    current_tid = library_track_id(track) if track else None
     like_count = sum(
         1 for user_likes in guild_likes.values()
-        if track and any(
-            t["track_id"] == (_likes_mod._track_id(track)) for t in user_likes
-        )
+        if track and any(t["track_id"] == current_tid for t in user_likes)
     )
     like_label = f"❤️ {like_count}" if like_count > 0 else "🤍"
     like_style = 4 if like_count > 0 else 2  # red if any likes, grey otherwise
@@ -866,8 +870,6 @@ async def start_radio_with_welcome(
         return
     session.radio_welcome_in_progress = True
 
-    dj_file: str | None = None
-
     async def _gen_welcome() -> str | None:
         if not DJ_ANNOUNCER_ENABLED:
             return None
@@ -878,23 +880,27 @@ async def start_radio_with_welcome(
         return await synthesize_dj_audio(text, gid)
 
     async def _fill():
-        await _radio.fill_radio_queue(guild, vc, text_channel, auto_play=False)
+        await _radio.fill_radio_queue(
+            guild, vc, text_channel, auto_play=False, early_play=True,
+        )
 
     try:
-        welcome_task = asyncio.create_task(_gen_welcome())
         fill_task = asyncio.create_task(_fill())
+        welcome_task = asyncio.create_task(_gen_welcome()) if DJ_ANNOUNCER_ENABLED else None
 
-        try:
-            dj_file = await asyncio.wait_for(asyncio.shield(welcome_task), timeout=15.0)
-        except asyncio.TimeoutError:
-            logger.warning("start_radio_with_welcome: welcome gen timed out, skipping")
-        except Exception as exc:
-            logger.warning("start_radio_with_welcome: welcome gen error: %s", exc)
+        dj_file: str | None = None
+        if welcome_task:
+            try:
+                dj_file = await asyncio.wait_for(asyncio.shield(welcome_task), timeout=10.0)
+            except asyncio.TimeoutError:
+                logger.warning("start_radio_with_welcome: welcome gen timed out, skipping")
+            except Exception as exc:
+                logger.warning("start_radio_with_welcome: welcome gen error: %s", exc)
 
         if dj_file:
             from src.dj_announcer import cleanup_dj_audio, get_dj_ffmpeg_options
 
-            if vc.is_playing() or vc.is_paused():
+            if vc.is_playing() or vc.is_paused() or session.queue:
                 cleanup_dj_audio(dj_file)
             else:
                 done_event = asyncio.Event()

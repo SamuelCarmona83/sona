@@ -170,6 +170,7 @@ DJ_VOICE=es-MX-DaliaNeural        # Edge-TTS voice
 | Duplicate songs in library / disk too large | Run `python3 scripts/dedupe_library.py --apply` (stop bot first) or use **Limpiar duplicados** in the explorer |
 | Explorer shows no data | Ensure `spotify_cache/` exists and the bot has run at least once; use `docker compose up -d explorer` |
 | Explorer dedupe button fails | Recreate explorer after code changes: `docker compose up -d --force-recreate explorer` |
+| Bot hangs then restarts; log shows `Enter the URL you were redirected to` | Spotify token expired — run `!auth` in Discord; bot no longer blocks on stdin after fix |
 
 ### Local Library
 

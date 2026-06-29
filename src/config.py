@@ -3,7 +3,7 @@ import os
 import time
 
 import spotipy
-from spotipy.oauth2 import SpotifyOAuth
+from spotipy.oauth2 import SpotifyOAuth, SpotifyOauthError
 
 from poc_setlistfm import load_dotenv_values, get_config_value
 
@@ -217,6 +217,7 @@ YTDL_OPTIONS_NO_COOKIES.pop("cookiesfrombrowser", None)
 YTDL_SEARCH_CONCURRENCY = max(1, int(get_config_value("YTDL_SEARCH_CONCURRENCY", dotenv_values, "2")))
 YTDL_SEARCH_DELAY_SEC = _env_float("YTDL_SEARCH_DELAY_SEC", 0.75)
 YTDL_SEARCH_JITTER_SEC = _env_float("YTDL_SEARCH_JITTER_SEC", 0.35)
+YTDL_SEARCH_DELAY_URGENT_SEC = _env_float("YTDL_SEARCH_DELAY_URGENT_SEC", 0.5)
 
 FFMPEG_LOUDNESS_NORMALIZE_FILTER = "dynaudnorm=p=0.9:s=5"
 normalize_audio_enabled = _env_bool("NORMALIZE_AUDIO")
@@ -290,7 +291,40 @@ YOUTUBE_PREFERRED_CHANNEL_HINTS = ("topic", "vevo", "official", "records", "musi
 MIN_SPOTIFY_REFINEMENT_SCORE = 7.5
 
 
-def build_spotify_auth_manager(cache_path: str) -> SpotifyOAuth:
+class NonInteractiveSpotifyOAuth(SpotifyOAuth):
+    """Spotify OAuth that never blocks on stdin (required for Docker/headless)."""
+
+    _AUTH_REQUIRED_MSG = "Spotify requiere autorización. Usa !auth en Discord."
+
+    def get_auth_response(self, open_browser=None):
+        raise SpotifyOauthError(self._AUTH_REQUIRED_MSG)
+
+    def get_access_token(self, code=None, as_dict=True, check_cache=True):
+        if code:
+            return super().get_access_token(code=code, as_dict=as_dict, check_cache=False)
+
+        if check_cache:
+            token_info = self.validate_token(self.cache_handler.get_cached_token())
+            if token_info is not None:
+                if self.is_token_expired(token_info):
+                    try:
+                        token_info = self.refresh_access_token(token_info["refresh_token"])
+                    except SpotifyOauthError as exc:
+                        cache_path = getattr(self, "cache_path", None)
+                        if cache_path and os.path.isfile(cache_path):
+                            try:
+                                os.remove(cache_path)
+                            except OSError:
+                                pass
+                        raise SpotifyOauthError(
+                            f"Token Spotify expirado ({exc}). Usa !auth en Discord."
+                        ) from exc
+                return token_info if as_dict else token_info["access_token"]
+
+        raise SpotifyOauthError(self._AUTH_REQUIRED_MSG)
+
+
+def build_spotify_auth_manager(cache_path: str) -> NonInteractiveSpotifyOAuth:
     client_id = get_config_value("SPOTIFY_CLIENT_ID", dotenv_values)
     client_secret = get_config_value("SPOTIFY_CLIENT_SECRET", dotenv_values)
     redirect_uri = get_config_value("SPOTIFY_REDIRECT_URI", dotenv_values, "http://localhost:8888/callback")
@@ -298,7 +332,7 @@ def build_spotify_auth_manager(cache_path: str) -> SpotifyOAuth:
         raise ValueError("Faltan credenciales Spotify (SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET).")
     cache_dir = os.path.dirname(cache_path) or "."
     os.makedirs(cache_dir, exist_ok=True)
-    return SpotifyOAuth(
+    return NonInteractiveSpotifyOAuth(
         client_id=client_id,
         client_secret=client_secret,
         redirect_uri=redirect_uri,

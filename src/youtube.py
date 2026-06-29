@@ -26,6 +26,7 @@ from src.config import (
     ANTHROPIC_MODEL,
     YTDL_SEARCH_CONCURRENCY,
     YTDL_SEARCH_DELAY_SEC,
+    YTDL_SEARCH_DELAY_URGENT_SEC,
     YTDL_SEARCH_JITTER_SEC,
     YOUTUBE_URL_CACHE_TTL_SEC,
     LIBRARY_ENABLED,
@@ -323,12 +324,13 @@ async def _refresh_url_from_video_id(video_id: str) -> dict | None:
 _load_metadata_index()
 
 
-async def _throttle_youtube_request(reason: str) -> None:
+async def _throttle_youtube_request(reason: str, *, urgent: bool = False) -> None:
     """Space out yt-dlp requests so queue fills do not look like bot bursts."""
     global _last_search_start
     async with _search_spacing_lock:
+        base_delay = YTDL_SEARCH_DELAY_URGENT_SEC if urgent else YTDL_SEARCH_DELAY_SEC
         jitter = random.uniform(0.0, YTDL_SEARCH_JITTER_SEC) if YTDL_SEARCH_JITTER_SEC > 0 else 0.0
-        target_delay = YTDL_SEARCH_DELAY_SEC + jitter
+        target_delay = base_delay + (0.0 if urgent else jitter)
         if target_delay > 0:
             now = time.monotonic()
             wait_for = target_delay - (now - _last_search_start)
@@ -337,16 +339,16 @@ async def _throttle_youtube_request(reason: str) -> None:
                     "youtube.throttle: waiting %.2fs before %s (base=%.2fs, jitter=%.2fs)",
                     wait_for,
                     reason,
-                    YTDL_SEARCH_DELAY_SEC,
+                    base_delay,
                     jitter,
                 )
                 await asyncio.sleep(wait_for)
         _last_search_start = time.monotonic()
 
 
-async def _run_rate_limited_yt_request(func, reason: str):
+async def _run_rate_limited_yt_request(func, reason: str, *, urgent: bool = False):
     async with _search_semaphore:
-        await _throttle_youtube_request(reason)
+        await _throttle_youtube_request(reason, urgent=urgent)
         return await asyncio.to_thread(func)
 
 
@@ -479,7 +481,7 @@ def _search_sync(query: str, base_opts: dict) -> list[dict]:
     return _parse_search_entries(query, info)
 
 
-async def _search_youtube_candidates(query: str) -> list[dict]:
+async def _search_youtube_candidates(query: str, *, urgent: bool = False) -> list[dict]:
     def _search():
         candidates = _search_sync(query, YTDL_OPTIONS)
         if candidates or is_youtube_rate_limited():
@@ -492,7 +494,7 @@ async def _search_youtube_candidates(query: str) -> list[dict]:
             return fallback
         return candidates
 
-    return await _run_rate_limited_yt_request(_search, f"search {query[:60]}")
+    return await _run_rate_limited_yt_request(_search, f"search {query[:60]}", urgent=urgent)
 
 
 async def get_search_candidates(query: str) -> list[dict]:
@@ -520,7 +522,13 @@ async def get_search_candidates(query: str) -> list[dict]:
     return []
 
 
-async def search_youtube(query: str, enable_llm: bool = True, *, trusted: bool = False) -> dict | None:
+async def search_youtube(
+    query: str,
+    enable_llm: bool = True,
+    *,
+    trusted: bool = False,
+    urgent: bool = False,
+) -> dict | None:
     """Search YouTube and return the best scored candidate, using the LLM as tie-breaker.
 
     When *trusted* is True (e.g. query comes from a Spotify URL where we already
@@ -557,8 +565,12 @@ async def search_youtube(query: str, enable_llm: bool = True, *, trusted: bool =
 
     best_overall: dict | None = None  # track the best candidate across all queries
 
+    used_urgent = False
     for candidate_query in _build_search_queries(query):
-        candidates = await _search_youtube_candidates(candidate_query)
+        use_urgent = urgent and not used_urgent
+        candidates = await _search_youtube_candidates(candidate_query, urgent=use_urgent)
+        if use_urgent:
+            used_urgent = True
         if not candidates:
             continue
 

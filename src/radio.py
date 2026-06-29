@@ -371,23 +371,24 @@ async def record_played(guild_id: int, track: dict) -> None:
         "artist_name": track.get("artist"),
     })
     
-    # Save to played_ids (use spotify_id if available, else hash of title)
+    from src.library import track_id as library_track_id
+
     track_title = track.get("title", "")
-    track_id = spotify_id or f"yt_{hash(track_title) & 0x7fffffff:08x}"
+    tid = library_track_id(track)
     ids = _played_ids.setdefault(guild_id, [])
-    if track_id not in ids:
-        ids.append(track_id)
+    if tid not in ids:
+        ids.append(tid)
         if len(ids) > _PLAYED_IDS_MAX:
             _played_ids[guild_id] = ids[-_PLAYED_IDS_MAX:]
         _save_played_ids()
         logger.debug(
             "radio.record_played: saved track id=%s title='%s' (total: %d)",
-            track_id, track_title, len(ids),
+            tid, track_title, len(ids),
         )
     else:
         logger.debug(
             "radio.record_played: track id=%s already in history",
-            track_id,
+            tid,
         )
 
 
@@ -549,12 +550,36 @@ async def _youtube_fallback_fill(guild_id: int, needed: int) -> list[dict]:
 # Fill engine
 # ---------------------------------------------------------------------------
 
+async def _try_early_play(
+    gid: int,
+    guild: discord.Guild,
+    vc: discord.VoiceClient,
+    text_channel,
+    *,
+    early_play: bool,
+    triggered: dict[int, bool],
+) -> None:
+    if not early_play or triggered.get(gid):
+        return
+    from src.playback import play_next, queues
+
+    if vc and (vc.is_playing() or vc.is_paused()):
+        triggered[gid] = True
+        return
+    if not queues.get(gid):
+        return
+    triggered[gid] = True
+    logger.info("radio.fill: early_play iniciando reproduccion guild=%s", gid)
+    await play_next(guild, vc, text_channel)
+
+
 async def fill_radio_queue(
     guild: discord.Guild,
     vc: discord.VoiceClient,
     text_channel,
     *,
     auto_play: bool = True,
+    early_play: bool = False,
 ) -> None:
     """Fetch Spotify recommendations and add them to the queue.
 
@@ -574,12 +599,16 @@ async def fill_radio_queue(
     if _filling.get(gid):
         return
     _filling[gid] = True
+    early_play_triggered: dict[int, bool] = {}
 
     try:
         q = queues.get(gid, collections.deque())
         needed = RADIO_QUEUE_TARGET_SIZE - len(q)
         if needed <= 0:
             return
+
+        queue_was_empty = len(q) == 0
+        yt_search_needs_urgent = early_play and queue_was_empty
 
         taste_profile = await _resolve_taste_profile(guild)
         if taste_profile and (taste_profile.seed_track_ids or taste_profile.seed_genres):
@@ -595,8 +624,7 @@ async def fill_radio_queue(
         if is_youtube_rate_limited():
             local_tracks = await get_radio_candidates(gid, get_mood(gid), needed)
             if local_tracks:
-                if gid not in queues:
-                    queues[gid] = collections.deque()
+                queues.setdefault(gid, collections.deque())
                 for track in local_tracks:
                     queues[gid].append(track)
                 logger.info(
@@ -624,6 +652,7 @@ async def fill_radio_queue(
             profile_candidates = profile_pool[: profile_needed * 2]
 
             async def _fetch_profile(info: dict) -> dict | None:
+                nonlocal yt_search_needs_urgent
                 stub = {
                     "title": info.get("title", info["query"]),
                     "yt_query": info["query"],
@@ -639,7 +668,12 @@ async def fill_radio_queue(
                 entry = get_entry(tid)
                 if entry:
                     return track_from_entry(tid, entry, requester=requester)
-                yt_info = await _syt_profile(info["query"], enable_llm=False, trusted=True)
+                urgent = yt_search_needs_urgent
+                if urgent:
+                    yt_search_needs_urgent = False
+                yt_info = await _syt_profile(
+                    info["query"], enable_llm=False, trusted=True, urgent=urgent,
+                )
                 if not yt_info or not yt_info.get("url"):
                     local = resolve_local_track(stub)
                     if local:
@@ -660,11 +694,11 @@ async def fill_radio_queue(
                     "webpage_url": yt_info.get("webpage_url"),
                 }
 
-            profile_results = await asyncio.gather(*(_fetch_profile(t) for t in profile_candidates))
             played_set_profile = set(_played_ids.get(gid, []))
             seen_urls_profile: set[str] = set()
             profile_tracks = []
-            for track in profile_results:
+            for info in profile_candidates:
+                track = await _fetch_profile(info)
                 if track is None:
                     continue
                 sid = track.get("spotify_id")
@@ -674,13 +708,15 @@ async def fill_radio_queue(
                     continue
                 seen_urls_profile.add(url)
                 profile_tracks.append(track)
+                queues.setdefault(gid, collections.deque())
+                queues[gid].append(track)
+                await _try_early_play(
+                    gid, guild, vc, text_channel,
+                    early_play=early_play, triggered=early_play_triggered,
+                )
                 if len(profile_tracks) >= profile_needed:
                     break
             if profile_tracks:
-                if gid not in queues:
-                    queues[gid] = collections.deque()
-                for track in profile_tracks:
-                    queues[gid].append(track)
                 needed -= len(profile_tracks)
                 logger.info(
                     "radio.fill: %d canciones de perfil Spotify (%s) para guild=%s",
@@ -706,6 +742,7 @@ async def fill_radio_queue(
         if liked_tracks:
             from src.youtube import search_youtube as _syt
             async def _fetch_liked(info: dict) -> dict | None:
+                nonlocal yt_search_needs_urgent
                 stub = {
                     "title": info.get("title", info["query"]),
                     "yt_query": info["query"],
@@ -722,7 +759,12 @@ async def fill_radio_queue(
                 if entry:
                     t = track_from_entry(tid, entry, requester=f"📻 Radio ❤️×{info['_like_count']}")
                     return t
-                yt_info = await _syt(info["query"], enable_llm=False, trusted=True)
+                urgent = yt_search_needs_urgent
+                if urgent:
+                    yt_search_needs_urgent = False
+                yt_info = await _syt(
+                    info["query"], enable_llm=False, trusted=True, urgent=urgent,
+                )
                 if not yt_info or not yt_info.get("url"):
                     local = resolve_local_track(stub)
                     if local:
@@ -742,11 +784,12 @@ async def fill_radio_queue(
                     "video_id":   yt_info.get("video_id"),
                     "webpage_url": yt_info.get("webpage_url"),
                 }
-            liked_results = await asyncio.gather(*(_fetch_liked(t) for t in liked_tracks))
+
             played_set_lk = set(_played_ids.get(gid, []))
             seen_urls_lk: set[str] = set()
             priority_tracks = []
-            for t in liked_results:
+            for info in liked_tracks:
+                t = await _fetch_liked(info)
                 if t is None:
                     continue
                 sid = t.get("spotify_id")
@@ -756,11 +799,13 @@ async def fill_radio_queue(
                     continue
                 seen_urls_lk.add(url)
                 priority_tracks.append(t)
+                queues.setdefault(gid, collections.deque())
+                queues[gid].append(t)
+                await _try_early_play(
+                    gid, guild, vc, text_channel,
+                    early_play=early_play, triggered=early_play_triggered,
+                )
             if priority_tracks:
-                if gid not in queues:
-                    queues[gid] = collections.deque()
-                for track in priority_tracks:
-                    queues[gid].append(track)
                 needed -= len(priority_tracks)
                 logger.info(
                     "radio.fill: %d canciones liked priorizadas para guild=%s",
@@ -788,11 +833,17 @@ async def fill_radio_queue(
         # Search YouTube for all Spotify-sourced recommendations in parallel.
         # Fallback recs already have yt_info pre-fetched; skip search for those.
         async def _fetch(idx: int, info: dict) -> dict | None:
+            nonlocal yt_search_needs_urgent
             if using_fallback:
                 yt_info = info.get("yt_info")
             else:
                 enable_llm = idx < LLM_ALBUM_TRACK_RANKING_LIMIT
-                yt_info = await search_youtube(info["query"], enable_llm=enable_llm, trusted=True)
+                urgent = yt_search_needs_urgent
+                if urgent:
+                    yt_search_needs_urgent = False
+                yt_info = await search_youtube(
+                    info["query"], enable_llm=enable_llm, trusted=True, urgent=urgent,
+                )
             if not yt_info:
                 return None
             artist, _title = _split_query_parts(info["query"])
@@ -806,16 +857,17 @@ async def fill_radio_queue(
                 "thumbnail":  yt_info.get("thumbnail") or "",
                 "spotify_id": info.get("spotify_id"),
                 "artist_id":  info.get("artist_id"),
+                "video_id":   yt_info.get("video_id"),
+                "webpage_url": yt_info.get("webpage_url"),
             }
 
-        results = await asyncio.gather(*(_fetch(i, r) for i, r in enumerate(recs)))
         played_set = set(_played_ids.get(gid, []))
         seen_urls: set[str] = set()
         new_tracks = []
-        for t in results:
+        for i, info in enumerate(recs):
+            t = await _fetch(i, info)
             if t is None:
                 continue
-            # Dedup by spotify_id (non-None) or by YouTube URL
             sid = t.get("spotify_id")
             url = t.get("url", "")
             dedup_key = sid if sid else f"url_{url}"
@@ -823,11 +875,16 @@ async def fill_radio_queue(
                 continue
             seen_urls.add(url)
             new_tracks.append(t)
+            queues.setdefault(gid, collections.deque())
+            queues[gid].append(t)
+            await _try_early_play(
+                gid, guild, vc, text_channel,
+                early_play=early_play, triggered=early_play_triggered,
+            )
             if len(new_tracks) >= needed:
                 break
 
         if not new_tracks:
-            # played_ids may have saturated; trim and retry once with empty history
             ids = _played_ids.get(gid, [])
             if ids:
                 keep = ids[-200:]
@@ -838,7 +895,8 @@ async def fill_radio_queue(
                     gid,
                 )
                 retry_played_set = set(keep)
-                for t in results:
+                for i, info in enumerate(recs):
+                    t = await _fetch(i, info)
                     if t is None:
                         continue
                     sid = t.get("spotify_id")
@@ -848,17 +906,18 @@ async def fill_radio_queue(
                         continue
                     seen_urls.add(url)
                     new_tracks.append(t)
+                    queues.setdefault(gid, collections.deque())
+                    queues[gid].append(t)
+                    await _try_early_play(
+                        gid, guild, vc, text_channel,
+                        early_play=early_play, triggered=early_play_triggered,
+                    )
                     if len(new_tracks) >= needed:
                         break
 
         if not new_tracks:
             logger.warning("radio.fill: ninguna recomendacion encontrada en YouTube para guild=%s", gid)
             return
-
-        if gid not in queues:
-            queues[gid] = collections.deque()
-        for track in new_tracks:
-            queues[gid].append(track)
 
         logger.info("radio.fill: %d canciones añadidas a la cola de guild=%s", len(new_tracks), gid)
 

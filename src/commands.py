@@ -279,7 +279,12 @@ async def _youtube_matches_for_spotify_tracks(
 ) -> list[dict]:
     if len(spotify_tracks) == 1:
         info = spotify_tracks[0]
-        yt_info = await search_youtube(info["query"], enable_llm=True, trusted=trusted_spotify_source)
+        yt_info = await search_youtube(
+            info["query"],
+            enable_llm=True,
+            trusted=trusted_spotify_source,
+            urgent=True,
+        )
         if not yt_info:
             return []
         return [_queue_track_from_youtube_search(yt_info, info, requester)]

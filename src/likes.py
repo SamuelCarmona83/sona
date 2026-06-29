@@ -9,6 +9,8 @@ import logging
 import pathlib
 import time
 
+from src.library import track_id
+
 logger = logging.getLogger(__name__)
 
 _LIKES_PATH = pathlib.Path(".cache/likes.json")
@@ -47,16 +49,44 @@ def _save() -> None:
         logger.warning("likes: failed to save: %s", exc)
 
 
+def _entry_track_id(entry: dict) -> str:
+    return track_id({
+        "spotify_id": entry.get("spotify_id"),
+        "video_id": entry.get("video_id"),
+        "webpage_url": entry.get("webpage_url"),
+        "yt_query": entry.get("yt_query") or entry.get("title", ""),
+        "title": entry.get("title", ""),
+    })
+
+
+def _normalize_loaded_likes() -> None:
+    changed = False
+    for users in _likes.values():
+        for uid, tracks in users.items():
+            seen: set[str] = set()
+            deduped: list[dict] = []
+            for entry in tracks:
+                new_tid = _entry_track_id(entry)
+                if new_tid != entry.get("track_id"):
+                    entry["track_id"] = new_tid
+                    changed = True
+                if new_tid in seen:
+                    changed = True
+                    continue
+                seen.add(new_tid)
+                deduped.append(entry)
+            users[uid] = deduped
+    if changed:
+        _save()
+
+
 _load()
-
-
-def _track_id(track: dict) -> str:
-    return track.get("spotify_id") or f"yt_{hash(track.get('title', '')) & 0x7fffffff:08x}"
+_normalize_loaded_likes()
 
 
 def toggle_like(guild_id: int, user_id: int, track: dict) -> bool:
     """Toggle like for track. Returns True if liked, False if unliked."""
-    tid = _track_id(track)
+    tid = track_id(track)
     guild_likes = _likes.setdefault(guild_id, {})
     user_likes = guild_likes.setdefault(user_id, [])
 
@@ -76,6 +106,8 @@ def toggle_like(guild_id: int, user_id: int, track: dict) -> bool:
             "yt_query": track.get("yt_query", track.get("title", "")),
             "spotify_id": track.get("spotify_id"),
             "artist_id":  track.get("artist_id"),
+            "video_id":   track.get("video_id"),
+            "webpage_url": track.get("webpage_url"),
             "thumbnail":  track.get("thumbnail", ""),
             "liked_at": time.time(),
         })
@@ -86,7 +118,7 @@ def toggle_like(guild_id: int, user_id: int, track: dict) -> bool:
 
 def is_liked_by(guild_id: int, user_id: int, track: dict) -> bool:
     """Return True if the user has liked this track."""
-    tid = _track_id(track)
+    tid = track_id(track)
     user_likes = _likes.get(guild_id, {}).get(user_id, [])
     return any(t["track_id"] == tid for t in user_likes)
 
