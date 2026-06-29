@@ -1,125 +1,134 @@
 <!DOCTYPE html>
-<html lang="es" class="h-full">
+<html lang="es">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Spoty Scanner — Explorador de datos</title>
+  <title>sona explorer</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
   <script src="https://cdn.tailwindcss.com"></script>
   <script>
     tailwind.config = {
       theme: {
         extend: {
           colors: {
-            spotify: "#1db954",
-            surface: "#181818",
-            surface2: "#282828",
+            ink: "#201d1d",
+            canvas: "#fdfcfc",
+            body: "#424245",
+            mute: "#646262",
+            ash: "#9a9898",
+            soft: "#f8f7f7",
+            accent: "#007aff",
+            warn: "#ff9f0a",
+            danger: "#ff3b30",
+            ok: "#30d158",
           },
+          fontFamily: {
+            mono: ["JetBrains Mono", "IBM Plex Mono", "ui-monospace", "Menlo", "monospace"],
+          },
+          maxWidth: { content: "960px" },
         },
       },
     };
   </script>
 </head>
-<body class="min-h-full bg-[#121212] text-white antialiased">
-
-  <header class="border-b border-surface2 px-8 py-6">
-    <h1 class="text-2xl font-bold text-spotify">Spoty Scanner</h1>
-    <p class="mt-1 text-sm text-zinc-400">Explorador de búsquedas y datos del bot</p>
-    <span id="cacheBadge" class="mt-2 inline-block rounded-full bg-spotify/15 px-3 py-1 text-xs text-spotify">
-      Cargando caché…
-    </span>
+<body class="overflow-x-hidden max-w-full font-mono text-[13px] text-body bg-canvas antialiased">
+  <header class="bg-ink text-canvas py-5 mb-8">
+    <div class="max-w-content mx-auto px-5 flex items-baseline justify-between gap-4 flex-wrap">
+      <h1 class="text-lg font-bold text-canvas tracking-tight m-0">sona</h1>
+      <span id="cacheBadge" class="text-[11px] text-ash">cargando…</span>
+    </div>
   </header>
 
-  <div id="banner" class="mx-8 mt-4 hidden rounded-lg px-4 py-3 text-sm"></div>
+  <div class="max-w-content mx-auto px-5 pb-12">
+    <div id="banner" class="hidden"></div>
 
-  <div id="stats" class="grid grid-cols-2 gap-3 px-8 py-5 sm:grid-cols-3 lg:grid-cols-5">
-    <div class="rounded-lg border border-surface2 bg-surface p-4">
-      <div id="statSearches" class="text-3xl font-bold text-spotify">—</div>
-      <div class="mt-1 text-xs uppercase tracking-wide text-zinc-500">Búsquedas</div>
-    </div>
-    <div class="rounded-lg border border-surface2 bg-surface p-4">
-      <div id="statLibrary" class="text-3xl font-bold text-spotify">—</div>
-      <div class="mt-1 text-xs uppercase tracking-wide text-zinc-500">Biblioteca</div>
-    </div>
-    <div class="rounded-lg border border-surface2 bg-surface p-4">
-      <div id="statLikes" class="text-3xl font-bold text-spotify">—</div>
-      <div class="mt-1 text-xs uppercase tracking-wide text-zinc-500">Likes</div>
-    </div>
-    <div class="rounded-lg border border-surface2 bg-surface p-4">
-      <div id="statPlayed" class="text-3xl font-bold text-spotify">—</div>
-      <div class="mt-1 text-xs uppercase tracking-wide text-zinc-500">Radio (IDs)</div>
-    </div>
-    <div class="rounded-lg border border-surface2 bg-surface p-4">
-      <div id="statDisk" class="text-2xl font-bold text-spotify">—</div>
-      <div class="mt-1 text-xs uppercase tracking-wide text-zinc-500">Disco (audio)</div>
-      <div id="statDiskDetail" class="mt-1 text-xs text-zinc-600"></div>
-    </div>
-  </div>
+    <p id="statsLine" class="text-xs text-mute border-b border-black/10 pb-4 mb-5">—</p>
 
-  <div class="flex flex-wrap items-center gap-3 px-8 pb-4">
-    <input
-      type="search"
-      id="searchInput"
-      placeholder="Filtrar por título, búsqueda, artista…"
-      autocomplete="off"
-      class="min-w-[200px] flex-1 rounded-full border border-surface2 bg-surface px-4 py-2.5 text-sm text-white outline-none focus:border-spotify"
-    >
-    <select
-      id="sortSelect"
-      class="cursor-pointer rounded-full border border-surface2 bg-surface px-4 py-2.5 text-sm text-white outline-none"
-    >
-      <option value="recent">Más reciente</option>
-      <option value="alpha">Alfabético</option>
-      <option value="duration">Duración</option>
-      <option value="plays">Más reproducidas</option>
-      <option value="size">Mayor tamaño</option>
-    </select>
-    <div class="flex rounded-full border border-surface2 bg-surface p-1 text-sm">
-      <button id="viewGrid" class="view-btn rounded-full bg-spotify px-4 py-1.5 font-semibold text-black">Tarjetas</button>
-      <button id="viewTable" class="view-btn rounded-full px-4 py-1.5 font-semibold text-zinc-400 hover:text-white">Tabla</button>
-    </div>
-  </div>
-
-  <nav class="flex gap-1 border-b border-surface2 px-8">
-    <button class="tab border-b-2 border-spotify px-5 py-3 text-sm font-semibold text-spotify" data-tab="searches">Búsquedas</button>
-    <button class="tab border-b-2 border-transparent px-5 py-3 text-sm font-semibold text-zinc-400 hover:text-white" data-tab="library">Biblioteca</button>
-    <button class="tab border-b-2 border-transparent px-5 py-3 text-sm font-semibold text-zinc-400 hover:text-white" data-tab="likes">Likes</button>
-  </nav>
-
-  <main class="px-8 py-6 pb-12">
-    <section id="panel-searches">
-      <p id="countSearches" class="mb-4 text-sm text-zinc-500"></p>
-      <div id="gridSearches" class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4"></div>
-      <div id="tableSearches" class="hidden"></div>
-    </section>
-    <section id="panel-library" class="hidden">
-      <div id="libraryToolbar" class="mb-4 flex flex-wrap items-center gap-3">
-        <div id="dedupeBanner" class="hidden flex-1 rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-2 text-sm text-amber-300"></div>
-        <div id="libraryGroupToggle" class="hidden flex rounded-full border border-surface2 bg-surface p-1 text-sm">
-          <button id="libGrouped" class="rounded-full bg-spotify px-3 py-1 font-semibold text-black">Agrupado</button>
-          <button id="libDetailed" class="rounded-full px-3 py-1 font-semibold text-zinc-400 hover:text-white">Detallado</button>
-        </div>
-        <button id="dedupeBtn" class="hidden rounded-full bg-red-500/20 px-4 py-2 text-sm font-semibold text-red-400 hover:bg-red-500/30">
-          Limpiar duplicados
-        </button>
+    <div class="flex flex-wrap items-center gap-3 mb-6">
+      <div class="flex-1 min-w-[200px]">
+        <input type="search" id="searchInput" class="h-10 w-full rounded border border-black/10 bg-soft px-3 text-sm text-ink focus:outline-none focus:border-mute" placeholder="filtrar…" autocomplete="off">
       </div>
-      <p id="countLibrary" class="mb-4 text-sm text-zinc-500"></p>
-      <div id="gridLibrary" class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4"></div>
-      <div id="tableLibrary" class="hidden"></div>
-    </section>
-    <section id="panel-likes" class="hidden">
-      <p id="countLikes" class="mb-4 text-sm text-zinc-500"></p>
-      <div id="gridLikes" class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4"></div>
-      <div id="tableLikes" class="hidden"></div>
-    </section>
-  </main>
+      <select id="sortSelect" class="h-10 rounded border border-black/10 bg-soft px-3 text-sm text-ink focus:outline-none cursor-pointer">
+        <option value="recent">más reciente</option>
+        <option value="alpha">alfabético</option>
+        <option value="duration">duración</option>
+        <option value="plays">más reproducidas</option>
+        <option value="size">mayor tamaño</option>
+      </select>
+      <div class="flex overflow-hidden rounded border border-black/10">
+        <button id="viewGrid" type="button" class="px-4 py-1 text-sm font-medium bg-ink text-canvas">tarjetas</button>
+        <button id="viewTable" type="button" class="px-4 py-1 text-sm font-medium text-mute hover:text-ink">tabla</button>
+      </div>
+    </div>
+
+    <nav class="flex border-b border-black/10 mb-6">
+      <button type="button" class="px-5 py-3 text-sm font-medium text-ink border-b-2 border-ink" data-tab="searches">búsquedas</button>
+      <button type="button" class="px-5 py-3 text-sm font-medium text-mute border-b-2 border-transparent hover:text-ink" data-tab="library">biblioteca</button>
+      <button type="button" class="px-5 py-3 text-sm font-medium text-mute border-b-2 border-transparent hover:text-ink" data-tab="likes">likes</button>
+    </nav>
+
+    <main>
+      <section id="panel-searches" class="block">
+        <p id="countSearches" class="text-[11px] text-ash mb-3"></p>
+        <div id="gridSearches" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4"></div>
+        <div id="tableSearches" class="hidden"></div>
+      </section>
+
+      <section id="panel-library" class="hidden">
+        <div id="libraryToolbar" class="flex flex-wrap items-center gap-3 mb-4">
+          <div id="dedupeBanner" class="hidden flex-1 min-w-[200px] border border-warn/40 px-3.5 py-2.5 text-sm text-warn"></div>
+          <div id="libraryGroupToggle" class="hidden flex overflow-hidden rounded border border-black/10">
+            <button id="libGrouped" type="button" class="px-4 py-1 text-sm font-medium bg-ink text-canvas">agrupado</button>
+            <button id="libDetailed" type="button" class="px-4 py-1 text-sm font-medium text-mute hover:text-ink">detallado</button>
+          </div>
+          <button id="dedupeBtn" type="button" class="hidden px-4 py-2 text-sm font-medium text-danger border border-danger/30 bg-danger/10 rounded hover:bg-danger/15 disabled:opacity-50">dedupe</button>
+        </div>
+        <p id="countLibrary" class="text-[11px] text-ash mb-3"></p>
+        <div id="gridLibrary" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4"></div>
+        <div id="tableLibrary" class="hidden"></div>
+      </section>
+
+      <section id="panel-likes" class="hidden">
+        <p id="countLikes" class="text-[11px] text-ash mb-3"></p>
+        <div id="gridLikes" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4"></div>
+        <div id="tableLikes" class="hidden"></div>
+      </section>
+    </main>
+
+    <footer class="mt-8 text-[11px] text-ash">explorer</footer>
+  </div>
 
   <script>
     const CACHE_DIRS = [".cache", "spotify_cache"];
-    const TAB_ACTIVE = "border-b-2 border-spotify text-spotify";
-    const TAB_INACTIVE = "border-b-2 border-transparent text-zinc-400 hover:text-white";
-    const TH = "cursor-pointer select-none whitespace-nowrap px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-zinc-400 hover:text-white";
-    const TD = "px-4 py-3 text-sm text-zinc-300";
-    const TABLE_WRAP = "overflow-x-auto rounded-lg border border-surface2";
+
+    const UI = {
+      btn: "px-4 py-1 text-sm font-medium text-mute hover:text-ink",
+      btnActive: "px-4 py-1 text-sm font-medium bg-ink text-canvas",
+      btnDanger: "px-4 py-2 text-sm font-medium text-danger border border-danger/30 bg-danger/10 rounded hover:bg-danger/15 disabled:opacity-50",
+      tab: "px-5 py-3 text-sm font-medium text-mute border-b-2 border-transparent hover:text-ink",
+      tabActive: "px-5 py-3 text-sm font-medium text-ink border-b-2 border-ink",
+      banner: "mb-6 border px-4 py-3 text-sm",
+      bannerInfo: "border-accent/30 bg-soft text-ink",
+      bannerError: "border-danger/30 bg-soft text-danger",
+      link: "text-ink hover:text-accent hover:underline underline-offset-2",
+      empty: "py-12 text-center text-sm text-mute border border-black/10",
+      card: "border border-black/10 bg-canvas overflow-hidden hover:border-mute",
+      cardThumb: "aspect-video bg-soft flex items-center justify-center overflow-hidden",
+      cardThumbImg: "w-full h-full object-cover",
+      cardBody: "p-3",
+      cardTitle: "text-sm font-medium text-ink line-clamp-2 mb-1",
+      cardMeta: "text-[11px] text-mute",
+      cardLinks: "mt-2 text-[11px]",
+      tableWrap: "w-full overflow-hidden border border-black/10",
+      th: "px-2.5 py-2 text-[11px] font-medium text-mute text-left truncate cursor-pointer select-none hover:text-ink",
+      thNum: "px-2.5 py-2 text-[11px] font-medium text-mute text-right truncate cursor-pointer select-none hover:text-ink",
+      td: "px-2.5 py-2 text-[13px] text-body border-t border-black/10 truncate align-top",
+      tdTitle: "px-2.5 py-2 text-[13px] text-body border-t border-black/10 whitespace-normal break-words align-top",
+      tdNum: "px-2.5 py-2 text-[13px] text-body border-t border-black/10 truncate text-right align-top",
+      rowHover: "hover:bg-soft",
+    };
 
     let cacheDir = null;
     let activeTab = "searches";
@@ -135,38 +144,31 @@
 
     const TABLE_COLUMNS = {
       searches: [
-        { key: "query", label: "Búsqueda" },
-        { key: "title", label: "Título" },
-        { key: "uploader", label: "Canal" },
-        { key: "duration", label: "Duración", numeric: true },
-        { key: "cached_at", label: "Cacheado", numeric: true },
+        { key: "title", label: "título", wide: true },
+        { key: "duration", label: "dur", numeric: true, narrow: true },
+        { key: "cached_at", label: "fecha", numeric: true },
       ],
       library: [
-        { key: "title", label: "Título" },
-        { key: "artist", label: "Artista" },
-        { key: "play_count", label: "Reproducciones", numeric: true },
-        { key: "duration", label: "Duración", numeric: true },
-        { key: "file_size_bytes", label: "Tamaño", numeric: true },
-        { key: "on_disk", label: "En disco" },
-        { key: "cached_at", label: "Cacheado", numeric: true },
+        { key: "title", label: "título", wide: true },
+        { key: "artist", label: "artista" },
+        { key: "play_count", label: "plays", numeric: true, narrow: true },
+        { key: "file_size_bytes", label: "tamaño", numeric: true, narrow: true },
       ],
       libraryGrouped: [
-        { key: "title", label: "Título" },
-        { key: "artist", label: "Artista" },
-        { key: "play_count", label: "Reproducciones", numeric: true },
-        { key: "duration", label: "Duración", numeric: true },
-        { key: "file_size_bytes", label: "Tamaño", numeric: true },
-        { key: "copies", label: "Copias", numeric: true },
-        { key: "wasted_bytes", label: "Desperdicio", numeric: true },
-        { key: "on_disk", label: "En disco" },
+        { key: "title", label: "título", wide: true },
+        { key: "artist", label: "artista" },
+        { key: "play_count", label: "plays", numeric: true, narrow: true },
+        { key: "file_size_bytes", label: "tamaño", numeric: true, narrow: true },
+        { key: "copies", label: "dup", numeric: true, narrow: true },
       ],
       likes: [
-        { key: "title", label: "Título" },
-        { key: "artist", label: "Artista" },
-        { key: "yt_query", label: "Búsqueda" },
-        { key: "liked_at", label: "Like", numeric: true },
+        { key: "title", label: "título", wide: true },
+        { key: "artist", label: "artista" },
+        { key: "liked_at", label: "fecha", numeric: true, narrow: true },
       ],
     };
+
+    const COL_WIDTHS = { wide: "44%", artist: "24%", default: "14%", narrow: "9%" };
 
     const DEFAULT_TABLE_SORT = {
       searches: { column: "cached_at", dir: "desc" },
@@ -182,7 +184,7 @@
             cacheDir = dir;
             return await res.json();
           }
-        } catch (_) { /* try next dir */ }
+        } catch (_) { /* try next */ }
       }
       return null;
     }
@@ -191,7 +193,7 @@
       try {
         const res = await fetch("/api/disk-usage");
         if (res.ok) return await res.json();
-      } catch (_) { /* static-only fallback */ }
+      } catch (_) { /* static fallback */ }
       return { total_bytes: 0, files: {}, tracks_on_disk: 0 };
     }
 
@@ -273,9 +275,8 @@
 
     function formatTimestamp(unix) {
       if (!unix) return "—";
-      return new Date(unix * 1000).toLocaleString("es", {
-        day: "2-digit", month: "short", year: "numeric",
-        hour: "2-digit", minute: "2-digit",
+      return new Date(unix * 1000).toLocaleDateString("es", {
+        day: "2-digit", month: "short", year: "2-digit",
       });
     }
 
@@ -297,33 +298,23 @@
 
     function thumbHtml(thumbnail, alt) {
       if (thumbnail) {
-        return `<img src="${escapeHtml(thumbnail)}" alt="${escapeHtml(alt)}" loading="lazy" class="h-full w-full object-cover">`;
+        return `<img src="${escapeHtml(thumbnail)}" alt="${escapeHtml(alt)}" loading="lazy" class="${UI.cardThumbImg}">`;
       }
-      return `<span class="text-4xl text-zinc-600">♪</span>`;
+      return `<span class="text-3xl text-ash">♪</span>`;
     }
 
     function linkHtml(href, label) {
       if (!href) return "";
-      return `<a href="${escapeHtml(href)}" target="_blank" rel="noopener" class="text-spotify hover:underline">${escapeHtml(label)}</a>`;
+      return `<a href="${escapeHtml(href)}" target="_blank" rel="noopener" class="${UI.link}">${escapeHtml(label)}</a>`;
     }
 
     function emptyHtml(msg) {
-      return `<div class="col-span-full py-12 text-center text-sm text-zinc-500">${escapeHtml(msg)}</div>`;
+      return `<div class="${UI.empty}">${escapeHtml(msg)}</div>`;
     }
 
     function loadingHtml() {
-      return `<div class="col-span-full py-12 text-center text-sm text-zinc-500">
-        <span class="mr-2 inline-block h-3.5 w-3.5 animate-spin rounded-full border-2 border-spotify border-t-transparent align-middle"></span>
-        Cargando datos…
-      </div>`;
+      return `<div class="${UI.empty}"><span class="inline-block h-3.5 w-3.5 animate-spin rounded-full border-2 border-black/10 border-t-ink align-middle mr-2"></span>cargando</div>`;
     }
-
-    const CARD = "overflow-hidden rounded-lg border border-surface2 bg-surface transition-colors hover:border-spotify";
-    const THUMB = "flex aspect-video items-center justify-center overflow-hidden bg-surface2";
-    const BODY = "p-3.5";
-    const TITLE = "mb-1 line-clamp-2 text-sm font-semibold";
-    const QUERY = "mb-2 line-clamp-1 text-xs italic text-spotify";
-    const META = "text-xs text-zinc-500";
 
     function resolveFileSize(trackId, entry) {
       if (entry.file_size_bytes > 0) return entry.file_size_bytes;
@@ -461,23 +452,21 @@
     }
 
     function sortIndicator(column) {
-      if (tableSort.column !== column) return `<span class="text-zinc-600">↕</span>`;
+      if (tableSort.column !== column) return `<span class="text-ash">↕</span>`;
       return tableSort.dir === "asc"
-        ? `<span class="text-spotify">↑</span>`
-        : `<span class="text-spotify">↓</span>`;
+        ? `<span class="text-accent">↑</span>`
+        : `<span class="text-accent">↓</span>`;
     }
 
     function renderSearchCard(item) {
       const yt = youtubeUrl(item);
       return `
-        <article class="${CARD}">
-          <div class="${THUMB}">${thumbHtml(item.thumbnail, item.title)}</div>
-          <div class="${BODY}">
-            <div class="${TITLE}">${escapeHtml(item.title)}</div>
-            <div class="${QUERY}">"${escapeHtml(item.query)}"</div>
-            <div class="${META}">${escapeHtml(item.uploader)} · ${formatDuration(item.duration)}</div>
-            <div class="${META}">Cacheado: ${formatTimestamp(item.cached_at)}</div>
-            <div class="mt-2.5 flex flex-wrap gap-2">${linkHtml(yt, "YouTube")}</div>
+        <article class="${UI.card}">
+          <div class="${UI.cardThumb}">${thumbHtml(item.thumbnail, item.title)}</div>
+          <div class="${UI.cardBody}">
+            <div class="${UI.cardTitle}">${escapeHtml(item.title)}</div>
+            <div class="${UI.cardMeta}">${formatDuration(item.duration)} · ${formatTimestamp(item.cached_at)}</div>
+            <div class="${UI.cardLinks}">${linkHtml(yt, "yt")}</div>
           </div>
         </article>`;
     }
@@ -485,20 +474,14 @@
     function renderLibraryCard(item) {
       const yt = youtubeUrl(item);
       const sp = spotifyUrl(item.spotify_id);
+      const size = item.on_disk ? formatBytes(item.file_size_bytes) : "—";
       return `
-        <article class="${CARD}">
-          <div class="${THUMB}">${thumbHtml(item.thumbnail, item.title)}</div>
-          <div class="${BODY}">
-            <div class="${TITLE}">${escapeHtml(item.title)}</div>
-            <div class="${META}">${escapeHtml(item.artist)}</div>
-            <div class="mt-2 flex flex-wrap gap-2">
-              <span class="rounded-full bg-white/10 px-2 py-0.5 text-xs text-zinc-400">${item.play_count} reproducciones</span>
-              ${item.on_disk ? `<span class="rounded-full bg-spotify/15 px-2 py-0.5 text-xs font-semibold text-spotify">${formatBytes(item.file_size_bytes)}</span>` : ""}
-            </div>
-            <div class="mt-2.5 flex flex-wrap gap-2">
-              ${linkHtml(yt, "YouTube")}
-              ${linkHtml(sp, "Spotify")}
-            </div>
+        <article class="${UI.card}">
+          <div class="${UI.cardThumb}">${thumbHtml(item.thumbnail, item.title)}</div>
+          <div class="${UI.cardBody}">
+            <div class="${UI.cardTitle}">${escapeHtml(item.title)}</div>
+            <div class="${UI.cardMeta}">${escapeHtml(item.artist)} · ${item.play_count} · ${size}</div>
+            <div class="${UI.cardLinks}">${linkHtml(yt, "yt")}${sp ? " · " + linkHtml(sp, "sp") : ""}</div>
           </div>
         </article>`;
     }
@@ -506,51 +489,62 @@
     function renderLikeCard(item) {
       const sp = spotifyUrl(item.spotify_id);
       return `
-        <article class="${CARD}">
-          <div class="${THUMB}">${thumbHtml(item.thumbnail, item.title)}</div>
-          <div class="${BODY}">
-            <div class="${TITLE}">${escapeHtml(item.title)}</div>
-            <div class="${META}">${escapeHtml(item.artist)}</div>
-            ${item.yt_query && item.yt_query !== "—" ? `<div class="${QUERY}">"${escapeHtml(item.yt_query)}"</div>` : ""}
-            <div class="${META}">Like: ${formatTimestamp(item.liked_at)}</div>
-            <div class="mt-2.5 flex flex-wrap gap-2">${linkHtml(sp, "Spotify")}</div>
+        <article class="${UI.card}">
+          <div class="${UI.cardThumb}">${thumbHtml(item.thumbnail, item.title)}</div>
+          <div class="${UI.cardBody}">
+            <div class="${UI.cardTitle}">${escapeHtml(item.title)}</div>
+            <div class="${UI.cardMeta}">${escapeHtml(item.artist)} · ${formatTimestamp(item.liked_at)}</div>
+            <div class="${UI.cardLinks}">${linkHtml(sp, "sp")}</div>
           </div>
         </article>`;
     }
 
+    function tableLinks(tab, item) {
+      if (tab === "searches") return linkHtml(youtubeUrl(item), "yt");
+      if (tab === "library") {
+        return [linkHtml(youtubeUrl(item), "yt"), linkHtml(spotifyUrl(item.spotify_id), "sp")]
+          .filter(Boolean).join(" ");
+      }
+      return linkHtml(spotifyUrl(item.spotify_id), "sp");
+    }
+
+    function titleCell(tab, item) {
+      const links = tableLinks(tab, item);
+      let sub = "";
+      if (tab === "searches" && item.query && item.query !== item.title) {
+        sub = `<span class="block text-[11px] text-ash mt-0.5">${escapeHtml(item.query)}</span>`;
+      }
+      return `<span class="font-medium text-ink">${escapeHtml(item.title || "—")}</span>${sub}` +
+        (links ? `<span class="block text-[11px] mt-1">${links}</span>` : "");
+    }
+
     function cellValue(tab, item, key) {
+      if (key === "title") return titleCell(tab, item);
       if (key === "duration") return formatDuration(item.duration);
-      if (key === "cached_at") return formatTimestamp(item.cached_at);
-      if (key === "liked_at") return formatTimestamp(item.liked_at);
+      if (key === "cached_at" || key === "liked_at") return formatTimestamp(item[key]);
       if (key === "file_size_bytes") return item.on_disk ? formatBytes(item.file_size_bytes) : "—";
-      if (key === "wasted_bytes") {
-        return item.wasted_bytes > 0
-          ? `<span class="text-amber-400">${formatBytes(item.wasted_bytes)}</span>`
-          : "—";
-      }
       if (key === "copies") {
-        return item.copies > 1
-          ? `<span class="text-amber-400">${item.copies}</span>`
-          : "1";
-      }
-      if (key === "on_disk") {
-        return item.on_disk
-          ? `<span class="text-spotify">Sí</span>`
-          : `<span class="text-zinc-600">No</span>`;
-      }
-      if (key === "query" || key === "yt_query") {
-        return `<span class="italic text-spotify">"${escapeHtml(item[key])}"</span>`;
+        if (item.copies <= 1) return "—";
+        const extra = item.wasted_bytes > 0 ? ` ${formatBytes(item.wasted_bytes)}` : "";
+        return `<span class="text-warn">${item.copies}${extra}</span>`;
       }
       return escapeHtml(String(item[key] ?? "—"));
     }
 
-    function tableLinks(tab, item) {
-      if (tab === "searches") return linkHtml(youtubeUrl(item), "YouTube");
-      if (tab === "library") {
-        return [linkHtml(youtubeUrl(item), "YT"), linkHtml(spotifyUrl(item.spotify_id), "Spotify")]
-          .filter(Boolean).join(" · ");
-      }
-      return linkHtml(spotifyUrl(item.spotify_id), "Spotify");
+    function colWidth(col) {
+      if (col.wide) return COL_WIDTHS.wide;
+      if (col.narrow) return COL_WIDTHS.narrow;
+      if (col.key === "artist") return COL_WIDTHS.artist;
+      return COL_WIDTHS.default;
+    }
+
+    function thClass(col) {
+      return col.numeric ? UI.thNum : UI.th;
+    }
+
+    function tdClass(col) {
+      if (col.key === "title") return UI.tdTitle;
+      return col.numeric ? UI.tdNum : UI.td;
     }
 
     function renderTable(tab, items) {
@@ -561,37 +555,37 @@
       let footer = "";
       if (tab === "library" && items.length > 0) {
         const shownBytes = items.reduce((s, i) => s + (i.file_size_bytes || 0), 0);
-        const wasted = items.reduce((s, i) => s + (i.wasted_bytes || 0), 0);
-        const label = libraryGrouped ? "canciones únicas" : "entradas";
         footer = `
-          <tfoot class="border-t border-surface2 bg-surface/80">
-            <tr>
-              <td colspan="${cols.length}" class="${TD} text-right text-xs text-zinc-500">
-                Mostrando ${formatBytes(shownBytes)} de ${formatBytes(diskUsage.total_bytes)} en disco
-                (${items.length} ${label}${wasted > 0 ? ` · ${formatBytes(wasted)} desperdiciados` : ""})
+          <tfoot>
+            <tr class="bg-soft">
+              <td colspan="${cols.length}" class="px-2.5 py-2 text-[11px] text-mute text-right">
+                ${formatBytes(shownBytes)} / ${formatBytes(diskUsage.total_bytes)} · ${items.length} filas
               </td>
-              <td class="${TD}"></td>
             </tr>
           </tfoot>`;
       }
 
+      const colgroup = cols.map((col) =>
+        `<col style="width:${colWidth(col)}">`
+      ).join("");
+
       const header = cols.map((col) => `
-        <th class="${TH}" data-sort="${col.key}">
-          <span class="inline-flex items-center gap-1">${escapeHtml(col.label)} ${sortIndicator(col.key)}</span>
+        <th class="${thClass(col)}" data-sort="${col.key}">
+          ${escapeHtml(col.label)} ${sortIndicator(col.key)}
         </th>
-      `).join("") + `<th class="${TH}">Enlaces</th>`;
+      `).join("");
 
       const rows = items.map((item) => `
-        <tr class="border-t border-surface2/60 hover:bg-surface2/40">
-          ${cols.map((col) => `<td class="${TD} max-w-xs truncate">${cellValue(tab, item, col.key)}</td>`).join("")}
-          <td class="${TD} whitespace-nowrap">${tableLinks(tab, item)}</td>
+        <tr class="${UI.rowHover}">
+          ${cols.map((col) => `<td class="${tdClass(col)}">${cellValue(tab, item, col.key)}</td>`).join("")}
         </tr>
       `).join("");
 
       return `
-        <div class="${TABLE_WRAP}">
-          <table class="w-full min-w-[720px]">
-            <thead class="bg-surface">${header}</thead>
+        <div class="${UI.tableWrap}">
+          <table class="w-full table-fixed border-collapse">
+            <colgroup>${colgroup}</colgroup>
+            <thead class="bg-soft"><tr>${header}</tr></thead>
             <tbody>${rows}</tbody>
             ${footer}
           </table>
@@ -599,10 +593,10 @@
     }
 
     function emptyMessage(tab, filter) {
-      if (filter) return "Ningún resultado coincide con el filtro.";
-      if (tab === "library") return "Sin pistas en biblioteca. El bot crea este índice al reproducir y cachear audio.";
-      if (tab === "likes") return "Sin likes guardados aún.";
-      return "Sin búsquedas cacheadas aún.";
+      if (filter) return "sin resultados";
+      if (tab === "library") return "biblioteca vacía";
+      if (tab === "likes") return "sin likes";
+      return "sin búsquedas";
     }
 
     function renderPanel(tab) {
@@ -628,19 +622,22 @@
         const empty = emptyMessage(tab, filter);
         grid.innerHTML = viewMode === "grid" ? emptyHtml(empty) : "";
         table.innerHTML = viewMode === "table"
-          ? `<div class="py-12 text-center text-sm text-zinc-500">${escapeHtml(empty)}</div>`
+          ? `<div class="${UI.empty}">${escapeHtml(empty)}</div>`
           : "";
         return;
       }
 
-      const suffix = tab === "library" && libraryGrouped && viewMode === "table" ? " únicas" : "";
-      countEl.textContent = `${items.length} resultado${items.length !== 1 ? "s" : ""}${suffix}${filter ? " (filtrado)" : ""}`;
+      countEl.textContent = filter ? `${items.length} / filtro` : "";
 
       if (viewMode === "grid") {
         grid.innerHTML = items.map(renderFns[tab]).join("");
+        grid.classList.remove("hidden");
+        table.classList.add("hidden");
         table.innerHTML = "";
       } else {
         table.innerHTML = renderTable(tab, items);
+        table.classList.remove("hidden");
+        grid.classList.add("hidden");
         grid.innerHTML = "";
         table.querySelectorAll("th[data-sort]").forEach((th) => {
           th.addEventListener("click", () => {
@@ -663,18 +660,16 @@
     }
 
     function updateStats() {
-      document.getElementById("statSearches").textContent = searches.length;
-      document.getElementById("statLibrary").textContent = library.length;
-      document.getElementById("statLikes").textContent = likes.length;
-      document.getElementById("statPlayed").textContent = playedCount;
-      document.getElementById("statDisk").textContent = formatBytes(diskUsage.total_bytes);
-      let diskDetail = diskUsage.tracks_on_disk > 0
-        ? `${diskUsage.tracks_on_disk} archivos en library/`
-        : "Sin audio cacheado";
+      const parts = [
+        `<strong class="font-medium text-ink">${library.length}</strong> biblioteca`,
+        `<strong class="font-medium text-ink">${searches.length}</strong> búsquedas`,
+        `<strong class="font-medium text-ink">${likes.length}</strong> likes`,
+        `<strong class="font-medium text-ink">${formatBytes(diskUsage.total_bytes)}</strong> disco`,
+      ];
       if (dedupePreview && dedupePreview.wasted_bytes > 0) {
-        diskDetail += ` · ${dedupePreview.duplicate_groups} duplicados · ${formatBytes(dedupePreview.wasted_bytes)} recuperables`;
+        parts.push(`<span class="text-warn">${dedupePreview.duplicate_groups} dup</span>`);
       }
-      document.getElementById("statDiskDetail").textContent = diskDetail;
+      document.getElementById("statsLine").innerHTML = parts.join(" · ");
     }
 
     function updateDedupeUi() {
@@ -696,42 +691,42 @@
 
       banner.classList.remove("hidden");
       banner.textContent =
-        `${dedupePreview.duplicate_groups} grupos duplicados · ` +
-        `${formatBytes(dedupePreview.wasted_bytes)} recuperables · ` +
-        `${dedupePreview.total_entries} entradas → ~${dedupePreview.unique_videos} canciones`;
+        `${dedupePreview.duplicate_groups} duplicados · ${formatBytes(dedupePreview.wasted_bytes)} recuperables`;
 
       btn.classList.remove("hidden");
+      btn.className = UI.btnDanger;
       btn.disabled = false;
-      btn.textContent = "Limpiar duplicados";
+      btn.textContent = "dedupe";
     }
 
     async function runDedupe() {
       if (!dedupePreview || dedupePreview.wasted_bytes <= 0) return;
       const msg =
-        `¿Eliminar duplicados y recuperar ~${formatBytes(dedupePreview.wasted_bytes)}?\n\n` +
+        `¿eliminar duplicados y recuperar ~${formatBytes(dedupePreview.wasted_bytes)}?\n\n` +
         `${dedupePreview.duplicate_groups} grupos · ${dedupePreview.files_to_delete.length} archivos\n\n` +
-        "Recomendado: detener el bot antes (docker compose stop bot).";
+        "recomendado: detener el bot antes (docker compose stop bot).";
       if (!confirm(msg)) return;
 
       const btn = document.getElementById("dedupeBtn");
       btn.disabled = true;
-      btn.textContent = "Limpiando…";
+      btn.className = UI.btnDanger;
+      btn.textContent = "limpiando…";
 
       try {
         const res = await fetch("/api/library/dedupe", { method: "POST" });
         const data = await res.json();
-        if (!res.ok) throw new Error(data.error || "Error al limpiar");
+        if (!res.ok) throw new Error(data.error || "error al limpiar");
 
         showBanner(
-          `Limpieza completada: ${formatBytes(data.bytes_freed || dedupePreview.wasted_bytes)} liberados, ` +
-          `${data.entries_after} entradas en biblioteca.`,
+          `liberados ${formatBytes(data.bytes_freed || dedupePreview.wasted_bytes)} · ${data.entries_after} entradas`,
           "info"
         );
         await reloadData();
       } catch (err) {
-        showBanner(`Error: ${err.message}`, "error");
+        showBanner(`[-] error: ${err.message}`, "error");
         btn.disabled = false;
-        btn.textContent = "Limpiar duplicados";
+        btn.className = UI.btnDanger;
+        btn.textContent = "dedupe";
       }
     }
 
@@ -751,12 +746,8 @@
 
     function setLibraryGrouped(grouped) {
       libraryGrouped = grouped;
-      document.getElementById("libGrouped").className = grouped
-        ? "rounded-full bg-spotify px-3 py-1 font-semibold text-black"
-        : "rounded-full px-3 py-1 font-semibold text-zinc-400 hover:text-white";
-      document.getElementById("libDetailed").className = grouped
-        ? "rounded-full px-3 py-1 font-semibold text-zinc-400 hover:text-white"
-        : "rounded-full bg-spotify px-3 py-1 font-semibold text-black";
+      document.getElementById("libGrouped").className = grouped ? UI.btnActive : UI.btn;
+      document.getElementById("libDetailed").className = grouped ? UI.btn : UI.btnActive;
       if (viewMode === "table") tableSort = { ...DEFAULT_TABLE_SORT.library };
       renderPanel("library");
     }
@@ -764,39 +755,33 @@
     function showBanner(msg, type) {
       const el = document.getElementById("banner");
       el.textContent = msg;
-      el.className = "mx-8 mt-4 rounded-lg px-4 py-3 text-sm " + (
-        type === "error"
-          ? "border border-red-400/30 bg-red-400/10 text-red-400"
-          : "border border-spotify/25 bg-spotify/15 text-spotify"
-      );
+      el.className = `${UI.banner} ${type === "error" ? UI.bannerError : UI.bannerInfo}`;
     }
 
     function setCacheBadge() {
       const el = document.getElementById("cacheBadge");
-      el.textContent = cacheDir ? `Caché: /${cacheDir}/` : "Sin caché encontrada";
+      el.textContent = cacheDir ? `/${cacheDir}/` : "sin caché";
     }
 
-    function setTabClasses(btn, isActive) {
-      btn.className = "tab px-5 py-3 text-sm font-semibold " + (isActive ? TAB_ACTIVE : TAB_INACTIVE);
+    function setTab() {
+      document.querySelectorAll("[data-tab]").forEach((t) => {
+        t.className = t.dataset.tab === activeTab ? UI.tabActive : UI.tab;
+      });
     }
 
     function setViewMode(mode) {
       viewMode = mode;
-      const gridBtn = document.getElementById("viewGrid");
-      const tableBtn = document.getElementById("viewTable");
+      document.getElementById("viewGrid").className = mode === "grid" ? UI.btnActive : UI.btn;
+      document.getElementById("viewTable").className = mode === "table" ? UI.btnActive : UI.btn;
       const sortSelect = document.getElementById("sortSelect");
 
       if (mode === "grid") {
-        gridBtn.className = "view-btn rounded-full bg-spotify px-4 py-1.5 font-semibold text-black";
-        tableBtn.className = "view-btn rounded-full px-4 py-1.5 font-semibold text-zinc-400 hover:text-white";
         sortSelect.classList.remove("hidden");
         ["searches", "library", "likes"].forEach((name) => {
           document.getElementById(`grid${name.charAt(0).toUpperCase() + name.slice(1)}`).classList.remove("hidden");
           document.getElementById(`table${name.charAt(0).toUpperCase() + name.slice(1)}`).classList.add("hidden");
         });
       } else {
-        tableBtn.className = "view-btn rounded-full bg-spotify px-4 py-1.5 font-semibold text-black";
-        gridBtn.className = "view-btn rounded-full px-4 py-1.5 font-semibold text-zinc-400 hover:text-white";
         sortSelect.classList.add("hidden");
         tableSort = { ...DEFAULT_TABLE_SORT[activeTab] };
         ["searches", "library", "likes"].forEach((name) => {
@@ -830,12 +815,13 @@
       }
     }
 
-    document.querySelectorAll(".tab").forEach((btn) => {
+    document.querySelectorAll("[data-tab]").forEach((btn) => {
       btn.addEventListener("click", () => {
         activeTab = btn.dataset.tab;
-        document.querySelectorAll(".tab").forEach((t) => setTabClasses(t, t.dataset.tab === activeTab));
+        setTab();
         ["searches", "library", "likes"].forEach((name) => {
-          document.getElementById(`panel-${name}`).classList.toggle("hidden", name !== activeTab);
+          const panel = document.getElementById(`panel-${name}`);
+          panel.className = name === activeTab ? "block" : "hidden";
         });
         if (viewMode === "table") tableSort = { ...DEFAULT_TABLE_SORT[activeTab] };
         updateSortOptions();
@@ -867,13 +853,9 @@
       ]);
 
       if (!cacheDir) {
-        showBanner(
-          "No se encontró carpeta de caché (.cache/ ni spotify_cache/). " +
-          "Con Docker: docker compose up -d explorer. Sin Docker: ./serve_explorer.sh",
-          "error"
-        );
+        showBanner("sin caché — docker compose up -d explorer", "error");
         ["Searches", "Library", "Likes"].forEach((name) => {
-          document.getElementById(`grid${name}`).innerHTML = emptyHtml("Sin datos disponibles.");
+          document.getElementById(`grid${name}`).innerHTML = emptyHtml("sin datos disponibles.");
           document.getElementById(`table${name}`).innerHTML = "";
         });
         setCacheBadge();
@@ -892,7 +874,7 @@
       renderAll();
 
       if (searches.length === 0 && library.length === 0 && likes.length === 0) {
-        showBanner("La carpeta de caché existe pero aún no hay datos. Usa !play o !search en Discord.", "info");
+        showBanner("caché vacía — usa !play en discord", "info");
       }
     }
 

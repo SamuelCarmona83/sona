@@ -47,24 +47,95 @@ def track_video_id(track: dict, video_ref: str | None = None) -> str | None:
 
 
 def track_id(track: dict) -> str:
-    sid = track.get("spotify_id")
-    if sid:
-        return sid
+    """Stable index key — video_id wins over spotify_id to avoid duplicate entries."""
     video_id = track_video_id(track)
     if video_id:
         return f"yt_{video_id}"
+    sid = track.get("spotify_id")
+    if sid:
+        return sid
     key = track.get("yt_query") or track.get("title", "")
     return _stable_query_hash(key)
 
 
 def _find_tid_by_video_id(video_id: str) -> str | None:
     canonical = f"yt_{video_id}"
-    if canonical in _index and get_local_path(canonical):
+    if canonical in _index:
         return canonical
     for tid, entry in _index.items():
-        if entry.get("video_id") == video_id and get_local_path(tid):
+        if entry.get("video_id") == video_id:
             return tid
     return None
+
+
+def _merge_entries_into(canonical_tid: str, legacy_tid: str) -> bool:
+    if legacy_tid == canonical_tid or legacy_tid not in _index:
+        return False
+    legacy = _index.pop(legacy_tid)
+    canonical = _index.setdefault(canonical_tid, {})
+    canonical["play_count"] = canonical.get("play_count", 0) + legacy.get("play_count", 0)
+    canonical["request_count"] = canonical.get("request_count", 0) + legacy.get("request_count", 0)
+    canonical["last_played"] = max(canonical.get("last_played", 0), legacy.get("last_played", 0))
+    canonical["last_requested"] = max(
+        canonical.get("last_requested", 0), legacy.get("last_requested", 0),
+    )
+    canonical["cached_at"] = max(canonical.get("cached_at", 0), legacy.get("cached_at", 0))
+    if not get_local_path(canonical_tid) and legacy.get("file_path"):
+        canonical["file_path"] = legacy["file_path"]
+        if legacy.get("file_size_bytes"):
+            canonical["file_size_bytes"] = legacy["file_size_bytes"]
+    for field in (
+        "spotify_id", "artist_id", "title", "artist", "thumbnail",
+        "duration", "yt_query", "video_id",
+    ):
+        if not canonical.get(field) and legacy.get(field):
+            canonical[field] = legacy[field]
+    canonical["video_id"] = canonical.get("video_id") or legacy.get("video_id")
+    logger.info(
+        "library: merged %s into %s ('%s')",
+        legacy_tid, canonical_tid, canonical.get("title", "?"),
+    )
+    return True
+
+
+def _resolve_index_tid(track: dict) -> str:
+    tid = track_id(track)
+    video_id = track_video_id(track)
+    if not video_id:
+        return tid
+    canonical = f"yt_{video_id}"
+    changed = False
+    for legacy_tid in [
+        t for t, entry in list(_index.items())
+        if entry.get("video_id") == video_id and t != canonical
+    ]:
+        if _merge_entries_into(canonical, legacy_tid):
+            changed = True
+    if tid != canonical and tid in _index:
+        if _merge_entries_into(canonical, tid):
+            changed = True
+    if changed:
+        _save_index()
+    return canonical
+
+
+def _migrate_index_duplicates() -> None:
+    by_video: dict[str, list[str]] = {}
+    for tid, entry in _index.items():
+        video_id = entry.get("video_id")
+        if video_id:
+            by_video.setdefault(video_id, []).append(tid)
+    changed = False
+    for video_id, tids in by_video.items():
+        if len(tids) <= 1:
+            continue
+        canonical = f"yt_{video_id}"
+        for tid in tids:
+            if tid != canonical and _merge_entries_into(canonical, tid):
+                changed = True
+    if changed:
+        _save_index()
+        logger.info("library: migrated duplicate index entries by video_id")
 
 
 def _load_index() -> None:
@@ -87,6 +158,7 @@ def _save_index() -> None:
 
 
 _load_index()
+_migrate_index_duplicates()
 
 
 def _file_size_mb() -> float:
@@ -222,7 +294,7 @@ def resolve_local_track(track: dict) -> dict | None:
 def record_play(track: dict) -> None:
     if not LIBRARY_ENABLED:
         return
-    tid = track_id(track)
+    tid = _resolve_index_tid(track)
     entry = _index.setdefault(tid, {
         "title": track.get("title", "?"),
         "artist": track.get("artist", "Unknown"),
@@ -239,13 +311,17 @@ def record_play(track: dict) -> None:
     entry["last_played"] = time.time()
     if track.get("title"):
         entry["title"] = track["title"]
+    if track.get("spotify_id") and not entry.get("spotify_id"):
+        entry["spotify_id"] = track["spotify_id"]
+    if track.get("video_id") and not entry.get("video_id"):
+        entry["video_id"] = track["video_id"]
     _save_index()
 
 
 def record_request(track: dict) -> None:
     if not LIBRARY_ENABLED:
         return
-    tid = track_id(track)
+    tid = _resolve_index_tid(track)
     entry = _index.setdefault(tid, {
         "title": track.get("title", "?"),
         "artist": track.get("artist", "Unknown"),
@@ -286,7 +362,7 @@ def _upsert_entry_from_track(
     *,
     tid: str | None = None,
 ) -> None:
-    resolved_tid = tid or track_id(track)
+    resolved_tid = tid or _resolve_index_tid(track)
     entry = _index.setdefault(resolved_tid, {})
     update = {
         "file_path": file_path,
@@ -386,7 +462,7 @@ async def enqueue_download(track: dict, video_ref: str | None = None) -> None:
             _upsert_entry_from_track(track, str(local_path), video_id, tid=existing_tid)
             return
 
-    tid = track_id(track)
+    tid = _resolve_index_tid(track)
     if get_local_path(tid):
         return
     if tid in _pending_downloads:
