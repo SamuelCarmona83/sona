@@ -256,6 +256,12 @@ def _build_v2_payload(guild_id: int) -> dict:
     )
     like_label = f"❤️ {like_count}" if like_count > 0 else "🤍"
     like_style = 4 if like_count > 0 else 2  # red if any likes, grey otherwise
+    if track and track.get("is_radio_stream"):
+        from src.fm_favorites import favorite_id_for_track
+
+        favorite_id = favorite_id_for_track(guild_id, track)
+        like_label = f"❤️ {favorite_id}" if favorite_id is not None else "🤍"
+        like_style = 4 if favorite_id is not None else 2
     children.append({"type": 1, "components": [
         {"type": 2, "custom_id": "player_radio", "label": "📻" + ("✓" if radio_on else ""), "style": 3 if radio_on else 2},
         {"type": 2, "custom_id": "player_mood",  "label": "🎭 Mood", "style": 2},
@@ -394,42 +400,34 @@ class PlayerView(discord.ui.View):
         session = guild_session(gid)
         now_playing = session.now_playing
         q = guild_session(gid).queue
-        if not q:
-            if now_playing and now_playing.get("is_radio_stream"):
-                try:
-                    stations = await asyncio.to_thread(top_stations, limit=10)
-                except Exception as exc:
-                    logger.warning("player_queue: failed to fetch top FM stations: %s", exc)
-                    await interaction.response.send_message(
-                        "No pude obtener el Top FM ahora. Intenta de nuevo en unos segundos.",
-                        ephemeral=True,
-                    )
-                    return
+        if now_playing and now_playing.get("is_radio_stream"):
+            from src.fm_favorites import list_favorites
 
-                if not stations:
-                    await interaction.response.send_message("No hay estaciones Top FM disponibles ahora.", ephemeral=True)
-                    return
-
-                lines = []
-                for i, station in enumerate(stations[:10], 1):
-                    name = station.get("name", "?")
-                    country = station.get("country") or "?"
-                    votes = station.get("votes", 0)
-                    clicks = station.get("clickcount", 0)
-                    lines.append(f"`{i}.` **{name}** — {country} | 👍 {votes} | 🔥 {clicks}")
-
-                embed = discord.Embed(
-                    title="📻 Top estaciones FM",
-                    description=(
-                        "La cola esta vacia porque estas en modo stream en vivo.\n"
-                        "Usa `!fm <nombre>` para cambiar de estación:\n\n"
-                        + "\n".join(lines)
-                    ),
-                    color=0x1DB954,
+            favorites = list_favorites(gid)
+            if not favorites:
+                await interaction.response.send_message(
+                    "No hay favoritos FM guardados. Usa ❤️ mientras suena una estación.",
+                    ephemeral=True,
                 )
-                await interaction.response.send_message(embed=embed, ephemeral=True)
                 return
 
+            lines = []
+            for fav_id, station in favorites[:30]:
+                name = (station.get("name") or "FM Station")[:72]
+                lines.append(f"`{fav_id}` — {name}")
+
+            embed = discord.Embed(
+                title="📻 Favoritos FM",
+                description=(
+                    "Usa `!fm id:<ID>` para cambiar con precisión.\n\n"
+                    + "\n".join(lines)
+                ),
+                color=0x1DB954,
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
+        if not q:
             await interaction.response.send_message("La cola esta vacia.", ephemeral=True)
             return
         lines = []
@@ -455,6 +453,19 @@ class PlayerView(discord.ui.View):
         if not track:
             await interaction.response.send_message("Nada reproduciéndose ahora.", ephemeral=True)
             return
+
+        if track.get("is_radio_stream"):
+            from src.fm_favorites import toggle_favorite
+
+            is_favorite, favorite_id = toggle_favorite(gid, track)
+            if is_favorite:
+                text = f"❤️ Guardada en favoritos FM con ID `{favorite_id}`"
+            else:
+                text = f"🗑️ Quitada de favoritos FM (ID `{favorite_id}`)"
+            await interaction.response.send_message(text, ephemeral=True)
+            await update_player_embed(guild, interaction.channel)
+            return
+
         from src import likes as _likes_mod
         liked = _likes_mod.toggle_like(gid, interaction.user.id, track)
         action = "❤️ Le diste like" if liked else "💔 Quitaste el like de"

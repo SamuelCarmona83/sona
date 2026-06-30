@@ -2,6 +2,8 @@ import unittest
 from unittest.mock import Mock, patch
 
 from src.radio_browser import (
+    get_station_by_uuid,
+    list_countries,
     parse_search_query,
     pick_best_station,
     rank_stations,
@@ -68,6 +70,7 @@ class RadioBrowserTests(unittest.TestCase):
             "url": "http://legacy.example.com/stream",
             "url_resolved": "https://cdn.example.com/mitre.aac",
             "homepage": "https://mitre.example.com",
+            "favicon": "https://mitre.example.com/favicon.png",
             "country": "Argentina",
             "language": "es",
             "tags": "news,talk",
@@ -191,6 +194,44 @@ class RadioBrowserTests(unittest.TestCase):
 
         self.assertEqual(len(stations), 1)
         self.assertEqual(stations[0]["name"], "CNN US AAC")
+
+    def test_get_station_by_uuid_returns_normalized_station(self) -> None:
+        response = Mock()
+        response.json.return_value = [
+            {
+                "stationuuid": "abc-123",
+                "name": "Hits 1",
+                "url": "https://example.com/hits1",
+                "url_resolved": "https://example.com/hits1",
+                "country": "France",
+                "countrycode": "FR",
+                "codec": "MP3",
+                "bitrate": 256,
+            }
+        ]
+        response.raise_for_status.return_value = None
+
+        with patch("src.radio_browser.requests.get", return_value=response):
+            station = get_station_by_uuid("abc-123")
+
+        self.assertIsNotNone(station)
+        self.assertEqual(station["stationuuid"], "abc-123")
+        self.assertEqual(station["countrycode"], "FR")
+
+    def test_list_countries_parses_country_codes(self) -> None:
+        response = Mock()
+        response.json.return_value = [
+            {"name": "Germany", "iso_3166_1": "DE"},
+            {"name": "Argentina", "countrycode": "AR"},
+            {"name": "Invalid", "iso_3166_1": ""},
+        ]
+        response.raise_for_status.return_value = None
+
+        with patch("src.radio_browser.requests.get", return_value=response):
+            countries = list_countries()
+
+        self.assertEqual(countries[0]["countrycode"], "AR")
+        self.assertEqual(countries[1]["countrycode"], "DE")
 
 
 if __name__ == "__main__":

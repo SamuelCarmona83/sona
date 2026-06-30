@@ -28,7 +28,14 @@ from src.playback import (
     update_player_embed,
 )
 from src.scoring import _split_query_parts
-from src.radio_browser import parse_search_query, pick_best_station, rank_stations, search_stations, station_to_track
+from src.radio_browser import (
+    parse_search_query,
+    pick_best_station,
+    rank_stations,
+    search_stations,
+    station_to_track,
+)
+from src.fm_favorites import delete_favorite, get_favorite, list_favorites
 from src.spotify import (
     _ensure_auth,
     _get_spotify_query,
@@ -238,6 +245,48 @@ def _queue_track_from_youtube_search(
         "acodec": yt_info.get("acodec", "?"),
         "abr": yt_info.get("abr", 0),
     }
+
+
+def _choose_fm_backup_station(stations: list[dict], selected: dict) -> dict | None:
+    selected_url = selected.get("url_resolved") or selected.get("url")
+    for station in stations:
+        url = station.get("url_resolved") or station.get("url")
+        if url and url != selected_url:
+            return station
+    return None
+
+
+async def _switch_to_fm_station(
+    guild: discord.Guild,
+    text_channel,
+    member: discord.Member,
+    station: dict,
+    *,
+    backup_station: dict | None,
+) -> bool:
+    if not member.voice:
+        raise ValueError("Debes estar en un canal de voz para cambiar de emisora.")
+
+    vc = guild.voice_client
+    if vc is None:
+        vc = await member.voice.channel.connect()
+    elif vc.channel != member.voice.channel:
+        await vc.move_to(member.voice.channel)
+
+    tracks = [station_to_track(station, requester="📻 FM")]
+    if backup_station:
+        tracks.append(station_to_track(backup_station, requester="📻 FM"))
+
+    _ensure_guild_queue(guild.id)
+    queues[guild.id] = collections.deque(tracks)
+
+    playback_active = vc.is_playing() or vc.is_paused()
+    if playback_active:
+        vc.stop()
+        asyncio.ensure_future(refresh_player_embed_fresh(guild, text_channel))
+    else:
+        await play_next(guild, vc, text_channel)
+    return playback_active
 
 
 def _first_radio_track_index(tracks: list[dict]) -> int:
@@ -688,26 +737,80 @@ async def _radio_station_cmd(ctx: commands.Context, query: str) -> None:
                 "**Ejemplos**\n"
                 "`!fm cnn country:us`\n"
                 "`!fm techno type:techno country:de`\n"
-                "`!fm hits 1 language:french`"
+                "`!fm hits 1 language:french`\n"
+                "`!fm fav`\n"
+                "`!fm fav del 3`\n"
+                "`!fm id:3`"
             ),
             color=0x1DB954,
         )
         await ctx.send(embed=embed, delete_after=45)
         return
 
+    parts = cleaned_query.split()
+    if parts and parts[0].lower() in {"fav", "favs", "favoritos"}:
+        if len(parts) == 1 or parts[1].lower() in {"list", "lista", "ls"}:
+            favorites = list_favorites(ctx.guild.id)
+            if not favorites:
+                await ctx.send("No hay favoritos FM guardados.", delete_after=10)
+                return
+            lines = [f"`{fid}` — {st.get('name', 'FM Station')}" for fid, st in favorites[:40]]
+            await ctx.send(
+                "📻 **Favoritos FM**\n" + "\n".join(lines) + "\n\nUsa `!fm id:<ID>` para cambiar.",
+                delete_after=35,
+            )
+            return
+
+        if len(parts) >= 3 and parts[1].lower() in {"del", "rm", "remove", "delete"}:
+            if not parts[2].isdigit():
+                await ctx.send("Uso: `!fm fav del <id>`", delete_after=10)
+                return
+            favorite_id = int(parts[2])
+            if delete_favorite(ctx.guild.id, favorite_id):
+                await ctx.send(f"🗑️ Favorito FM `{favorite_id}` eliminado.", delete_after=10)
+            else:
+                await ctx.send(f"No existe favorito FM con ID `{favorite_id}`.", delete_after=10)
+            return
+
+        await ctx.send("Uso: `!fm fav` | `!fm fav del <id>`", delete_after=12)
+        return
+
     parsed_query, fm_filters = parse_search_query(cleaned_query)
+    fav_match = re.fullmatch(r"(?:id:|fav:|#)?(\d+)", cleaned_query.lower())
+    if fav_match:
+        favorite_id = int(fav_match.group(1))
+        favorite_station = get_favorite(ctx.guild.id, favorite_id)
+        if not favorite_station:
+            await ctx.send(f"No existe favorito FM con ID `{favorite_id}`.", delete_after=12)
+            return
+        try:
+            await _switch_to_fm_station(
+                ctx.guild,
+                ctx.channel,
+                ctx.author,
+                favorite_station,
+                backup_station=None,
+            )
+        except ValueError as exc:
+            await ctx.send(str(exc), delete_after=10)
+            return
+        await ctx.send(
+            f"📻 FM cambiado a favorito `{favorite_id}`: **{favorite_station.get('name', 'FM Station')}**",
+            delete_after=15,
+        )
+        return
+
     if not parsed_query and not fm_filters:
         await ctx.send("Uso: `!fm <consulta> [country:.. language:.. type:.. codec:..]`", delete_after=12)
         return
 
-    voice_channel = ctx.author.voice.channel
     search_label = parsed_query or "radio"
     filter_parts = [f"{k}:{v}" for k, v in fm_filters.items()]
     filter_suffix = f" ({', '.join(filter_parts)})" if filter_parts else ""
     msg = await ctx.send(f"📡 Buscando emisora: **{search_label}**{filter_suffix}...", delete_after=40)
 
     try:
-        stations = await asyncio.to_thread(search_stations, parsed_query, limit=12, filters=fm_filters)
+        stations = await asyncio.to_thread(search_stations, parsed_query, limit=120, filters=fm_filters)
     except Exception as exc:
         logger.warning("fm: radio-browser search failed for query=%s filters=%s: %s", parsed_query, fm_filters, exc)
         await msg.edit(content="No se pudo consultar Radio Browser. Intenta de nuevo en unos segundos.")
@@ -723,45 +826,34 @@ async def _radio_station_cmd(ctx: commands.Context, query: str) -> None:
         return
 
     ranked = rank_stations(stations, parsed_query or cleaned_query)
-    top_stations = ranked[:2]
+    ranked = ranked[:200]
+    backup_station = _choose_fm_backup_station(ranked, best_station)
 
-    vc = await _connect_author_voice_channel(ctx, voice_channel)
-    _ensure_guild_queue(ctx.guild.id)
-
-    tracks_to_queue = [station_to_track(station, requester="📻 FM") for station in top_stations]
-    playback_active = vc.is_playing() or vc.is_paused()
-    # FM command is an explicit station switch: replace queue and jump immediately.
-    queues[ctx.guild.id] = collections.deque(tracks_to_queue)
-
-    station_name = best_station.get("name") or "FM Station"
-    country = best_station.get("country") or "?"
-    language = best_station.get("language") or "?"
-    codec = best_station.get("codec") or "?"
-    bitrate = best_station.get("bitrate") or 0
-    backup_msg = "\nRespaldo: se encolo 1 alternativa adicional." if len(tracks_to_queue) > 1 else ""
-    switch_msg = "\nCambiando emisora ahora..." if playback_active else ""
-    embed = discord.Embed(
-        title="📻 Emisora seleccionada",
-        description=(
-            f"**{station_name}**\n"
-            f"Pais: `{country}` | Idioma: `{language}`\n"
-            f"Codec: `{codec}` | Bitrate: `{bitrate} kbps`{backup_msg}{switch_msg}"
-        ),
-        color=0x1DB954,
-    )
+    try:
+        switching_now = await _switch_to_fm_station(
+            ctx.guild,
+            ctx.channel,
+            ctx.author,
+            best_station,
+            backup_station=backup_station,
+        )
+    except ValueError as exc:
+        await msg.edit(content=str(exc))
+        return
 
     try:
         await msg.delete()
     except Exception:
         pass
 
-    await ctx.send(embed=embed, delete_after=20)
-
-    if playback_active:
-        vc.stop()
-        asyncio.ensure_future(refresh_player_embed_fresh(ctx.guild, ctx.channel))
-    else:
-        await play_next(ctx.guild, vc, ctx.channel)
+    country = best_station.get("country") or "?"
+    codec = best_station.get("codec") or "?"
+    bitrate = best_station.get("bitrate") or 0
+    switching_text = " | cambiando ahora" if switching_now else ""
+    await ctx.send(
+        f"📻 **{best_station.get('name', 'FM Station')}** | {country} | {codec} {bitrate}kbps{switching_text}",
+        delete_after=18,
+    )
 
 
 @bot.command(name="fm", help="Busca y reproduce una emisora AM/FM por internet. Uso: !fm <consulta> [country:.. language:.. type:.. codec:..]")

@@ -62,10 +62,12 @@ def _to_int(value: Any) -> int:
 
 def _normalize_station(raw: dict) -> dict:
     return {
+        "stationuuid": (raw.get("stationuuid") or "").strip(),
         "name": (raw.get("name") or "").strip(),
         "url": (raw.get("url") or "").strip(),
         "url_resolved": (raw.get("url_resolved") or "").strip(),
         "homepage": (raw.get("homepage") or "").strip(),
+        "favicon": (raw.get("favicon") or "").strip(),
         "country": (raw.get("country") or "").strip(),
         "countrycode": (raw.get("countrycode") or "").strip().upper(),
         "state": (raw.get("state") or "").strip(),
@@ -316,12 +318,16 @@ def station_to_track(station: dict, *, requester: str = "📻 FM") -> dict:
     stream_url = station.get("url_resolved") or station.get("url")
     return {
         "title": station.get("name") or "FM Station",
+        "stationuuid": station.get("stationuuid") or "",
         "yt_query": station.get("name") or "",
         "url": stream_url,
         "requester": requester,
         "artist": station.get("country") or "Radio",
         "duration": 0,
-        "thumbnail": "",
+        "thumbnail": station.get("favicon") or "",
+        "favicon": station.get("favicon") or "",
+        "url_resolved": station.get("url_resolved") or station.get("url") or "",
+        "countrycode": station.get("countrycode") or "",
         "webpage_url": station.get("homepage") or "",
         "is_radio_stream": True,
         "codec": station.get("codec") or "",
@@ -329,3 +335,55 @@ def station_to_track(station: dict, *, requester: str = "📻 FM") -> dict:
         "language": station.get("language") or "",
         "tags": station.get("tags") or "",
     }
+
+
+def get_station_by_uuid(station_uuid: str, *, timeout_sec: int = DEFAULT_TIMEOUT_SEC) -> Optional[dict]:
+    sid = (station_uuid or "").strip()
+    if not sid:
+        return None
+
+    candidates: list[dict] = []
+    for url, params in (
+        ("https://de1.api.radio-browser.info/json/stations/byuuid", {"uuid": sid}),
+        (f"https://de1.api.radio-browser.info/json/stations/byuuid/{sid}", None),
+    ):
+        try:
+            response = requests.get(url, params=params, timeout=timeout_sec)
+            response.raise_for_status()
+            payload = response.json()
+            if isinstance(payload, list):
+                candidates.extend(_normalize_station(item) for item in payload if isinstance(item, dict))
+        except Exception:
+            continue
+
+    for station in candidates:
+        if _has_stream_url(station):
+            return station
+    return None
+
+
+def list_countries(*, timeout_sec: int = DEFAULT_TIMEOUT_SEC) -> list[dict]:
+    response = requests.get("https://de1.api.radio-browser.info/json/countries", timeout=timeout_sec)
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, list):
+        return []
+
+    countries: list[dict] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        name = (item.get("name") or "").strip()
+        code = (
+            item.get("iso_3166_1")
+            or item.get("countrycode")
+            or item.get("code")
+            or ""
+        )
+        code = str(code).strip().upper()
+        if not name or len(code) != 2:
+            continue
+        countries.append({"name": name, "countrycode": code})
+
+    countries.sort(key=lambda c: c["name"].lower())
+    return countries
