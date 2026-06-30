@@ -265,7 +265,21 @@ LIBRARY_MAX_TRACKS = max(10, int(get_config_value("LIBRARY_MAX_TRACKS", dotenv_v
 LIBRARY_MAX_MB = max(100, int(get_config_value("LIBRARY_MAX_MB", dotenv_values, "2048")))
 LIBRARY_AUTO_DOWNLOAD = _env_bool("LIBRARY_AUTO_DOWNLOAD")
 LIBRARY_MIN_PLAYS_TO_PIN = max(1, int(get_config_value("LIBRARY_MIN_PLAYS_TO_PIN", dotenv_values, "3")))
+LIBRARY_FETCH_COVERS = _env_bool("LIBRARY_FETCH_COVERS")
+LIBRARY_AUTO_ENRICH = _env_bool("LIBRARY_AUTO_ENRICH", "false")  # background enrich on plays *after* first discovery; first-time library additions always enrich for artwork/metadata
+LIBRARY_EMBED_METADATA = _env_bool("LIBRARY_EMBED_METADATA")
 YOUTUBE_URL_CACHE_TTL_SEC = max(60, int(get_config_value("YOUTUBE_URL_CACHE_TTL_SEC", dotenv_values, "1800")))
+
+GENIUS_CLIENT_ID = get_config_value("GENIUS_CLIENT_ID", dotenv_values, "")
+GENIUS_CLIENT_SECRET = get_config_value("GENIUS_CLIENT_SECRET", dotenv_values, "")
+GENIUS_ACCESS_TOKEN = get_config_value("GENIUS_ACCESS_TOKEN", dotenv_values, "")
+
+if GENIUS_ACCESS_TOKEN:
+    logger.info("Genius API configured (GENIUS_ACCESS_TOKEN present) — will enrich artwork + song links via api.genius.com")
+elif GENIUS_CLIENT_ID and GENIUS_CLIENT_SECRET:
+    logger.info("Genius client_id/secret present (ACCESS_TOKEN recommended for direct API use)")
+
+GENIUS_ENABLED = bool(GENIUS_ACCESS_TOKEN)
 
 FFMPEG_LOCAL_OPTIONS = _build_ffmpeg_options(for_streaming=False)
 

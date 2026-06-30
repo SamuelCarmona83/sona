@@ -10,8 +10,14 @@ from urllib.parse import urlparse
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "web"))
+sys.path.insert(0, str(ROOT))  # for src.*
 
 from dedupe_library import analyze, apply, resolve_cache_dir  # noqa: E402
+
+# Lazy to avoid import side effects until needed
+def _get_enrich_fns():
+    from src.library import scan_and_enrich_library, get_stats  # noqa: E402
+    return scan_and_enrich_library, get_stats
 
 CACHE_DIRS = (ROOT / ".cache", ROOT / "spotify_cache")
 SKIP_SUFFIXES = {".part", ".ytdl"}
@@ -71,6 +77,22 @@ class ExplorerHandler(SimpleHTTPRequestHandler):
                 return
             self._send_json(analyze(cache_dir))
             return
+        if path == "/api/library/enrich-preview":
+            try:
+                scan, getst = _get_enrich_fns()
+                # Preview is cheap: report current state + how many could benefit
+                st = getst()
+                idx = {}  # we don't want to import full index here; use stats
+                # Suggest based on missing artwork (primary goal of the enrichment system)
+                missing_artwork = max(0, st.get("total_indexed", 0) - st.get("with_cover", 0))
+                self._send_json({
+                    "stats": st,
+                    "suggest_enrich": missing_artwork,
+                    "note": "POST /api/library/enrich to run (targets tracks without cover_url using Spotify/Genius/Last.fm)",
+                })
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=500)
+            return
         super().do_GET()
 
     def do_POST(self):
@@ -82,6 +104,19 @@ class ExplorerHandler(SimpleHTTPRequestHandler):
                 return
             try:
                 result = apply(cache_dir, dry_run=False)
+                self._send_json(result)
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=500)
+            return
+        if path == "/api/library/enrich":
+            try:
+                scan, _ = _get_enrich_fns()
+                # Run limited autonomous pass (safe batch size)
+                import asyncio
+                result = asyncio.run(scan(max_items=100, force=False))
+                # Also return fresh stats
+                _, getst = _get_enrich_fns()
+                result["stats_after"] = getst()
                 self._send_json(result)
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=500)

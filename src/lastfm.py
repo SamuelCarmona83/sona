@@ -3,6 +3,8 @@
 Provides fallback track discovery using LastFM's free API (no auth required).
 Caches results for 24h to minimize API calls.
 """
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
@@ -235,4 +237,54 @@ async def get_artist_info(artist_name: str) -> dict | None:
 
     _set_cache(cache_key, info)
     logger.debug(f"lastfm: got info for artist '{artist_name}' with tags {tags}")
+    return info
+
+
+async def get_album_info(artist: str, album: str) -> dict | None:
+    """Get album info from Last.fm including images (for official-ish artwork fallback).
+
+    Return dict with keys: name, artist, image (url), tags, url or None.
+    """
+    if not artist or not album:
+        return None
+
+    cache_key = f"album_info:{artist}:{album}"
+    cached = _get_cached(cache_key)
+    if cached is not None:
+        return cached
+
+    result = await _lastfm_request(
+        "album.getInfo",
+        {"artist": artist, "album": album},
+    )
+
+    alb = result.get("album")
+    if not alb:
+        return None
+
+    tags = []
+    for t in (alb.get("tags", {}).get("tag") or [])[:5]:
+        name = t.get("name", "").strip()
+        if name:
+            tags.append(name)
+
+    images = alb.get("image") or []
+    # Use largest available (Last.fm returns multiple sizes)
+    image_url = ""
+    for im in reversed(images):  # last usually largest
+        u = im.get("#text", "")
+        if u:
+            image_url = u
+            break
+
+    info = {
+        "name": alb.get("name", album),
+        "artist": alb.get("artist", artist),
+        "image": image_url,
+        "tags": tags,
+        "url": alb.get("url", ""),
+    }
+
+    _set_cache(cache_key, info)
+    logger.debug(f"lastfm: got album info for '{artist} - {album}' (image={bool(image_url)})")
     return info

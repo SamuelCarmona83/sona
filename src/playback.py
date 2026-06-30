@@ -154,7 +154,7 @@ def _resolve_display_artist(title: str, artist: str) -> str:
     if " - " in title or " · " in title:
         parts = title.replace(" · ", " - ").split(" - ")
         if len(parts) >= 2:
-            return parts[-1].strip()
+            return parts[0].strip()  # artist is first part in "Artist - Title"
     return artist
 
 
@@ -179,6 +179,28 @@ def _build_v2_payload(guild_id: int) -> dict:
     has_track = bool(track)
     accent = 0x808080 if paused else 0x1DB954
 
+    if track:
+        # Always overlay the latest artwork from the library index.
+        # This ensures that if enrichment (Genius/Spotify cover) happened after
+        # play started (background), the embed will use the good 1:1 artwork
+        # instead of the original YT thumbnail.
+        try:
+            from src.library import get_entry, get_best_artwork, track_id as _lib_track_id
+            ttid = track.get("track_id") or track.get("video_id")
+            if not ttid and (track.get("spotify_id") or track.get("video_id")):
+                ttid = _lib_track_id(track)
+            if ttid:
+                entry = get_entry(ttid)
+                if entry:
+                    best = get_best_artwork(ttid, entry)
+                    if best:
+                        track = dict(track)  # copy so we don't mutate the queue/session one permanently
+                        track["cover_url"] = best
+                        # also keep updating the live now_playing so future builds are good
+                        session.now_playing = track
+        except Exception:
+            pass  # non fatal, use whatever was in track
+
     if not track:
         return {
             "flags": 32768,
@@ -202,11 +224,12 @@ def _build_v2_payload(guild_id: int) -> dict:
     content_text = "\n".join(lines)
 
     children: list[dict] = []
-    if track.get("thumbnail"):
+    art = track.get("cover_url") or track.get("thumbnail") or ""
+    if art:
         children.append({
             "type": 9,
             "components": [{"type": 10, "content": content_text}],
-            "accessory": {"type": 11, "media": {"url": track["thumbnail"]}}
+            "accessory": {"type": 11, "media": {"url": art}}
         })
     else:
         children.append({"type": 10, "content": content_text})

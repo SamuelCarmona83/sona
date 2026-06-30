@@ -84,6 +84,7 @@
             <button id="libDetailed" type="button" class="px-4 py-1 text-sm font-medium text-mute hover:text-ink">detallado</button>
           </div>
           <button id="dedupeBtn" type="button" class="hidden px-4 py-2 text-sm font-medium text-danger border border-danger/30 bg-danger/10 rounded hover:bg-danger/15 disabled:opacity-50">dedupe</button>
+          <button id="enrichBtn" type="button" class="px-4 py-2 text-sm font-medium text-ink border border-black/10 bg-soft rounded hover:bg-white disabled:opacity-50">enriquecer</button>
         </div>
         <p id="countLibrary" class="text-[11px] text-ash mb-3"></p>
         <div id="gridLibrary" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4"></div>
@@ -115,7 +116,7 @@
       link: "text-ink hover:text-accent hover:underline underline-offset-2",
       empty: "py-12 text-center text-sm text-mute border border-black/10",
       card: "border border-black/10 bg-canvas overflow-hidden hover:border-mute",
-      cardThumb: "aspect-video bg-soft flex items-center justify-center overflow-hidden",
+      cardThumb: "aspect-square bg-soft flex items-center justify-center overflow-hidden",
       cardThumbImg: "w-full h-full object-cover",
       cardBody: "p-3",
       cardTitle: "text-sm font-medium text-ink line-clamp-2 mb-1",
@@ -296,9 +297,10 @@
       return d.innerHTML;
     }
 
-    function thumbHtml(thumbnail, alt) {
-      if (thumbnail) {
-        return `<img src="${escapeHtml(thumbnail)}" alt="${escapeHtml(alt)}" loading="lazy" class="${UI.cardThumbImg}">`;
+    function thumbHtml(thumbnail, alt, cover) {
+      const src = cover || thumbnail;
+      if (src) {
+        return `<img src="${escapeHtml(src)}" alt="${escapeHtml(alt)}" loading="lazy" class="${UI.cardThumbImg}">`;
       }
       return `<span class="text-3xl text-ash">♪</span>`;
     }
@@ -340,11 +342,22 @@
       return Object.entries(raw).map(([trackId, entry]) => {
         const fileSize = resolveFileSize(trackId, entry);
         const onDisk = fileSize > 0 || !!diskUsage.files[trackId];
+        const bestArtwork = entry.cover_url || entry.thumbnail || null;  // prefer remote official; local_cover is fs cache companion
         return {
           trackId,
           title: entry.title || trackId,
           artist: entry.artist || "—",
           thumbnail: entry.thumbnail,
+          cover_url: entry.cover_url || "",
+          local_cover: entry.local_cover || "",
+          best_artwork: bestArtwork,
+          album: entry.album || "",
+          release_date: entry.release_date || "",
+          genres: entry.genres || [],
+          enriched_at: entry.enriched_at || 0,
+          genius_id: entry.genius_id || null,
+          genius_url: entry.genius_url || "",
+          lyrics_state: entry.lyrics_state || "",
           yt_query: entry.yt_query,
           spotify_id: entry.spotify_id,
           video_id: entry.video_id,
@@ -462,7 +475,7 @@
       const yt = youtubeUrl(item);
       return `
         <article class="${UI.card}">
-          <div class="${UI.cardThumb}">${thumbHtml(item.thumbnail, item.title)}</div>
+          <div class="${UI.cardThumb}">${thumbHtml(item.thumbnail, item.title, item.best_artwork || item.cover_url)}</div>
           <div class="${UI.cardBody}">
             <div class="${UI.cardTitle}">${escapeHtml(item.title)}</div>
             <div class="${UI.cardMeta}">${formatDuration(item.duration)} · ${formatTimestamp(item.cached_at)}</div>
@@ -477,11 +490,12 @@
       const size = item.on_disk ? formatBytes(item.file_size_bytes) : "—";
       return `
         <article class="${UI.card}">
-          <div class="${UI.cardThumb}">${thumbHtml(item.thumbnail, item.title)}</div>
+          <div class="${UI.cardThumb}">${thumbHtml(item.thumbnail, item.title, item.best_artwork || item.cover_url)}</div>
           <div class="${UI.cardBody}">
             <div class="${UI.cardTitle}">${escapeHtml(item.title)}</div>
             <div class="${UI.cardMeta}">${escapeHtml(item.artist)} · ${item.play_count} · ${size}</div>
-            <div class="${UI.cardLinks}">${linkHtml(yt, "yt")}${sp ? " · " + linkHtml(sp, "sp") : ""}</div>
+            ${item.album ? `<div class="text-[10px] text-ash mt-0.5">${escapeHtml(item.album)}</div>` : ""}
+            <div class="${UI.cardLinks}">${linkHtml(yt, "yt")}${sp ? " · " + linkHtml(sp, "sp") : ""}${item.genius_url ? " · " + linkHtml(item.genius_url, "genius") : ""}</div>
           </div>
         </article>`;
     }
@@ -490,7 +504,7 @@
       const sp = spotifyUrl(item.spotify_id);
       return `
         <article class="${UI.card}">
-          <div class="${UI.cardThumb}">${thumbHtml(item.thumbnail, item.title)}</div>
+          <div class="${UI.cardThumb}">${thumbHtml(item.thumbnail, item.title, item.best_artwork || item.cover_url)}</div>
           <div class="${UI.cardBody}">
             <div class="${UI.cardTitle}">${escapeHtml(item.title)}</div>
             <div class="${UI.cardMeta}">${escapeHtml(item.artist)} · ${formatTimestamp(item.liked_at)}</div>
@@ -730,6 +744,32 @@
       }
     }
 
+    async function runEnrich() {
+      const btn = document.getElementById("enrichBtn");
+      const orig = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = "enriqueciendo…";
+
+      try {
+        // First get preview
+        const pre = await fetch("/api/library/enrich-preview").then(r => r.json());
+        const suggest = pre.suggest_enrich || 0;
+        if (suggest <= 0 && !confirm("No hay muchas entradas por enriquecer. ¿Ejecutar de todas formas?")) {
+          btn.disabled = false; btn.textContent = orig; return;
+        }
+        const res = await fetch("/api/library/enrich", { method: "POST" });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || "error al enriquecer");
+        showBanner(`enriquecidas: ${data.updated || 0} (de ${data.processed || 0})`, "info");
+        await reloadData();
+      } catch (err) {
+        showBanner(`[-] error enriquecer: ${err.message}`, "error");
+      } finally {
+        btn.disabled = false;
+        btn.textContent = orig;
+      }
+    }
+
     async function reloadData() {
       const [libIndex, disk, dedupe] = await Promise.all([
         loadCacheJson("library_index.json"),
@@ -835,6 +875,7 @@
     document.getElementById("libGrouped").addEventListener("click", () => setLibraryGrouped(true));
     document.getElementById("libDetailed").addEventListener("click", () => setLibraryGrouped(false));
     document.getElementById("dedupeBtn").addEventListener("click", runDedupe);
+    document.getElementById("enrichBtn").addEventListener("click", runEnrich);
     document.getElementById("searchInput").addEventListener("input", renderAll);
     document.getElementById("sortSelect").addEventListener("change", renderAll);
 

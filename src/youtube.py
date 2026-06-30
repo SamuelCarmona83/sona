@@ -12,8 +12,6 @@ try:
 except ImportError:
     _anthropic_available = False
 
-import yt_dlp
-
 from src.config import (
     YTDL_OPTIONS,
     YTDL_OPTIONS_NO_COOKIES,
@@ -76,6 +74,7 @@ async def extract_youtube_tracks(url: str) -> list[dict]:
         return []
 
     def _extract():
+        import yt_dlp  # lazy to avoid requiring it in lightweight contexts (e.g. explorer enrich)
         opts = {
             **YTDL_OPTIONS,
             "logger": _YtDlpLogger(),
@@ -277,6 +276,7 @@ def _set_cached_url(cache_key: str, candidate: dict) -> dict:
 
 
 def _extract_video_sync(video_id: str, base_opts: dict) -> dict | None:
+    import yt_dlp  # lazy
     opts = {**base_opts, "logger": _YtDlpLogger()}
     with yt_dlp.YoutubeDL(opts) as ydl:
         try:
@@ -468,6 +468,7 @@ def _parse_search_entries(query: str, info: dict | None) -> list[dict]:
 
 
 def _search_sync(query: str, base_opts: dict) -> list[dict]:
+    import yt_dlp  # lazy
     opts = {**base_opts, "logger": _YtDlpLogger()}
     with yt_dlp.YoutubeDL(opts) as ydl:
         try:

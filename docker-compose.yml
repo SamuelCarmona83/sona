@@ -26,7 +26,7 @@ services:
       LIBRARY_PATH: /app/.cache/library
 
   explorer:
-    image: python:3.12-slim
+    build: .
     restart: unless-stopped
     working_dir: /app
     ports:
@@ -34,6 +34,7 @@ services:
     volumes:
       - ./web:/app/web:ro
       - ./spotify_cache:/app/.cache
+      - ./.env:/app/.env:ro
     command: python3 web/server.py
     environment:
       EXPLORER_PORT: "8080"

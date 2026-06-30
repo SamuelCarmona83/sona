@@ -109,6 +109,7 @@ def toggle_like(guild_id: int, user_id: int, track: dict) -> bool:
             "video_id":   track.get("video_id"),
             "webpage_url": track.get("webpage_url"),
             "thumbnail":  track.get("thumbnail", ""),
+            "cover_url": track.get("cover_url", ""),
             "liked_at": time.time(),
         })
         logger.debug("likes: user=%s liked '%s' guild=%s", user_id, track.get("title"), guild_id)

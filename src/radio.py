@@ -688,6 +688,7 @@ async def fill_radio_queue(
                     "artist": info.get("artist", "Unknown"),
                     "duration": yt_info.get("duration") or 0,
                     "thumbnail": yt_info.get("thumbnail") or "",
+                    "cover_url": yt_info.get("cover_url") or "",
                     "spotify_id": info.get("spotify_id"),
                     "artist_id": info.get("artist_id"),
                     "video_id": yt_info.get("video_id"),

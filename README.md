@@ -279,6 +279,31 @@ docker compose up -d bot
 
 The dedupe pass groups by `video_id`, keeps the highest-play-count entry, merges stats, updates `likes.json` and `played_ids.json`, and deletes orphan `.m4a` files.
 
+### Metadata & Official Artwork Enrichment
+
+The library now autonomously locates official artwork (Spotify album images preferred, complemented by Genius song art + Last.fm) + rich metadata (album, release date, genres, genius links).
+
+- On play (if `LIBRARY_AUTO_ENRICH=true`) or manually, entries get `cover_url` (Spotify `i.scdn.co/...` or Genius `song_art_image_url`), `album`, etc. stored in `library_index.json`.
+- Local copies of covers (when `LIBRARY_FETCH_COVERS=true`) saved to `library/covers/{tid}.jpg`.
+- yt-dlp sidecar thumbnails + optional embedded tags when `LIBRARY_EMBED_METADATA=true`.
+- Genius support via `GENIUS_ACCESS_TOKEN` (get at https://genius.com/api-clients). Adds `genius_url`, `lyrics_state`, high-quality artwork fallback. Set `GENIUS_CLIENT_ID` / `GENIUS_CLIENT_SECRET` too if using OAuth flows later.
+
+**CLI**
+```bash
+python3 scripts/enrich_library.py           # preview
+python3 scripts/enrich_library.py --apply --max 50
+```
+
+**Discord**
+`!library enrich` (requires admin Spotify auth via `!auth`).
+
+**Explorer UI:** Biblioteca tab → **enriquecer** button (preview + run).
+
+Enrichment reuses existing Spotify auth, Last.fm fallback, and scoring. Safe, cached, and additive (never breaks playback or dedupe).
+```
+
+Also update features list mention if wanted, but ok.
+
 ## Radio modes
 
 Radio fills the queue when it drops below a threshold. On cold start, the first resolved track begins playback immediately (`early_play`) while remaining slots are filled in the background.

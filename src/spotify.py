@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import random as _random
 import asyncio
 import logging
@@ -553,3 +555,33 @@ async def _ensure_auth(ctx: commands.Context) -> bool:
         success_message="Spotify autenticado correctamente.",
         timeout_message="Tiempo agotado. Usa `!auth` para reintentar.",
     )
+
+
+# ---------------------------------------------------------------------------
+# Rich metadata helpers for library enrichment (official artwork + album info)
+# ---------------------------------------------------------------------------
+
+async def get_spotify_track_full(spotify_id: str) -> dict | None:
+    """Return rich track+album metadata suitable for library entries.
+
+    Keys: spotify_id, title, artist, album, release_date, cover_url, genres, ...
+    Thin wrapper so callers can import from src.spotify without knowing metadata.py.
+    """
+    from src.metadata import fetch_spotify_cover_and_meta
+    return await fetch_spotify_cover_and_meta(spotify_id)
+
+
+async def search_spotify_for_match(query: str, artist_hint: str | None = None) -> dict | None:
+    """Best-effort Spotify match for a free-text query (used to retro-attach ids to YT entries).
+
+    Returns minimal attach info or None. Confidence gated inside metadata helper.
+    """
+    from src.metadata import try_attach_spotify_id
+    title = query
+    artist = artist_hint or ""
+    # naive split if query looks like "Artist - Title"
+    if " - " in query and not artist_hint:
+        parts = query.split(" - ", 1)
+        if len(parts) == 2:
+            artist, title = parts[0], parts[1]
+    return await try_attach_spotify_id(title, artist)

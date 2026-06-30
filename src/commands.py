@@ -17,7 +17,7 @@ from src.config import (
     RADIO_REQUESTER_LABEL,
     sp,
 )
-from src.library import entry_to_queue_track, get_stats, record_request, search_index
+from src.library import entry_to_queue_track, get_stats, record_request, search_index, scan_and_enrich_library
 from src.playback import (
     _paused,
     maybe_notify_rate_limited,
@@ -227,6 +227,7 @@ def _queue_track_from_youtube_search(
         "artist": artist or "Unknown",
         "duration": yt_info.get("duration") or 0,
         "thumbnail": yt_info.get("thumbnail") or "",
+        "cover_url": yt_info.get("cover_url") or "",
         "spotify_id": spotify_track.get("spotify_id"),
         "artist_id": spotify_track.get("artist_id"),
         "acodec": yt_info.get("acodec", "?"),
@@ -754,6 +755,7 @@ async def search(ctx: commands.Context, *, query: str):
             "artist": artist or selected.get("uploader", "Unknown"),
             "duration": selected.get("duration") or 0,
             "thumbnail": selected.get("thumbnail") or "",
+            "cover_url": selected.get("cover_url") or "",
         }
 
         playback_active = vc.is_playing() or vc.is_paused()
@@ -1292,6 +1294,7 @@ async def help_cmd(ctx: commands.Context):
         ("⚙️ Otros", None),
         ("!library", "Muestra estadisticas de la biblioteca local cacheada."),
         ("!library search <busqueda>", "Busca en la biblioteca local y elige reproducir o iniciar radio."),
+        ("!library enrich", "Admin: enriquece metadatos + artwork oficial (Spotify/LastFM)."),
         ("!cookies", "Estado de cookies de YouTube (solo admin)."),
         ("!auth", "Autenticacion de Spotify (solo admin)."),
         ("!ping", "Verifica que el bot este vivo."),
@@ -1496,7 +1499,7 @@ async def _library_search(ctx: commands.Context, query: str) -> None:
 
 @bot.command(
     name="library",
-    help="Estadisticas de la biblioteca local. Uso: !library | !library search <busqueda>",
+    help="Estadisticas de la biblioteca local. Uso: !library | !library search <q> | !library enrich (admin)",
 )
 async def library_cmd(ctx: commands.Context, *, args: str = ""):
     parts = args.strip().split(None, 1)
@@ -1510,12 +1513,29 @@ async def library_cmd(ctx: commands.Context, *, args: str = ""):
         await _library_search(ctx, query)
         return
 
+    if subcommand == "enrich":
+        if not await _ensure_auth(ctx):
+            return
+        msg = await ctx.send("⏳ Enriqueciendo biblioteca (todas las entradas, usa covers y metadatos oficiales de Spotify/Genius/Last.fm)...")
+        try:
+            res = await scan_and_enrich_library(max_items=None, force=False)
+            stats = get_stats()
+            await msg.edit(content=(
+                f"✅ Enriquecidas **{res.get('updated',0)}** / {res.get('processed',0)} "
+                f"(errores: {res.get('errors',0)}). "
+                f"Con cover: {stats.get('with_cover',0)} · enriquecidas: {stats.get('enriched',0)}"
+            ))
+        except Exception as exc:
+            await msg.edit(content=f"❌ Error en enrich: {exc}")
+        return
+
     stats = get_stats()
     embed = discord.Embed(
         title="Biblioteca local",
         description=(
             f"**{stats['on_disk']}** canciones en disco "
-            f"({stats['size_mb']} MB) · **{stats['pinned']}** fijadas por popularidad"
+            f"({stats['size_mb']} MB) · **{stats['pinned']}** fijadas · "
+            f"covers: **{stats.get('with_cover',0)}** · enriquecidas: **{stats.get('enriched',0)}** · genius: **{stats.get('with_genius',0)}**"
         ),
         color=0x1DB954,
     )
@@ -1531,7 +1551,7 @@ async def library_cmd(ctx: commands.Context, *, args: str = ""):
             value="Aun vacia — se llena al reproducir canciones.",
             inline=False,
         )
-    embed.set_footer(text="Usa `!library search <busqueda>` para buscar y reproducir o iniciar radio")
+    embed.set_footer(text="Usa `!library search <busqueda>` o `!library enrich` (admin) para organizar metadatos")
     await ctx.send(embed=embed, delete_after=45)
 
 

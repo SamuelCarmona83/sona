@@ -169,6 +169,26 @@ def _merge_entries(items: list[tuple[str, dict, Optional[pathlib.Path]]]) -> dic
         (e.get("cached_at", 0) for _, e, _ in items),
         default=0,
     )
+    # Preserve rich metadata + artwork preferring non-empty values from best candidates
+    for field in ("album", "release_date", "cover_url", "thumbnail", "local_cover", "genius_id", "genius_url", "lyrics_state"):
+        if not merged.get(field):
+            for _, e, _ in items:
+                if e.get(field):
+                    merged[field] = e[field]
+                    break
+    # genres: union
+    all_genres: list[str] = []
+    for _, e, _ in items:
+        for g in (e.get("genres") or []):
+            if g not in all_genres:
+                all_genres.append(g)
+    if all_genres:
+        merged["genres"] = all_genres
+    # enriched_at: max
+    merged["enriched_at"] = max(
+        (e.get("enriched_at", 0) for _, e, _ in items),
+        default=0,
+    ) or None
     return merged
 
 
@@ -261,6 +281,23 @@ def apply(cache_dir: pathlib.Path, *, dry_run: bool = True) -> dict[str, Any]:
         else:
             merged.pop("file_path", None)
             merged.pop("file_size_bytes", None)
+
+        # Handle local_cover rename to match canonical tid (covers keyed by tid)
+        lc = merged.get("local_cover")
+        if lc:
+            lc_path = pathlib.Path(lc)
+            if lc_path.is_file():
+                covers_dir = library_dir.parent / "covers" if (library_dir.parent / "covers").is_dir() else library_dir / "covers"
+                target_cover = covers_dir / f"{canonical_tid}.jpg"
+                if lc_path != target_cover and lc_path.parent == target_cover.parent:
+                    try:
+                        target_cover.parent.mkdir(parents=True, exist_ok=True)
+                        if target_cover.exists():
+                            target_cover.unlink()
+                        lc_path.rename(target_cover)
+                        merged["local_cover"] = str(target_cover.resolve())
+                    except Exception:
+                        pass
 
         merged["video_id"] = video_id
         new_index[canonical_tid] = merged
