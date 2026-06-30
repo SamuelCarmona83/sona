@@ -187,6 +187,7 @@ def _track_to_info(track: dict) -> dict:
         "query":     _format_spotify_track_query(track),
         "spotify_id": track.get("id"),
         "artist_id":  (track.get("artists") or [{}])[0].get("id"),
+        "spotify_refined": True,
     }
 
 
@@ -247,7 +248,7 @@ async def _get_spotify_track_info(query: str) -> dict:
 
     Falls back to {query=query, spotify_id=None, artist_id=None} on any failure.
     """
-    fallback = {"query": query, "spotify_id": None, "artist_id": None}
+    fallback = {"query": query, "spotify_id": None, "artist_id": None, "spotify_refined": False}
     try:
         if sp is None:
             return fallback
@@ -278,6 +279,7 @@ async def _get_spotify_track_info(query: str) -> dict:
                     "query":      refined,
                     "spotify_id": best_item.get("id"),
                     "artist_id":  (best_item.get("artists") or [{}])[0].get("id"),
+                    "spotify_refined": True,
                 }
             logger.warning(
                 "spotify_refine: descartando refinamiento para '%s'; mejor candidato '%s' con score %.2f",

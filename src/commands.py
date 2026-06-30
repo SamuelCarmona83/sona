@@ -28,6 +28,7 @@ from src.playback import (
     update_player_embed,
 )
 from src.scoring import _split_query_parts
+from src.radio_browser import pick_best_station, rank_stations, search_stations, station_to_track
 from src.spotify import (
     _ensure_auth,
     _get_spotify_query,
@@ -219,6 +220,7 @@ def _queue_track_from_youtube_search(
     requester: str,
 ) -> dict:
     artist, _ = _split_query_parts(spotify_track["query"])
+    spotify_refined = bool(spotify_track.get("spotify_refined"))
     return {
         "title": yt_info["title"],
         "yt_query": spotify_track["query"],
@@ -228,8 +230,9 @@ def _queue_track_from_youtube_search(
         "duration": yt_info.get("duration") or 0,
         "thumbnail": yt_info.get("thumbnail") or "",
         "cover_url": yt_info.get("cover_url") or "",
-        "spotify_id": spotify_track.get("spotify_id"),
-        "artist_id": spotify_track.get("artist_id"),
+        "spotify_id": spotify_track.get("spotify_id") if spotify_refined else None,
+        "artist_id": spotify_track.get("artist_id") if spotify_refined else None,
+        "spotify_refined": spotify_refined,
         "video_id": yt_info.get("video_id"),
         "webpage_url": yt_info.get("webpage_url", ""),
         "acodec": yt_info.get("acodec", "?"),
@@ -402,6 +405,7 @@ def _queue_lazy_spotify_playlist(
             "requester": requester,
             "spotify_id": info.get("spotify_id"),
             "artist_id": info.get("artist_id"),
+            "spotify_refined": bool(info.get("spotify_refined", True)),
         })
 
 
@@ -660,6 +664,84 @@ async def play(ctx: commands.Context, *, query: str):
         asyncio.ensure_future(refresh_player_embed_fresh(ctx.guild, ctx.channel))
     else:
         await play_next(ctx.guild, vc, ctx.channel)
+
+
+async def _radio_station_cmd(ctx: commands.Context, query: str) -> None:
+    if not ctx.author.voice:
+        await ctx.send("Debes estar en un canal de voz para usar este comando.", delete_after=8)
+        return
+
+    cleaned_query = query.strip()
+    if not cleaned_query:
+        await ctx.send("Uso: `!fm <emisora|pais|ciudad|genero>`", delete_after=10)
+        return
+
+    voice_channel = ctx.author.voice.channel
+    msg = await ctx.send(f"📡 Buscando emisora: **{cleaned_query}**...", delete_after=40)
+
+    try:
+        stations = await asyncio.to_thread(search_stations, cleaned_query, limit=12)
+    except Exception as exc:
+        logger.warning("fm: radio-browser search failed for query=%s: %s", cleaned_query, exc)
+        await msg.edit(content="No se pudo consultar Radio Browser. Intenta de nuevo en unos segundos.")
+        return
+
+    if not stations:
+        await msg.edit(content=f"No encontre emisoras para: **{cleaned_query}**")
+        return
+
+    best_station = pick_best_station(stations, cleaned_query)
+    if not best_station:
+        await msg.edit(content=f"No encontre streams validos para: **{cleaned_query}**")
+        return
+
+    ranked = rank_stations(stations, cleaned_query)
+    top_stations = ranked[:2]
+
+    vc = await _connect_author_voice_channel(ctx, voice_channel)
+    _ensure_guild_queue(ctx.guild.id)
+
+    tracks_to_queue = [station_to_track(station, requester="📻 FM") for station in top_stations]
+    playback_active = vc.is_playing() or vc.is_paused()
+    _enqueue_user_tracks_before_radio(ctx.guild.id, tracks_to_queue, playback_active=playback_active)
+
+    station_name = best_station.get("name") or "FM Station"
+    country = best_station.get("country") or "?"
+    language = best_station.get("language") or "?"
+    codec = best_station.get("codec") or "?"
+    bitrate = best_station.get("bitrate") or 0
+    backup_msg = "\nRespaldo: se encolo 1 alternativa adicional." if len(tracks_to_queue) > 1 else ""
+    embed = discord.Embed(
+        title="📻 Emisora seleccionada",
+        description=(
+            f"**{station_name}**\n"
+            f"Pais: `{country}` | Idioma: `{language}`\n"
+            f"Codec: `{codec}` | Bitrate: `{bitrate} kbps`{backup_msg}"
+        ),
+        color=0x1DB954,
+    )
+
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+    await ctx.send(embed=embed, delete_after=20)
+
+    if not playback_active:
+        await play_next(ctx.guild, vc, ctx.channel)
+    else:
+        asyncio.ensure_future(refresh_player_embed_fresh(ctx.guild, ctx.channel))
+
+
+@bot.command(name="fm", help="Busca y reproduce una emisora AM/FM por internet. Uso: !fm <consulta>")
+async def fm_cmd(ctx: commands.Context, *, query: str = ""):
+    await _radio_station_cmd(ctx, query)
+
+
+@bot.command(name="station", help="Alias de !fm. Uso: !station <consulta>")
+async def station_cmd(ctx: commands.Context, *, query: str = ""):
+    await _radio_station_cmd(ctx, query)
 
 
 @bot.command(name="search", help="Busca canciones y te permite elegir una. Uso: !search <busqueda>")

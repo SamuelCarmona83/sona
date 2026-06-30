@@ -15,12 +15,15 @@ from src.config import (
     LIBRARY_EMBED_METADATA,
     LIBRARY_ENABLED,
     LIBRARY_FETCH_COVERS,
+    LIBRARY_LOCAL_HIT_MIN_SCORE,
+    LIBRARY_LOCAL_HIT_VALIDATION_ENABLED,
     LIBRARY_MAX_MB,
     LIBRARY_MAX_TRACKS,
     LIBRARY_MIN_PLAYS_TO_PIN,
     LIBRARY_PATH,
     YTDL_OPTIONS,
 )
+from src.scoring import _score_candidate
 
 from src.metadata import (
     fetch_genius_cover_and_meta,
@@ -103,7 +106,7 @@ def _merge_entries_into(canonical_tid: str, legacy_tid: str) -> bool:
         "spotify_id", "artist_id", "title", "artist", "thumbnail",
         "duration", "yt_query", "video_id",
         "album", "release_date", "cover_url", "genres",
-        "local_cover", "genius_id", "genius_url", "lyrics_state",
+        "local_cover", "genius_id", "genius_url", "lyrics_state", "spotify_refined",
     ):
         if not canonical.get(field) and legacy.get(field):
             canonical[field] = legacy[field]
@@ -263,6 +266,7 @@ def track_from_entry(tid: str, entry: dict, *, requester: str = "📻 Radio") ->
         "thumbnail": entry.get("thumbnail", ""),
         "spotify_id": entry.get("spotify_id"),
         "artist_id": entry.get("artist_id"),
+        "spotify_refined": bool(entry.get("spotify_refined", False)),
         "video_id": entry.get("video_id"),
         "album": entry.get("album", ""),
         "release_date": entry.get("release_date", ""),
@@ -330,6 +334,7 @@ def entry_to_queue_track(tid: str, entry: dict, *, requester: str) -> dict:
         "thumbnail": entry.get("thumbnail", ""),
         "spotify_id": entry.get("spotify_id"),
         "artist_id": entry.get("artist_id"),
+        "spotify_refined": bool(entry.get("spotify_refined", False)),
         "video_id": entry.get("video_id"),
         "album": entry.get("album", ""),
         "release_date": entry.get("release_date", ""),
@@ -358,12 +363,62 @@ def resolve_local_track(track: dict) -> dict | None:
                 path = get_local_path(tid)
     if not path:
         return None
+
+    entry = _index.get(tid) or {}
+    if not _local_hit_consistent(track, entry):
+        _clear_conflicting_spotify_metadata(tid)
+        logger.warning(
+            "library: rejected local hit for '%s' (%s) due to low query/title coherence",
+            track.get("title", tid),
+            tid,
+        )
+        return None
+
     resolved = dict(track)
     resolved["url"] = str(path)
     resolved["local"] = True
     resolved["track_id"] = tid
     logger.info("library: hit local file for '%s' (%s)", track.get("title", tid), tid)
     return resolved
+
+
+def _local_hit_consistent(track: dict, entry: dict) -> bool:
+    if not LIBRARY_LOCAL_HIT_VALIDATION_ENABLED:
+        return True
+    query = (track.get("yt_query") or track.get("title") or "").strip()
+    candidate_title = (entry.get("title") or "").strip()
+    if not query or not candidate_title:
+        return True
+    candidate = {
+        "title": candidate_title,
+        "uploader": entry.get("artist") or "",
+        "duration": entry.get("duration") or 0,
+    }
+    score = _score_candidate(query, candidate)
+    if score >= LIBRARY_LOCAL_HIT_MIN_SCORE:
+        return True
+    logger.warning(
+        "library: local hit score %.2f below threshold %.2f for query '%s' vs cached '%s'",
+        score,
+        LIBRARY_LOCAL_HIT_MIN_SCORE,
+        query,
+        candidate_title,
+    )
+    return False
+
+
+def _clear_conflicting_spotify_metadata(tid: str) -> None:
+    entry = _index.get(tid)
+    if not entry:
+        return
+    touched = False
+    for key in ("spotify_id", "artist_id", "cover_url", "local_cover", "album", "release_date"):
+        if entry.get(key):
+            entry.pop(key, None)
+            touched = True
+    entry["spotify_refined"] = False
+    if touched:
+        _save_index()
 
 
 def record_play(track: dict) -> None:
@@ -376,6 +431,7 @@ def record_play(track: dict) -> None:
         "yt_query": track.get("yt_query", track.get("title", "")),
         "spotify_id": track.get("spotify_id"),
         "artist_id": track.get("artist_id"),
+        "spotify_refined": bool(track.get("spotify_refined", False)),
         "video_id": track.get("video_id"),
         "duration": track.get("duration", 0),
         "thumbnail": track.get("thumbnail", ""),
@@ -398,6 +454,8 @@ def record_play(track: dict) -> None:
         entry["spotify_id"] = track["spotify_id"]
     if track.get("video_id") and not entry.get("video_id"):
         entry["video_id"] = track["video_id"]
+    if track.get("spotify_refined"):
+        entry["spotify_refined"] = True
     if track.get("album") and not entry.get("album"):
         entry["album"] = track["album"]
     if track.get("cover_url") and not entry.get("cover_url"):
@@ -423,6 +481,7 @@ def record_request(track: dict) -> None:
         "yt_query": track.get("yt_query", track.get("title", "")),
         "spotify_id": track.get("spotify_id"),
         "artist_id": track.get("artist_id"),
+        "spotify_refined": bool(track.get("spotify_refined", False)),
         "video_id": track.get("video_id"),
         "duration": track.get("duration", 0),
         "thumbnail": track.get("thumbnail", ""),
@@ -524,8 +583,9 @@ def _upsert_entry_from_track(
         "title": track.get("title", entry.get("title", "?")),
         "artist": track.get("artist", entry.get("artist", "Unknown")),
         "yt_query": track.get("yt_query", entry.get("yt_query", "")),
-        "spotify_id": track.get("spotify_id"),
-        "artist_id": track.get("artist_id"),
+        "spotify_id": track.get("spotify_id") if track.get("spotify_refined") else entry.get("spotify_id"),
+        "artist_id": track.get("artist_id") if track.get("spotify_refined") else entry.get("artist_id"),
+        "spotify_refined": bool(track.get("spotify_refined", entry.get("spotify_refined", False))),
         "video_id": video_id or entry.get("video_id"),
         "duration": track.get("duration", entry.get("duration", 0)),
         "thumbnail": track.get("thumbnail", entry.get("thumbnail", "")),
@@ -806,11 +866,12 @@ async def enrich_entry(tid: str) -> bool:
             await ensure_local_cover(tid, entry)
         return False
 
-    sid = entry.get("spotify_id")
+    spotify_trusted = bool(entry.get("spotify_refined", False))
+    sid = entry.get("spotify_id") if spotify_trusted else None
     meta = None
     if sid:
         meta = await fetch_spotify_cover_and_meta(sid)
-    else:
+    elif spotify_trusted:
         # Always try to attach Spotify ID using title/artist during enrich (for manual !library enrich / script / explorer button).
         # This enables full Spotify metadata + makes future auto-enrich more powerful.
         # (The LIBRARY_AUTO_ENRICH flag mainly controls whether to kick off enrich on every play for tracks without sid.)
@@ -829,6 +890,7 @@ async def enrich_entry(tid: str) -> bool:
                     entry["release_date"] = attach["release_date"]
                 updated = True
                 sid = attach["spotify_id"]
+                entry["spotify_refined"] = True
                 meta = await fetch_spotify_cover_and_meta(sid)
 
     if meta:

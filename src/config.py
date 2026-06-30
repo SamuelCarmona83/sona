@@ -268,6 +268,8 @@ LIBRARY_MIN_PLAYS_TO_PIN = max(1, int(get_config_value("LIBRARY_MIN_PLAYS_TO_PIN
 LIBRARY_FETCH_COVERS = _env_bool("LIBRARY_FETCH_COVERS")
 LIBRARY_AUTO_ENRICH = _env_bool("LIBRARY_AUTO_ENRICH", "false")  # background enrich on plays *after* first discovery; first-time library additions always enrich for artwork/metadata
 LIBRARY_EMBED_METADATA = _env_bool("LIBRARY_EMBED_METADATA")
+LIBRARY_LOCAL_HIT_VALIDATION_ENABLED = _env_bool("LIBRARY_LOCAL_HIT_VALIDATION_ENABLED")
+LIBRARY_LOCAL_HIT_MIN_SCORE = _env_float("LIBRARY_LOCAL_HIT_MIN_SCORE", 5.0)
 YOUTUBE_URL_CACHE_TTL_SEC = max(60, int(get_config_value("YOUTUBE_URL_CACHE_TTL_SEC", dotenv_values, "1800")))
 
 GENIUS_CLIENT_ID = get_config_value("GENIUS_CLIENT_ID", dotenv_values, "")
