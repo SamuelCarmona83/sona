@@ -122,6 +122,40 @@ def analyze(cache_dir: pathlib.Path) -> dict[str, Any]:
             "duplicate_tids": dup_tids,
         })
 
+    # Additional pass for spotify_id dups (entries without video_id, e.g. created before video known)
+    video_tids = {t for items in by_video.values() for t, e, p in items}
+    by_sid: dict[str, list[tuple[str, dict, Optional[pathlib.Path]]]] = {}
+    for tid, entry in index.items():
+        if tid in video_tids:
+            continue
+        sid = entry.get("spotify_id")
+        if sid:
+            p = _file_on_disk(cache_dir, entry)
+            by_sid.setdefault(sid, []).append((tid, entry, p))
+    for sid, items in by_sid.items():
+        if len(items) <= 1:
+            continue
+        canonical_tid, canonical_entry, canonical_path = _pick_canonical(items)
+        group_waste = 0
+        dup_tids = []
+        for tid, entry, path in items:
+            if tid == canonical_tid:
+                continue
+            id_remap[tid] = canonical_tid
+            if path:
+                group_waste += path.stat().st_size
+                files_to_delete.append(str(path))
+            dup_tids.append(tid)
+        wasted_bytes += group_waste
+        duplicate_groups.append({
+            "video_id": sid,  # reuse key for report
+            "title": canonical_entry.get("title", "?"),
+            "copies": len(items),
+            "wasted_bytes": group_waste,
+            "canonical_tid": canonical_tid,
+            "duplicate_tids": dup_tids,
+        })
+
     orphan_files = []
     if library_dir.is_dir():
         indexed_paths = {
@@ -301,6 +335,14 @@ def apply(cache_dir: pathlib.Path, *, dry_run: bool = True) -> dict[str, Any]:
 
         merged["video_id"] = video_id
         new_index[canonical_tid] = merged
+
+    # Apply any additional remaps (e.g. sid-based dups from analyze) to clean the index
+    for old_tid, new_tid in list(id_remap.items()):
+        if old_tid in new_index and old_tid != new_tid:
+            if new_tid not in new_index:
+                new_index[new_tid] = new_index.pop(old_tid)
+            else:
+                new_index.pop(old_tid, None)
 
     for orphan_path in preview["files_to_delete"]:
         path = pathlib.Path(orphan_path)

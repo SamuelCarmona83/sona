@@ -581,14 +581,19 @@ async def _handle_empty_playback_queue(
 
 
 async def _resolve_url(track: dict) -> dict | None:
-    if track.get("url") and track.get("local"):
-        return track
-    if track.get("url") and not is_youtube_rate_limited():
-        return track
-
+    # Always prefer local cached file if available (for library use, offline, etc.)
+    # This must be first so that even if the incoming track has a YT stream URL (from search),
+    # we override with local file path if the song is already in the library.
     local = resolve_local_track(track)
     if local:
         return local
+
+    if track.get("url") and not is_youtube_rate_limited():
+        logger.info(
+            "playback: usando stream remoto de YT para '%s' (no había copia local en librería para este tid/video_id)",
+            track.get("title", "?"),
+        )
+        return track
 
     if is_youtube_rate_limited():
         return None

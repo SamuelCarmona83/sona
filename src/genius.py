@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 import pathlib
+import re
 import time
 from datetime import datetime
 
@@ -110,6 +111,29 @@ def _normalize_name(name: str) -> str:
     return name.lower().strip().replace("’", "'").replace("–", "-")
 
 
+_GENIUS_NOISE_TERMS = {
+    "official", "video", "audio", "lyrics", "lyric", "hd", "hq", "4k", "mv", "music",
+    "visualizer", "visualiser", "clip", "version", "full", "official video", "music video",
+    "lyric video", "visual video"
+}
+
+def _clean_for_genius(text: str) -> str:
+    """Remove common noise terms from titles for better Genius search matches."""
+    if not text:
+        return ""
+    t = _normalize_name(text)
+    for term in _GENIUS_NOISE_TERMS:
+        # remove whole words or bracketed
+        t = re.sub(rf"[\(\[\s]*{re.escape(term)}[\)\]\s]*", " ", t, flags=re.IGNORECASE)
+    t = re.sub(r"\s+", " ", t).strip()
+    # also remove trailing artist if duplicated in title like "Artist - Title"
+    if " - " in t:
+        parts = t.split(" - ", 1)
+        if len(parts) > 1 and _normalize_name(parts[0]) == _normalize_name(text.split(" - ",1)[0] if " - " in text else ""):
+            t = parts[1]
+    return t.strip()
+
+
 async def search_songs(q: str, limit: int = 5) -> list[dict]:
     """Search songs on Genius. Returns list of hit dicts (with 'result' key containing song)."""
     if not q:
@@ -151,38 +175,55 @@ async def get_song_by_title_artist(title: str, artist: str, limit: int = 5) -> d
     if not title:
         return None
 
-    query = f"{title} {artist}" if artist else title
+    clean_title = _clean_for_genius(title)
+    clean_artist = _clean_for_genius(artist)
+    # if title starts with "Artist - ", strip it for search
+    if clean_artist and clean_title.lower().startswith(clean_artist.lower() + " - "):
+        clean_title = clean_title[len(clean_artist) + 3:].strip()
+    query = f"{clean_title} {clean_artist}" if clean_artist else clean_title
     hits = await search_songs(query, limit=limit)
 
     norm_title = _normalize_name(title)
     norm_artist = _normalize_name(artist)
 
-    best = None
-    best_score = 0
-
-    for hit in hits:
+    def _score_hit(hit):
         result = hit.get("result") or {}
         hit_title = _normalize_name(result.get("title", ""))
         primary = result.get("primary_artist", {})
         hit_artist = _normalize_name(primary.get("name", ""))
-
-        # Simple scoring
         score = 0
-        if norm_title and norm_title in hit_title or hit_title in norm_title:
+        if norm_title and (norm_title in hit_title or hit_title in norm_title):
             score += 50
         if norm_artist and (norm_artist in hit_artist or hit_artist in norm_artist):
             score += 40
         if result.get("lyrics_state") == "complete":
             score += 10
+        return score, result
 
+    best = None
+    best_score = 0
+
+    for hit in hits:
+        score, result = _score_hit(hit)
         if score > best_score:
             best_score = score
             best = result
 
     if best and best.get("id"):
-        # Fetch full for richer data (art, album, etc)
         full = await get_song(best["id"])
         return full or best
+
+    # Fallback: try search with cleaned title only (or artist+title) if no good match
+    if not best and clean_title:
+        fallback_hits = await search_songs(clean_title, limit=limit)
+        for hit in fallback_hits:
+            score, result = _score_hit(hit)
+            if score > best_score:
+                best_score = score
+                best = result
+        if best and best.get("id"):
+            full = await get_song(best["id"])
+            return full or best
 
     return None
 

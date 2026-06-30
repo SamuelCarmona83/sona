@@ -230,6 +230,8 @@ def _queue_track_from_youtube_search(
         "cover_url": yt_info.get("cover_url") or "",
         "spotify_id": spotify_track.get("spotify_id"),
         "artist_id": spotify_track.get("artist_id"),
+        "video_id": yt_info.get("video_id"),
+        "webpage_url": yt_info.get("webpage_url", ""),
         "acodec": yt_info.get("acodec", "?"),
         "abr": yt_info.get("abr", 0),
     }
@@ -756,6 +758,8 @@ async def search(ctx: commands.Context, *, query: str):
             "duration": selected.get("duration") or 0,
             "thumbnail": selected.get("thumbnail") or "",
             "cover_url": selected.get("cover_url") or "",
+            "video_id": selected.get("video_id"),
+            "webpage_url": selected.get("webpage_url", ""),
         }
 
         playback_active = vc.is_playing() or vc.is_paused()

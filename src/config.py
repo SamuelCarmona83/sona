@@ -235,7 +235,7 @@ def _build_ffmpeg_options(*, for_streaming: bool) -> dict:
             "options": f"-vn -bufsize 512k -strict -2{normalize_suffix}",
         }
     return {
-        "before_options": "-nostdin",
+        "before_options": "-nostdin -fflags +genpts",
         "options": f"-vn -strict -2{normalize_suffix}",
     }
 

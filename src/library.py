@@ -6,6 +6,7 @@ import logging
 import pathlib
 import random
 import re
+import subprocess
 import time
 
 from src.config import (
@@ -117,7 +118,16 @@ def _merge_entries_into(canonical_tid: str, legacy_tid: str) -> bool:
 def _resolve_index_tid(track: dict) -> str:
     tid = track_id(track)
     video_id = track_video_id(track)
+    sid = track.get("spotify_id")
     if not video_id:
+        # no video, but still try to merge any duplicate sids to this tid (if sid present)
+        changed = False
+        if sid:
+            for legacy_tid in [t for t, e in list(_index.items()) if e.get("spotify_id") == sid and t != tid]:
+                if _merge_entries_into(tid, legacy_tid):
+                    changed = True
+        if changed:
+            _save_index()
         return tid
     canonical = f"yt_{video_id}"
     changed = False
@@ -130,6 +140,11 @@ def _resolve_index_tid(track: dict) -> str:
     if tid != canonical and tid in _index:
         if _merge_entries_into(canonical, tid):
             changed = True
+    # also merge any other entries that share the spotify_id (even if they lack video_id in entry)
+    if sid:
+        for legacy_tid in [t for t, e in list(_index.items()) if e.get("spotify_id") == sid and t != canonical]:
+            if _merge_entries_into(canonical, legacy_tid):
+                changed = True
     if changed:
         _save_index()
     return canonical
@@ -152,6 +167,34 @@ def _migrate_index_duplicates() -> None:
     if changed:
         _save_index()
         logger.info("library: migrated duplicate index entries by video_id")
+
+    # Also deduplicate entries that share the same spotify_id (can happen if one was keyed by sid
+    # before video_id was known, e.g. after restarts or before download completed).
+    # Prefer the canonical yt_{video} form if present.
+    by_sid: dict[str, list[str]] = {}
+    for tid, entry in list(_index.items()):
+        sid = entry.get("spotify_id")
+        if sid:
+            by_sid.setdefault(sid, []).append(tid)
+    for sid, tids in by_sid.items():
+        if len(tids) <= 1:
+            continue
+        # Prefer yt_... or any that has video_id
+        canonical = None
+        for t in tids:
+            e = _index.get(t, {})
+            if e.get("video_id") or t.startswith("yt_"):
+                if canonical is None or (t.startswith("yt_") and not canonical.startswith("yt_")):
+                    canonical = t
+        if canonical is None:
+            canonical = tids[0]
+        for t in tids:
+            if t != canonical:
+                if _merge_entries_into(canonical, t):
+                    changed = True
+    if changed:
+        _save_index()
+        logger.info("library: migrated duplicate index entries by spotify_id")
 
 
 def _load_index() -> None:
@@ -415,6 +458,52 @@ def _file_size_bytes(path: str) -> int | None:
     return None
 
 
+def _sanitize_audio_file(path: str) -> str:
+    """Remux local audio file with FFmpeg to fix common container issues
+    (e.g. 'timescale not set' in m4a/mp4 files from certain YT uploads).
+    Uses -c copy for speed, no re-encode.
+
+    SECURITY: subprocess.run is called with a list of arguments (no shell=True),
+    so it is NOT vulnerable to command injection even if 'path' contained
+    shell metacharacters. We also explicitly validate the path is inside
+    the library directory.
+    """
+    try:
+        lib_dir = _LIBRARY_DIR.resolve()
+        p = pathlib.Path(path).resolve()
+        if not str(p).startswith(str(lib_dir)):
+            logger.warning("library: sanitize refused path outside library dir: %s", path)
+            return path
+        if not p.is_file():
+            return path
+        fixed = p.with_suffix(p.suffix + ".fix")
+        cmd = [
+            "ffmpeg", "-y", "-i", str(p),
+            "-c", "copy",
+            "-fflags", "+genpts",
+            "-movflags", "+faststart",
+            str(fixed),
+        ]
+        res = subprocess.run(
+            cmd, capture_output=True, timeout=60, text=True, shell=False
+        )
+        if res.returncode == 0 and fixed.exists() and fixed.stat().st_size > 1000:
+            p.unlink(missing_ok=True)
+            fixed.rename(p)
+            logger.info("library: sanitized audio %s (fixed timescale/container)", path)
+            return str(p)
+        else:
+            fixed.unlink(missing_ok=True)
+            if res.returncode != 0:
+                logger.debug("library: sanitize ffmpeg failed for %s: %s", path, res.stderr[:200])
+    except FileNotFoundError:
+        # ffmpeg not in PATH, skip silently
+        pass
+    except Exception as exc:
+        logger.debug("library: sanitize failed for %s: %s", path, exc)
+    return path
+
+
 def _upsert_entry_from_track(
     track: dict,
     file_path: str,
@@ -520,7 +609,9 @@ def _download_sync(video_id: str, tid: str, track: dict) -> str | None:
 
     for path in sorted(_LIBRARY_DIR.glob(f"{tid}.*")):
         if path.is_file() and path.suffix not in (".part", ".ytdl"):
-            return str(path.resolve())
+            resolved = str(path.resolve())
+            resolved = _sanitize_audio_file(resolved)
+            return resolved
     return None
 
 

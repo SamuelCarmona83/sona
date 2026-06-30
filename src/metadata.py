@@ -230,8 +230,8 @@ async def fetch_genius_cover_and_meta(title: str, artist: str) -> dict[str, Any]
     try:
         g = await _fetch_genius(title, artist)
         if not g:
-            # This can happen if no GENIUS_ACCESS_TOKEN or no good search match
-            logger.info("metadata: Genius returned no data for '%s' by '%s' (is GENIUS_ACCESS_TOKEN set in .env and bot restarted?)", title, artist)
+            # This can happen if no GENIUS_ACCESS_TOKEN, no good search match, or API returned nothing useful
+            logger.info("metadata: Genius returned no data for '%s' by '%s'", title, artist)
             return None
         # Normalize to common shape used by enrichment
         return {
