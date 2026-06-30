@@ -511,7 +511,13 @@ def _upsert_entry_from_track(
     *,
     tid: str | None = None,
 ) -> None:
-    resolved_tid = tid or _resolve_index_tid(track)
+    if tid is not None:
+        resolved_tid = tid
+    else:
+        track_for_resolution = track
+        if video_id and not track.get("video_id"):
+            track_for_resolution = {**track, "video_id": video_id}
+        resolved_tid = _resolve_index_tid(track_for_resolution)
     entry = _index.setdefault(resolved_tid, {})
     update = {
         "file_path": file_path,
@@ -643,7 +649,7 @@ async def enqueue_download(track: dict, video_ref: str | None = None) -> None:
             async with _download_sem:
                 file_path = await asyncio.to_thread(_download_sync, video_id, tid, track)
             if file_path:
-                _upsert_entry_from_track(track, file_path, video_id)
+                _upsert_entry_from_track(track, file_path, video_id, tid=tid)
                 _evict_if_needed()
                 logger.info("library: cached '%s' -> %s", track.get("title", tid), file_path)
                 # Always enrich on first addition to the local library (when a song is searched/played for the first time).

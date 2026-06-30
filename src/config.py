@@ -6,9 +6,9 @@ import spotipy
 from spotipy.oauth2 import SpotifyOAuth, SpotifyOauthError
 
 from poc_setlistfm import load_dotenv_values, get_config_value
+from src.logging_config import configure_logging
 
-logging.basicConfig(level=logging.INFO)
-logging.getLogger("discord").setLevel(logging.WARNING)
+configure_logging()
 logger = logging.getLogger(__name__)
 dotenv_values = load_dotenv_values()
 
