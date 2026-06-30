@@ -28,7 +28,7 @@ from src.playback import (
     update_player_embed,
 )
 from src.scoring import _split_query_parts
-from src.radio_browser import pick_best_station, rank_stations, search_stations, station_to_track
+from src.radio_browser import parse_search_query, pick_best_station, rank_stations, search_stations, station_to_track
 from src.spotify import (
     _ensure_auth,
     _get_spotify_query,
@@ -672,30 +672,57 @@ async def _radio_station_cmd(ctx: commands.Context, query: str) -> None:
         return
 
     cleaned_query = query.strip()
-    if not cleaned_query:
-        await ctx.send("Uso: `!fm <emisora|pais|ciudad|genero>`", delete_after=10)
+    if not cleaned_query or cleaned_query.lower() in {"help", "ayuda", "-h", "--help"}:
+        embed = discord.Embed(
+            title="📻 Ayuda FM",
+            description=(
+                "Busca y reproduce emisoras en vivo con filtros opcionales.\n\n"
+                "**Uso**\n"
+                "`!fm <consulta> [filtros]`\n"
+                "`!station <consulta> [filtros]`\n\n"
+                "**Filtros**\n"
+                "`country:<codigo|pais>`  ej: `country:US`, `country:argentina`\n"
+                "`language:<idioma>`      ej: `language:english`\n"
+                "`type:<tipo>`            ej: `type:news`, `type:rock`, `type:techno`\n"
+                "`codec:<codec>`          ej: `codec:mp3`, `codec:aac`\n\n"
+                "**Ejemplos**\n"
+                "`!fm cnn country:us`\n"
+                "`!fm techno type:techno country:de`\n"
+                "`!fm hits 1 language:french`"
+            ),
+            color=0x1DB954,
+        )
+        await ctx.send(embed=embed, delete_after=45)
+        return
+
+    parsed_query, fm_filters = parse_search_query(cleaned_query)
+    if not parsed_query and not fm_filters:
+        await ctx.send("Uso: `!fm <consulta> [country:.. language:.. type:.. codec:..]`", delete_after=12)
         return
 
     voice_channel = ctx.author.voice.channel
-    msg = await ctx.send(f"📡 Buscando emisora: **{cleaned_query}**...", delete_after=40)
+    search_label = parsed_query or "radio"
+    filter_parts = [f"{k}:{v}" for k, v in fm_filters.items()]
+    filter_suffix = f" ({', '.join(filter_parts)})" if filter_parts else ""
+    msg = await ctx.send(f"📡 Buscando emisora: **{search_label}**{filter_suffix}...", delete_after=40)
 
     try:
-        stations = await asyncio.to_thread(search_stations, cleaned_query, limit=12)
+        stations = await asyncio.to_thread(search_stations, parsed_query, limit=12, filters=fm_filters)
     except Exception as exc:
-        logger.warning("fm: radio-browser search failed for query=%s: %s", cleaned_query, exc)
+        logger.warning("fm: radio-browser search failed for query=%s filters=%s: %s", parsed_query, fm_filters, exc)
         await msg.edit(content="No se pudo consultar Radio Browser. Intenta de nuevo en unos segundos.")
         return
 
     if not stations:
-        await msg.edit(content=f"No encontre emisoras para: **{cleaned_query}**")
+        await msg.edit(content=f"No encontre emisoras para: **{search_label}**{filter_suffix}")
         return
 
-    best_station = pick_best_station(stations, cleaned_query)
+    best_station = pick_best_station(stations, parsed_query or cleaned_query)
     if not best_station:
-        await msg.edit(content=f"No encontre streams validos para: **{cleaned_query}**")
+        await msg.edit(content=f"No encontre streams validos para: **{search_label}**{filter_suffix}")
         return
 
-    ranked = rank_stations(stations, cleaned_query)
+    ranked = rank_stations(stations, parsed_query or cleaned_query)
     top_stations = ranked[:2]
 
     vc = await _connect_author_voice_channel(ctx, voice_channel)
@@ -703,7 +730,8 @@ async def _radio_station_cmd(ctx: commands.Context, query: str) -> None:
 
     tracks_to_queue = [station_to_track(station, requester="📻 FM") for station in top_stations]
     playback_active = vc.is_playing() or vc.is_paused()
-    _enqueue_user_tracks_before_radio(ctx.guild.id, tracks_to_queue, playback_active=playback_active)
+    # FM command is an explicit station switch: replace queue and jump immediately.
+    queues[ctx.guild.id] = collections.deque(tracks_to_queue)
 
     station_name = best_station.get("name") or "FM Station"
     country = best_station.get("country") or "?"
@@ -711,12 +739,13 @@ async def _radio_station_cmd(ctx: commands.Context, query: str) -> None:
     codec = best_station.get("codec") or "?"
     bitrate = best_station.get("bitrate") or 0
     backup_msg = "\nRespaldo: se encolo 1 alternativa adicional." if len(tracks_to_queue) > 1 else ""
+    switch_msg = "\nCambiando emisora ahora..." if playback_active else ""
     embed = discord.Embed(
         title="📻 Emisora seleccionada",
         description=(
             f"**{station_name}**\n"
             f"Pais: `{country}` | Idioma: `{language}`\n"
-            f"Codec: `{codec}` | Bitrate: `{bitrate} kbps`{backup_msg}"
+            f"Codec: `{codec}` | Bitrate: `{bitrate} kbps`{backup_msg}{switch_msg}"
         ),
         color=0x1DB954,
     )
@@ -728,18 +757,19 @@ async def _radio_station_cmd(ctx: commands.Context, query: str) -> None:
 
     await ctx.send(embed=embed, delete_after=20)
 
-    if not playback_active:
-        await play_next(ctx.guild, vc, ctx.channel)
-    else:
+    if playback_active:
+        vc.stop()
         asyncio.ensure_future(refresh_player_embed_fresh(ctx.guild, ctx.channel))
+    else:
+        await play_next(ctx.guild, vc, ctx.channel)
 
 
-@bot.command(name="fm", help="Busca y reproduce una emisora AM/FM por internet. Uso: !fm <consulta>")
+@bot.command(name="fm", help="Busca y reproduce una emisora AM/FM por internet. Uso: !fm <consulta> [country:.. language:.. type:.. codec:..]")
 async def fm_cmd(ctx: commands.Context, *, query: str = ""):
     await _radio_station_cmd(ctx, query)
 
 
-@bot.command(name="station", help="Alias de !fm. Uso: !station <consulta>")
+@bot.command(name="station", help="Alias de !fm. Uso: !station <consulta> [country:.. language:.. type:.. codec:..]")
 async def station_cmd(ctx: commands.Context, *, query: str = ""):
     await _radio_station_cmd(ctx, query)
 

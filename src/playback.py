@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 
 import discord
 
+from src.radio_browser import top_stations
 from src.config import (
     DJ_ANNOUNCER_ENABLED,
     DJ_FUN_FACT_INTERVAL_TRACKS,
@@ -390,8 +391,45 @@ class PlayerView(discord.ui.View):
             return
         if guild:
             self.guild_id = gid
+        session = guild_session(gid)
+        now_playing = session.now_playing
         q = guild_session(gid).queue
         if not q:
+            if now_playing and now_playing.get("is_radio_stream"):
+                try:
+                    stations = await asyncio.to_thread(top_stations, limit=10)
+                except Exception as exc:
+                    logger.warning("player_queue: failed to fetch top FM stations: %s", exc)
+                    await interaction.response.send_message(
+                        "No pude obtener el Top FM ahora. Intenta de nuevo en unos segundos.",
+                        ephemeral=True,
+                    )
+                    return
+
+                if not stations:
+                    await interaction.response.send_message("No hay estaciones Top FM disponibles ahora.", ephemeral=True)
+                    return
+
+                lines = []
+                for i, station in enumerate(stations[:10], 1):
+                    name = station.get("name", "?")
+                    country = station.get("country") or "?"
+                    votes = station.get("votes", 0)
+                    clicks = station.get("clickcount", 0)
+                    lines.append(f"`{i}.` **{name}** — {country} | 👍 {votes} | 🔥 {clicks}")
+
+                embed = discord.Embed(
+                    title="📻 Top estaciones FM",
+                    description=(
+                        "La cola esta vacia porque estas en modo stream en vivo.\n"
+                        "Usa `!fm <nombre>` para cambiar de estación:\n\n"
+                        + "\n".join(lines)
+                    ),
+                    color=0x1DB954,
+                )
+                await interaction.response.send_message(embed=embed, ephemeral=True)
+                return
+
             await interaction.response.send_message("La cola esta vacia.", ephemeral=True)
             return
         lines = []
@@ -581,6 +619,12 @@ async def _handle_empty_playback_queue(
 
 
 async def _resolve_url(track: dict) -> dict | None:
+    if track.get("is_radio_stream"):
+        if track.get("url"):
+            logger.info("playback: usando stream en vivo para '%s'", track.get("title", "?"))
+            return track
+        return None
+
     # Always prefer local cached file if available (for library use, offline, etc.)
     # This must be first so that even if the incoming track has a YT stream URL (from search),
     # we override with local file path if the song is already in the library.
@@ -804,7 +848,8 @@ async def play_next(guild: discord.Guild, vc: discord.VoiceClient, text_channel)
 
     from src import radio as _radio
     asyncio.ensure_future(_radio.record_played(guild.id, track))
-    record_play(track)
+    if not track.get("is_radio_stream"):
+        record_play(track)
 
     if _radio.is_radio_active(guild.id) and len(session.queue) < RADIO_QUEUE_REFILL_THRESHOLD:
         asyncio.ensure_future(_radio.fill_radio_queue(guild, vc, text_channel))
@@ -843,7 +888,7 @@ async def play_next(guild: discord.Guild, vc: discord.VoiceClient, text_channel)
         await play_next(guild, vc, text_channel)
         return
 
-    if not track.get("local"):
+    if not track.get("local") and not track.get("is_radio_stream"):
         try:
             await enqueue_download(
                 track,
