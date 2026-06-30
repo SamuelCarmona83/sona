@@ -12,6 +12,7 @@ A Discord music bot that plays tracks from Spotify URLs, YouTube links, and plai
 - [Project structure](#project-structure)
 - [Data explorer](#data-explorer)
 - [Local library](#local-library)
+- [Testing and CI](#testing-and-ci)
 - [Radio modes](#radio-modes)
 - [Troubleshooting](#troubleshooting)
 - [License](#license)
@@ -303,6 +304,16 @@ Enrichment reuses existing Spotify auth, Last.fm fallback, and scoring. Safe, ca
 ```
 
 Also update features list mention if wanted, but ok.
+
+## Testing and CI
+
+Run tests locally:
+
+```bash
+BOT_TOKEN=test-token python3 -m unittest discover -s tests -p "test_*.py" -v
+```
+
+CI runs on every push and pull request via [`.github/workflows/ci.yml`](.github/workflows/ci.yml), installing `requirements.txt` and running the same test suite.
 
 ## Radio modes
 
