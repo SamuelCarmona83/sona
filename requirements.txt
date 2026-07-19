@@ -6,3 +6,4 @@ anthropic>=0.25.0
 edge-tts>=6.1.0
 requests>=2.31.0
 browser-cookie3>=0.19.1
+shazamio>=0.6.0

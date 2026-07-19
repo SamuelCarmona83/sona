@@ -17,6 +17,8 @@ from src.config import (
     RADIO_REQUESTER_LABEL,
     sp,
 )
+
+_startup_announced = False
 from src.library import entry_to_queue_track, get_stats, record_request, search_index, scan_and_enrich_library
 from src.playback import (
     _paused,
@@ -197,9 +199,19 @@ async def _connect_author_voice_channel(
 ) -> discord.VoiceClient:
     vc = ctx.guild.voice_client
     if vc is None:
-        return await voice_channel.connect()
+        try:
+            return await voice_channel.connect(timeout=20.0)
+        except asyncio.TimeoutError:
+            raise RuntimeError("Timeout conectando al canal de voz.") from None
+        except Exception as exc:
+            raise RuntimeError(f"Error conectando al canal de voz: {exc}") from None
     if vc.channel != voice_channel:
-        await vc.move_to(voice_channel)
+        try:
+            await vc.move_to(voice_channel, timeout=20.0)
+        except asyncio.TimeoutError:
+            raise RuntimeError("Timeout moviendo al canal de voz.") from None
+        except Exception as exc:
+            raise RuntimeError(f"Error moviendo al canal de voz: {exc}") from None
     return vc
 
 
@@ -269,9 +281,19 @@ async def _switch_to_fm_station(
 
     vc = guild.voice_client
     if vc is None:
-        vc = await member.voice.channel.connect()
+        try:
+            vc = await member.voice.channel.connect(timeout=15.0, reconnect=True)
+        except asyncio.TimeoutError:
+            raise ValueError("No pude conectarme al canal de voz dentro del tiempo límite (15s). Revisa permisos o la conexión de voz de Discord.") from None
+        except Exception as exc:
+            raise ValueError(f"Error al conectar al canal de voz: {exc}") from None
     elif vc.channel != member.voice.channel:
-        await vc.move_to(member.voice.channel)
+        try:
+            await vc.move_to(member.voice.channel, timeout=15.0)
+        except asyncio.TimeoutError:
+            raise ValueError("Timeout al moverme al canal de voz. Intenta de nuevo.") from None
+        except Exception as exc:
+            raise ValueError(f"Error al mover al canal de voz: {exc}") from None
 
     tracks = [station_to_track(station, requester="📻 FM")]
     if backup_station:
@@ -368,8 +390,10 @@ async def _publish_voice_channel_status(guild: discord.Guild, status: str) -> No
 
 def _reset_guild_playback_state(guild_id: int) -> None:
     from src import radio as _radio
+    from src.playback import stop_fm_recognition
 
     _radio.set_radio_active(guild_id, False)
+    stop_fm_recognition(guild_id)
     queues[guild_id] = collections.deque()
     now_playing_info[guild_id] = None
     _paused[guild_id] = False
@@ -502,17 +526,20 @@ async def on_ready():
     start_cookie_watchdog()
     logger.info(f"Bot conectado como {bot.user} (id={bot.user.id})")
     logger.info(f"Guilds: {[g.name for g in bot.guilds]}")
-    try:
-        channel = await bot.fetch_channel(BOT_TEXT_CHANNEL_ID)
-        embed = discord.Embed(
-            title="🎵 Bot de música listo",
-            description="Usa `!play <canción>` para reproducir.",
-            color=0x1DB954
-        )
-        await channel.send(embed=embed)
-        logger.info("Mensaje de startup enviado correctamente.")
-    except Exception as e:
-        logger.error(f"No se pudo enviar el mensaje de startup: {e}")
+    global _startup_announced
+    if not _startup_announced:
+        try:
+            channel = await bot.fetch_channel(BOT_TEXT_CHANNEL_ID)
+            embed = discord.Embed(
+                title="🎵 Bot de música listo",
+                description="Usa `!play <canción>` para reproducir.",
+                color=0x1DB954
+            )
+            await channel.send(embed=embed)
+            logger.info("Mensaje de startup enviado correctamente.")
+            _startup_announced = True
+        except Exception as e:
+            logger.error(f"No se pudo enviar el mensaje de startup: {e}")
 
 
 @bot.event
@@ -542,6 +569,14 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
             return
     except ImportError:
         pass
+
+    # Handle voice connect timeouts and similar transient voice errors gracefully
+    cause_str = str(cause).lower()
+    if isinstance(cause, (asyncio.TimeoutError, TimeoutError, RuntimeError)) and any(k in cause_str for k in ("timeout", "conect", "voice", "mover", "canal de voz")):
+        await ctx.send("No pude unirme o moverme al canal de voz a tiempo. Intenta de nuevo en unos segundos.")
+        logger.warning("[ERROR] %s: voice/timeout error: %s", ctx.command, cause)
+        return
+
     await ctx.send(f"Error inesperado: `{error}`")
     logger.error(f"[ERROR] {ctx.command}: {error}")
 
@@ -569,7 +604,10 @@ async def on_voice_state_update(
         before.channel.id,
         member.guild.id,
     )
+    from src.playback import stop_fm_recognition
+
     _radio.set_radio_active(member.guild.id, False)
+    stop_fm_recognition(member.guild.id)
     queues[member.guild.id] = collections.deque()
     now_playing_info[member.guild.id] = None
     _paused[member.guild.id] = False
@@ -810,7 +848,17 @@ async def _radio_station_cmd(ctx: commands.Context, query: str) -> None:
     msg = await ctx.send(f"📡 Buscando emisora: **{search_label}**{filter_suffix}...", delete_after=40)
 
     try:
-        stations = await asyncio.to_thread(search_stations, parsed_query, limit=120, filters=fm_filters)
+        stations = await asyncio.wait_for(
+            asyncio.to_thread(search_stations, parsed_query, limit=120, filters=fm_filters),
+            timeout=45.0,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("fm: radio-browser search timed out for query=%s filters=%s", parsed_query, fm_filters)
+        try:
+            await msg.edit(content="La búsqueda de emisoras tardó demasiado. Intenta de nuevo.")
+        except Exception:
+            pass
+        return
     except Exception as exc:
         logger.warning("fm: radio-browser search failed for query=%s filters=%s: %s", parsed_query, fm_filters, exc)
         await msg.edit(content="No se pudo consultar Radio Browser. Intenta de nuevo en unos segundos.")
@@ -1109,6 +1157,22 @@ async def now_playing_cmd(ctx: commands.Context):
     current = now_playing_info.get(ctx.guild.id)
     if not current:
         await ctx.send("No hay nada reproduciendose.")
+        return
+    if current.get("is_radio_stream"):
+        rec_title = (current.get("recognized_title") or "").strip()
+        rec_artist = (current.get("recognized_artist") or "").strip()
+        station = current.get("title", "FM")
+        if rec_title:
+            song = f"{rec_artist} — {rec_title}" if rec_artist else rec_title
+            await ctx.send(
+                f"\U0001f4fb **{station}**\n\U0001f3b5 Ahora suena: **{song}**",
+                delete_after=20,
+            )
+            return
+        await ctx.send(
+            f"\U0001f4fb **{station}** — identificando canción…",
+            delete_after=15,
+        )
         return
     await ctx.send(f"\U0001f3b5 **{current['title']}** — pedido por {current['requester']}", delete_after=15)
 

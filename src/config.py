@@ -245,8 +245,8 @@ FFMPEG_OPTIONS = _build_ffmpeg_options(for_streaming=True)
 SEARCH_RESULT_COUNT = 5
 MIN_SEARCH_SCORE = 6.0
 RADIO_REQUESTER_LABEL = "📻 Radio"
-RADIO_QUEUE_REFILL_THRESHOLD = 3
-RADIO_QUEUE_TARGET_SIZE = 5
+RADIO_QUEUE_REFILL_THRESHOLD = 4
+RADIO_QUEUE_TARGET_SIZE = 8
 LLM_SCORE_MARGIN = 4.5
 LLM_RANKING_TIMEOUT = 8.0
 LLM_ALBUM_TRACK_RANKING_LIMIT = 3
@@ -258,6 +258,12 @@ DJ_VOICE = get_config_value("DJ_VOICE", dotenv_values, "es-MX-DaliaNeural")
 DJ_ANNOUNCE_COOLDOWN_SEC = int(get_config_value("DJ_ANNOUNCE_COOLDOWN", dotenv_values, "120"))
 DJ_VOLUME = get_config_value("DJ_VOLUME", dotenv_values, "1.2")
 DJ_FUN_FACT_INTERVAL_TRACKS = int(get_config_value("DJ_FUN_FACT_INTERVAL", dotenv_values, "5"))
+
+# FM stream song recognition (shazamio sidecar sampler)
+FM_RECOGNIZER_ENABLED = _env_bool("FM_RECOGNIZER_ENABLED")
+FM_RECOGNIZER_INTERVAL_SEC = max(10.0, _env_float("FM_RECOGNIZER_INTERVAL_SEC", 30.0))
+FM_RECOGNIZER_SAMPLE_SEC = max(3.0, min(15.0, _env_float("FM_RECOGNIZER_SAMPLE_SEC", 8.0)))
+FM_RECOGNIZER_ANNOUNCE = _env_bool("FM_RECOGNIZER_ANNOUNCE")
 
 LIBRARY_ENABLED = _env_bool("LIBRARY_ENABLED")
 LIBRARY_PATH = get_config_value("LIBRARY_PATH", dotenv_values, ".cache/library")

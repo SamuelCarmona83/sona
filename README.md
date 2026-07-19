@@ -24,6 +24,7 @@ A Discord music bot that plays tracks from Spotify URLs, YouTube links, and plai
 - **Smart matching** — Heuristic scoring with optional Claude tie-breaking when top candidates are close; search result caching to reduce API spend.
 - **Local library** — Auto-caches played audio to disk; stable track IDs (`spotify_id` → `yt_{video_id}` → SHA-256 fallback); offline radio when YouTube is blocked.
 - **24/7 radio** — Mood-based genre seeds, Spotify taste profiles, liked-track priority, DJ announcer (Edge-TTS), and fast-start playback (first track plays while the queue keeps filling).
+- **FM live radio** — Search and stream internet stations via Radio Browser; optional **real-time song ID** with shazamio while a station is playing.
 - **Data explorer** — Lightweight web UI to inspect cached metadata, library usage, and run deduplication.
 
 ## Requirements
@@ -124,6 +125,12 @@ NORMALIZE_AUDIO=true               # FFmpeg loudness normalization
 DJ_ANNOUNCER_ENABLED=true
 LIBRARY_ENABLED=true
 LIBRARY_AUTO_DOWNLOAD=true
+
+# FM song recognition (shazamio)
+FM_RECOGNIZER_ENABLED=true
+FM_RECOGNIZER_INTERVAL_SEC=30
+FM_RECOGNIZER_SAMPLE_SEC=8
+FM_RECOGNIZER_ANNOUNCE=true
 ```
 
 Docker Compose overrides several values for the container environment; see [`docker-compose.yml`](docker-compose.yml).
@@ -170,6 +177,17 @@ Commands are prefixed with `!` and must be sent in the configured text channel.
 | `!radio profile off` | Fall back to guild play history |
 | `!mood <name>` | Set genre mood for recommendations |
 
+### FM (internet radio)
+
+| Command | Description |
+|---------|-------------|
+| `!fm <query> [filters]` | Search Radio Browser and play a live station |
+| `!station <query>` | Alias of `!fm` |
+| `!fm fav` / `!fm id:<n>` | List or play FM favorites |
+| `!np` | Shows the station **and** the recognized song (when available) |
+
+While FM is playing, the bot periodically samples the stream with FFmpeg and identifies the current track via **shazamio** (unofficial Shazam client; no API key). Matches appear on the player embed and optionally as a short chat message when the song changes. Disable with `FM_RECOGNIZER_ENABLED=false`.
+
 ### Library and likes
 
 | Command | Description |
@@ -208,6 +226,9 @@ src/
 ├── spotify.py        # URL parsing, OAuth, recommendations
 ├── scoring.py        # Heuristic ranking + LLM tie-break
 ├── radio.py          # Radio fill engine, moods, play history
+├── radio_browser.py  # FM station search (Radio Browser API)
+├── fm_favorites.py   # Per-guild FM station favorites
+├── fm_recognizer.py  # Real-time FM song ID (shazamio + FFmpeg sample)
 ├── library.py        # Local cache, stable IDs, downloads
 ├── likes.py          # Per-user likes and radio priority
 ├── spotify_taste.py  # Taste profile builder

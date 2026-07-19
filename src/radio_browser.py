@@ -1,6 +1,8 @@
 import difflib
 import logging
+import random
 import re
+import time
 from typing import Any, Optional
 
 import requests
@@ -8,7 +10,128 @@ import requests
 logger = logging.getLogger(__name__)
 
 RADIO_BROWSER_SEARCH_URL = "https://de1.api.radio-browser.info/json/stations/search"
-DEFAULT_TIMEOUT_SEC = 8
+DEFAULT_TIMEOUT_SEC = 12
+
+# User agent recommended by radio-browser.info project.
+USER_AGENT = "spoty-scanner-discord (+https://github.com/spoty-scanner)"
+
+# Fallback mirrors (used if discovery fails). Only de1 is typically live at any time.
+_RADIO_BROWSER_FALLBACK_BASES = [
+    "https://de1.api.radio-browser.info",
+]
+
+# Cached discovery result
+_server_bases_cache: Optional[list[str]] = None
+_server_bases_ts: float = 0.0
+_SERVER_CACHE_TTL_SEC = 3600
+
+
+def _safe_status_code(resp: Any) -> int:
+    """Return integer status_code from real response or test Mock (which never misses attrs)."""
+    try:
+        val = getattr(resp, "status_code", None)
+        if isinstance(val, int):
+            return val
+        if val is None:
+            return 200
+        return int(val)
+    except Exception:
+        return 200
+
+
+def _get_radio_browser_bases() -> list[str]:
+    """Return list of active radio-browser API base URLs (with discovery + cache)."""
+    global _server_bases_cache, _server_bases_ts
+    now = time.time()
+    if _server_bases_cache and (now - _server_bases_ts) < _SERVER_CACHE_TTL_SEC:
+        return _server_bases_cache
+
+    try:
+        resp = requests.get(
+            "https://all.api.radio-browser.info/json/servers",
+            headers={"User-Agent": USER_AGENT},
+            timeout=6,
+        )
+        if _safe_status_code(resp) >= 400:
+            raise requests.exceptions.HTTPError("bad status in discovery")
+        resp.raise_for_status()
+        j = resp.json()
+        data = j if isinstance(j, list) else []
+        bases: list[str] = []
+        for item in data:
+            if isinstance(item, dict):
+                name = item.get("name")
+                if isinstance(name, str) and name and "." in name:
+                    bases.append(f"https://{name}")
+        if bases:
+            _server_bases_cache = bases
+            _server_bases_ts = now
+            return _server_bases_cache
+    except Exception as exc:
+        logger.debug("radio_browser: server discovery failed, using fallbacks: %s", exc)
+
+    _server_bases_cache = list(_RADIO_BROWSER_FALLBACK_BASES)
+    _server_bases_ts = now
+    return _server_bases_cache
+
+
+def _http_get(
+    path: str,
+    *,
+    params: Optional[dict] = None,
+    timeout: int = DEFAULT_TIMEOUT_SEC,
+    max_retries: int = 3,
+) -> requests.Response:
+    """Perform GET against a radio-browser mirror, with server failover + retries for transients."""
+    bases = _get_radio_browser_bases() or list(_RADIO_BROWSER_FALLBACK_BASES)
+    order = list(bases)
+    random.shuffle(order)
+
+    last_exc: Optional[Exception] = None
+    tried: list[str] = []
+
+    for base in order:
+        url = f"{base}{path}"
+        tried.append(base)
+        for attempt in range(max_retries):
+            try:
+                resp = requests.get(
+                    url,
+                    params=params,
+                    headers={"User-Agent": USER_AGENT},
+                    timeout=timeout,
+                )
+                status_code = _safe_status_code(resp)
+                if status_code >= 500:
+                    # treat as transient for this server
+                    raise requests.exceptions.HTTPError(f"server {status_code}", response=resp)
+                resp.raise_for_status()
+                return resp
+            except requests.exceptions.HTTPError as exc:
+                resp_for_status = getattr(exc, "response", None)
+                status = _safe_status_code(resp_for_status) if resp_for_status is not None else 0
+                if 400 <= status < 500:
+                    # client errors (bad request etc) — fail fast, no failover
+                    raise
+                last_exc = exc
+            except Exception as exc:
+                # SSL, connection, timeout, read errors etc.
+                last_exc = exc
+
+            if attempt < max_retries - 1:
+                # small backoff, jittered a bit
+                delay = 0.3 * (2 ** attempt) + random.uniform(0, 0.25)
+                time.sleep(delay)
+
+    # Exhausted all servers and retries
+    logger.warning(
+        "radio_browser: exhausted servers for path=%s tried=%s last_err=%s",
+        path, tried, last_exc,
+    )
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("radio_browser: no servers available")
+
 
 _COUNTRY_HINTS = {
     "us": "US",
@@ -176,8 +299,7 @@ def _search_once(
         params["language"] = applied_filters["language"]
     if applied_filters.get("tag"):
         params["tag"] = applied_filters["tag"]
-    response = requests.get(RADIO_BROWSER_SEARCH_URL, params=params, timeout=timeout_sec)
-    response.raise_for_status()
+    response = _http_get("/json/stations/search", params=params, timeout=timeout_sec)
     payload = response.json()
     if not isinstance(payload, list):
         return []
@@ -273,8 +395,7 @@ def top_stations(*, limit: int = 10, timeout_sec: int = DEFAULT_TIMEOUT_SEC) -> 
         "order": "clicktimestamp",
         "reverse": "true",
     }
-    response = requests.get(RADIO_BROWSER_SEARCH_URL, params=params, timeout=timeout_sec)
-    response.raise_for_status()
+    response = _http_get("/json/stations/search", params=params, timeout=timeout_sec)
     payload = response.json()
     if not isinstance(payload, list):
         return []
@@ -343,13 +464,12 @@ def get_station_by_uuid(station_uuid: str, *, timeout_sec: int = DEFAULT_TIMEOUT
         return None
 
     candidates: list[dict] = []
-    for url, params in (
-        ("https://de1.api.radio-browser.info/json/stations/byuuid", {"uuid": sid}),
-        (f"https://de1.api.radio-browser.info/json/stations/byuuid/{sid}", None),
+    for pth, prm in (
+        ("/json/stations/byuuid", {"uuid": sid}),
+        (f"/json/stations/byuuid/{sid}", None),
     ):
         try:
-            response = requests.get(url, params=params, timeout=timeout_sec)
-            response.raise_for_status()
+            response = _http_get(pth, params=prm, timeout=timeout_sec)
             payload = response.json()
             if isinstance(payload, list):
                 candidates.extend(_normalize_station(item) for item in payload if isinstance(item, dict))
@@ -363,8 +483,7 @@ def get_station_by_uuid(station_uuid: str, *, timeout_sec: int = DEFAULT_TIMEOUT
 
 
 def list_countries(*, timeout_sec: int = DEFAULT_TIMEOUT_SEC) -> list[dict]:
-    response = requests.get("https://de1.api.radio-browser.info/json/countries", timeout=timeout_sec)
-    response.raise_for_status()
+    response = _http_get("/json/countries", timeout=timeout_sec)
     payload = response.json()
     if not isinstance(payload, list):
         return []

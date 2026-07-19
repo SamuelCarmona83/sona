@@ -15,6 +15,7 @@ from src.config import (
     FFMPEG_LOCAL_OPTIONS,
     FFMPEG_OPTIONS,
     RADIO_QUEUE_REFILL_THRESHOLD,
+    RADIO_QUEUE_TARGET_SIZE,
     RADIO_REQUESTER_LABEL,
 )
 from src.dj_announcer import get_buenos_aires_hour
@@ -44,6 +45,7 @@ class GuildPlaybackSession:
     tracks_since_dj_comment: int = 0
     player_embed_recreated_at: float = 0.0
     last_rate_limit_notify: float = 0.0
+    playback_busy: bool = False
 
     def embed_recreate_due(self) -> bool:
         return time.time() - self.player_embed_recreated_at >= PLAYER_EMBED_RECREATE_INTERVAL_SEC
@@ -219,13 +221,26 @@ def _build_v2_payload(guild_id: int) -> dict:
         f"## {title_line}",
         f"{duration_str} · por {track['requester']}",
     ]
+    if track.get("is_radio_stream"):
+        rec_title = (track.get("recognized_title") or "").strip()
+        rec_artist = (track.get("recognized_artist") or "").strip()
+        if rec_title:
+            if rec_artist:
+                lines.insert(1, f"♪ {rec_artist} — {rec_title}")
+            else:
+                lines.insert(1, f"♪ {rec_title}")
     if queue_size > 0:
         next_title = list(q)[0].get("title", "?")[:80]
         lines.append(f"Siguiente: {next_title}")
     content_text = "\n".join(lines)
 
     children: list[dict] = []
-    art = track.get("cover_url") or track.get("thumbnail") or ""
+    art = (
+        track.get("recognized_cover_url")
+        or track.get("cover_url")
+        or track.get("thumbnail")
+        or ""
+    )
     if art:
         children.append({
             "type": 9,
@@ -366,6 +381,7 @@ class PlayerView(discord.ui.View):
             await interaction.response.send_message("No pude encontrar este servidor.", ephemeral=True)
             return
         self.guild_id = gid
+        stop_fm_recognition(gid)
         guild_session(gid).reset_playback()
         vc = guild.voice_client
         if vc:
@@ -621,12 +637,22 @@ async def _handle_empty_playback_queue(
 ) -> None:
     from src import radio as _radio
 
+    stop_fm_recognition(guild.id)
     if _radio.is_radio_active(guild.id):
         asyncio.ensure_future(_radio.fill_radio_queue(guild, vc, text_channel))
         return
     await asyncio.sleep(1)
     if guild.voice_client:
         await guild.voice_client.disconnect()
+
+
+async def _ensure_playback_continues(guild: discord.Guild, vc: discord.VoiceClient, text_channel) -> None:
+    """Deferred helper used when playback_busy to let current transition settle then retry play_next."""
+    await asyncio.sleep(0.05)
+    try:
+        await play_next(guild, vc, text_channel)
+    except Exception:
+        pass
 
 
 async def _resolve_url(track: dict) -> dict | None:
@@ -831,113 +857,212 @@ async def _resolve_dj_audio_before_track(
         return None
 
 
+def stop_fm_recognition(guild_id: int) -> None:
+    """Stop the FM song-recognition sidecar for a guild."""
+    try:
+        from src.fm_recognizer import stop_fm_recognizer
+
+        stop_fm_recognizer(guild_id)
+    except Exception as exc:
+        logger.debug("stop_fm_recognition: %s", exc)
+
+
+def start_fm_recognition(guild_id: int, track: dict, text_channel) -> None:
+    """Start continuous Shazam recognition for a live FM stream track."""
+    if not track.get("is_radio_stream"):
+        stop_fm_recognition(guild_id)
+        return
+    stream_url = track.get("url") or track.get("url_resolved") or ""
+    if not stream_url:
+        stop_fm_recognition(guild_id)
+        return
+
+    from src.fm_recognizer import start_fm_recognizer
+
+    def _is_active() -> bool:
+        session = guild_session(guild_id)
+        current = session.now_playing
+        if not current or not current.get("is_radio_stream"):
+            return False
+        if session.paused:
+            return False
+        current_url = current.get("url") or current.get("url_resolved") or ""
+        return current_url == stream_url
+
+    async def _on_match(gid: int, match: dict) -> None:
+        session = guild_session(gid)
+        current = session.now_playing
+        if not current or not current.get("is_radio_stream"):
+            return
+        updated = dict(current)
+        updated["recognized_title"] = match.get("title") or ""
+        updated["recognized_artist"] = match.get("artist") or ""
+        updated["recognized_album"] = match.get("album")
+        updated["recognized_cover_url"] = match.get("cover_url")
+        updated["recognized_shazam_url"] = match.get("shazam_url")
+        updated["recognized_at"] = match.get("recognized_at")
+        session.now_playing = updated
+
+        guild = bot.get_guild(gid)
+        channel = session.player_channel or text_channel
+        if guild is not None and channel is not None:
+            try:
+                await update_player_embed(guild, channel)
+            except Exception as exc:
+                logger.debug("fm on_match: embed update failed: %s", exc)
+        status = f"{match.get('artist', '')} — {match.get('title', '')}".strip(" —")
+        if status and guild is not None:
+            try:
+                await _update_status(guild, status[:100])
+            except Exception:
+                pass
+
+    async def _on_stale(gid: int) -> None:
+        # Keep last match visible; only clear cover-ish noise after prolonged misses.
+        logger.debug("fm_recognizer: stale misses guild=%s", gid)
+
+    start_fm_recognizer(
+        guild_id,
+        stream_url,
+        on_match=_on_match,
+        is_active=_is_active,
+        text_channel=text_channel,
+        on_stale=_on_stale,
+    )
+
+
 async def play_next(guild: discord.Guild, vc: discord.VoiceClient, text_channel):
     session = guild_session(guild.id)
-    session.cancel_prefetch()
-
-    if not session.queue:
-        session.now_playing = None
-        session.paused = False
-        await _update_status(guild, None)
-        await update_player_embed(guild, text_channel)
-        await _handle_empty_playback_queue(guild, vc, text_channel)
+    if session.playback_busy:
+        # Concurrent transition in progress (e.g. track end + error path racing); let current drain queue.
+        asyncio.create_task(_ensure_playback_continues(guild, vc, text_channel))
         return
-
-    track = session.queue.popleft()
-    track = await _resolve_url(track)
-    if not track:
-        if is_youtube_rate_limited():
-            await maybe_notify_rate_limited(guild.id, text_channel)
-            await text_channel.send("No hay copia local y YouTube está bloqueado, saltando...", delete_after=8)
-        else:
-            await text_channel.send("No se encontro en YouTube, saltando...", delete_after=5)
-        await play_next(guild, vc, text_channel)
-        return
-
-    session.now_playing = track
-    session.paused = False
-
-    from src import radio as _radio
-    asyncio.ensure_future(_radio.record_played(guild.id, track))
-    if not track.get("is_radio_stream"):
-        record_play(track)
-
-    if _radio.is_radio_active(guild.id) and len(session.queue) < RADIO_QUEUE_REFILL_THRESHOLD:
-        asyncio.ensure_future(_radio.fill_radio_queue(guild, vc, text_channel))
-
-    if session.queue:
-        session.prefetch_task = asyncio.create_task(_prefetch_next(guild.id))
-
-    prefetched_dj = session.prefetched_dj_audio
-    session.prefetched_dj_audio = None
-    session.tracks_since_dj_comment += 1
-
-    if _is_user_requested_track(track):
-        if prefetched_dj:
-            from src.dj_announcer import cleanup_dj_audio
-            cleanup_dj_audio(prefetched_dj)
-        dj_file = None
-    else:
-        dj_file = await _resolve_dj_audio_before_track(guild.id, track, prefetched_dj)
-
-    ffmpeg_opts = FFMPEG_LOCAL_OPTIONS if track.get("local") else FFMPEG_OPTIONS
+    session.playback_busy = True
     try:
-        source = discord.FFmpegOpusAudio(track["url"], **ffmpeg_opts)
-        logger.info(
-            "play_next: reproduciendo '%s' (local=%s, codec=%s, abr=%s)",
-            track["title"],
-            track.get("local", False),
-            track.get("acodec", "?"),
-            track.get("abr", "?"),
-        )
-    except Exception as e:
-        logger.warning(f"play_next: video no disponible '{track['title']}': {e}, saltando...")
-        await maybe_notify_rate_limited(guild.id, text_channel)
-        from src.youtube import _url_cache
-        from src.scoring import _normalize_text as _n
-        _url_cache.pop(_n(track.get("yt_query", "")), None)
-        await play_next(guild, vc, text_channel)
-        return
+        session.cancel_prefetch()
 
-    if not track.get("local") and not track.get("is_radio_stream"):
+        if not session.queue:
+            session.now_playing = None
+            session.paused = False
+            stop_fm_recognition(guild.id)
+            await _update_status(guild, None)
+            await update_player_embed(guild, text_channel)
+            await _handle_empty_playback_queue(guild, vc, text_channel)
+            return
+
+        track = session.queue.popleft()
+        track = await _resolve_url(track)
+        if not track:
+            if is_youtube_rate_limited():
+                await maybe_notify_rate_limited(guild.id, text_channel)
+                await text_channel.send("No hay copia local y YouTube está bloqueado, saltando...", delete_after=8)
+            else:
+                await text_channel.send("No se encontro en YouTube, saltando...", delete_after=5)
+            asyncio.create_task(play_next(guild, vc, text_channel))
+            return
+
+        session.now_playing = track
+        session.paused = False
+
+        from src import radio as _radio
+        asyncio.ensure_future(_radio.record_played(guild.id, track))
+        if not track.get("is_radio_stream"):
+            record_play(track)
+
+        if _radio.is_radio_active(guild.id) and len(session.queue) < RADIO_QUEUE_TARGET_SIZE:
+            asyncio.ensure_future(_radio.fill_radio_queue(guild, vc, text_channel))
+
+        if session.queue:
+            session.prefetch_task = asyncio.create_task(_prefetch_next(guild.id))
+
+        prefetched_dj = session.prefetched_dj_audio
+        session.prefetched_dj_audio = None
+        session.tracks_since_dj_comment += 1
+
+        if _is_user_requested_track(track):
+            if prefetched_dj:
+                from src.dj_announcer import cleanup_dj_audio
+                cleanup_dj_audio(prefetched_dj)
+            dj_file = None
+        else:
+            dj_file = await _resolve_dj_audio_before_track(guild.id, track, prefetched_dj)
+
+        ffmpeg_opts = dict(FFMPEG_LOCAL_OPTIONS if track.get("local") else FFMPEG_OPTIONS)
+        if track.get("is_radio_stream"):
+            url = track.get("url", "")
+            if ".m3u8" in url or "playlist" in url or "/live/" in url.lower():
+                # Extra robustness for HLS / live radio streams that tend to cut
+                base_before = ffmpeg_opts.get("before_options", "")
+                extra = (
+                    " -protocol_whitelist file,http,https,tcp,tls,crypto,data,httpproxy"
+                    " -allowed_extensions ALL -live_start_index -1"
+                )
+                ffmpeg_opts["before_options"] = (base_before + extra).strip()
         try:
-            await enqueue_download(
-                track,
-                track.get("video_id") or track.get("webpage_url"),
+            source = discord.FFmpegOpusAudio(track["url"], **ffmpeg_opts)
+            logger.info(
+                "play_next: reproduciendo '%s' (local=%s, codec=%s, abr=%s)",
+                track["title"],
+                track.get("local", False),
+                track.get("acodec", "?"),
+                track.get("abr", "?"),
             )
-        except Exception as exc:
-            logger.warning("play_next: background download enqueue failed: %s", exc)
-
-    def after(error):
-        if error:
-            logger.error(f"Error en reproduccion: {error}")
-        asyncio.run_coroutine_threadsafe(play_next(guild, vc, text_channel), bot.loop)
-
-    if dj_file:
-        from src.dj_announcer import cleanup_dj_audio, get_dj_ffmpeg_options
-
-        def after_dj(error):
-            cleanup_dj_audio(dj_file)
-            if error:
-                logger.warning("play_next: DJ TTS playback error: %s", error)
-            try:
-                song_source = discord.FFmpegOpusAudio(track["url"], **ffmpeg_opts)
-                vc.play(song_source, after=after)
-            except Exception as e:
-                logger.warning("play_next: song source failed after DJ: %s", e)
-                asyncio.run_coroutine_threadsafe(play_next(guild, vc, text_channel), bot.loop)
-
-        try:
-            dj_source = discord.FFmpegOpusAudio(dj_file, **get_dj_ffmpeg_options())
-            vc.play(dj_source, after=after_dj)
         except Exception as e:
-            logger.warning("play_next: DJ TTS source failed: %s", e)
-            cleanup_dj_audio(dj_file)
+            logger.warning(f"play_next: video no disponible '{track['title']}': {e}, saltando...")
+            await maybe_notify_rate_limited(guild.id, text_channel)
+            from src.youtube import _url_cache
+            from src.scoring import _normalize_text as _n
+            _url_cache.pop(_n(track.get("yt_query", "")), None)
+            asyncio.create_task(play_next(guild, vc, text_channel))
+            return
+
+        if not track.get("local") and not track.get("is_radio_stream"):
+            try:
+                await enqueue_download(
+                    track,
+                    track.get("video_id") or track.get("webpage_url"),
+                )
+            except Exception as exc:
+                logger.warning("play_next: background download enqueue failed: %s", exc)
+
+        def after(error):
+            if error:
+                logger.error(f"Error en reproduccion: {error}")
+            asyncio.run_coroutine_threadsafe(play_next(guild, vc, text_channel), bot.loop)
+
+        if dj_file:
+            from src.dj_announcer import cleanup_dj_audio, get_dj_ffmpeg_options
+
+            def after_dj(error):
+                cleanup_dj_audio(dj_file)
+                if error:
+                    logger.warning("play_next: DJ TTS playback error: %s", error)
+                try:
+                    song_source = discord.FFmpegOpusAudio(track["url"], **ffmpeg_opts)
+                    vc.play(song_source, after=after)
+                except Exception as e:
+                    logger.warning("play_next: song source failed after DJ: %s", e)
+                    asyncio.run_coroutine_threadsafe(play_next(guild, vc, text_channel), bot.loop)
+
+            try:
+                dj_source = discord.FFmpegOpusAudio(dj_file, **get_dj_ffmpeg_options())
+                vc.play(dj_source, after=after_dj)
+            except Exception as e:
+                logger.warning("play_next: DJ TTS source failed: %s", e)
+                cleanup_dj_audio(dj_file)
+                vc.play(source, after=after)
+        else:
             vc.play(source, after=after)
-    else:
-        vc.play(source, after=after)
-    await update_player_embed(guild, text_channel)
-    await _update_status(guild, track["title"])
+
+        if track.get("is_radio_stream"):
+            start_fm_recognition(guild.id, track, text_channel)
+        else:
+            stop_fm_recognition(guild.id)
+
+        await update_player_embed(guild, text_channel)
+        await _update_status(guild, track["title"])
+    finally:
+        session.playback_busy = False
 
 
 async def start_radio_with_welcome(
@@ -1027,7 +1152,7 @@ async def _update_status(guild: discord.Guild, title: str | None):
     # discord.py 2.3 has no voice-status API — raw HTTP route required
     vc = guild.voice_client
     if not vc:
-        logger.warning("_update_status: no hay voice_client activo, no se puede actualizar estado")
+        logger.debug("_update_status: no hay voice_client activo, no se puede actualizar estado")
         return
     status_text = title or ""
     logger.info(f"_update_status: actualizando canal {vc.channel.id} con estado: '{status_text}'")

@@ -583,7 +583,7 @@ async def fill_radio_queue(
 ) -> None:
     """Fetch Spotify recommendations and add them to the queue.
 
-    Called when queue length drops below RADIO_QUEUE_REFILL_THRESHOLD, or when radio is
+    Called when queue length drops below target (or on explicit radio start), or when radio is
     first activated. Guarded by _filling to prevent concurrent fills.
 
     If *auto_play* is False, tracks are queued but playback is NOT started
@@ -831,10 +831,28 @@ async def fill_radio_queue(
             logger.warning("radio.fill: fallback YouTube tambien vacio para guild=%s", gid)
             return
 
-        # Search YouTube for all Spotify-sourced recommendations in parallel.
-        # Fallback recs already have yt_info pre-fetched; skip search for those.
+        # Search YouTube (or use local) for Spotify-sourced recs.
+        # We try local library first (fast path, no YT hit if already cached from prior plays).
+        # Then launch remaining searches concurrently (internally rate-limited + throttled).
         async def _fetch(idx: int, info: dict) -> dict | None:
             nonlocal yt_search_needs_urgent
+            # Local cache fast-path (avoid YT search for tracks already in library)
+            stub = {
+                "title": info.get("title", info.get("query", "")),
+                "yt_query": info["query"],
+                "spotify_id": info.get("spotify_id"),
+                "artist_id": info.get("artist_id"),
+                "artist": info.get("artist", "Unknown"),
+            }
+            local = resolve_local_track(stub)
+            if local:
+                local["requester"] = "📻 Radio"
+                return local
+            tid = track_id(stub)
+            entry = get_entry(tid)
+            if entry:
+                return track_from_entry(tid, entry, requester="📻 Radio")
+
             if using_fallback:
                 yt_info = info.get("yt_info")
             else:
@@ -865,8 +883,13 @@ async def fill_radio_queue(
         played_set = set(_played_ids.get(gid, []))
         seen_urls: set[str] = set()
         new_tracks = []
-        for i, info in enumerate(recs):
-            t = await _fetch(i, info)
+        # Concurrent fetch (governed by yt search semaphore + per-search throttle)
+        fetch_coros = [_fetch(i, info) for i, info in enumerate(recs)]
+        fetched_results = await asyncio.gather(*fetch_coros, return_exceptions=True)
+        for t in fetched_results:
+            if isinstance(t, Exception):
+                logger.debug("radio.fill: fetch error (ignored): %s", t)
+                continue
             if t is None:
                 continue
             sid = t.get("spotify_id")
