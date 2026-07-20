@@ -258,6 +258,24 @@ DJ_VOICE = get_config_value("DJ_VOICE", dotenv_values, "es-MX-DaliaNeural")
 DJ_ANNOUNCE_COOLDOWN_SEC = int(get_config_value("DJ_ANNOUNCE_COOLDOWN", dotenv_values, "120"))
 DJ_VOLUME = get_config_value("DJ_VOLUME", dotenv_values, "1.2")
 DJ_FUN_FACT_INTERVAL_TRACKS = int(get_config_value("DJ_FUN_FACT_INTERVAL", dotenv_values, "5"))
+# auto | elevenlabs | edge
+DJ_TTS_PROVIDER = get_config_value("DJ_TTS_PROVIDER", dotenv_values, "auto").strip().lower()
+ELEVENLABS_API_KEY = get_config_value("ELEVENLABS_API_KEY", dotenv_values, "").strip()
+ELEVENLABS_VOICE_ID = get_config_value(
+    "ELEVENLABS_VOICE_ID", dotenv_values, "EXAVITQu4vr4xnSDxMaL"
+).strip()  # default: Sarah (multilingual-capable stock voice; override in .env)
+ELEVENLABS_MODEL = get_config_value(
+    "ELEVENLABS_MODEL", dotenv_values, "eleven_multilingual_v2"
+).strip()
+# Duck DJ voice under music (local tracks only)
+DJ_MIXER_ENABLED = _env_bool("DJ_MIXER_ENABLED", "false")
+# Music level while DJ speaks (higher = less attenuation)
+DJ_MIXER_MUSIC_DUCK = max(0.1, min(1.0, _env_float("DJ_MIXER_MUSIC_DUCK", 0.55)))
+# Mix short fun-facts under songs (default off — avoids weird 2–3s duck dips)
+DJ_MIXER_FUN_FACTS = _env_bool("DJ_MIXER_FUN_FACTS", "false")
+# Minimum TTS length (seconds) to attempt a mix; shorter uses sequential TTS→song
+DJ_MIXER_MIN_TTS_SEC = max(1.0, _env_float("DJ_MIXER_MIN_TTS_SEC", 4.0))
+DJ_WELCOME_TIMEOUT_SEC = max(5.0, _env_float("DJ_WELCOME_TIMEOUT_SEC", 15.0))
 
 # FM stream song recognition (shazamio sidecar sampler)
 FM_RECOGNIZER_ENABLED = _env_bool("FM_RECOGNIZER_ENABLED")
@@ -269,6 +287,14 @@ FM_RECOGNIZER_ANNOUNCE = _env_bool("FM_RECOGNIZER_ANNOUNCE")
 FM_HISTORY_ENABLED = _env_bool("FM_HISTORY_ENABLED")
 FM_HISTORY_MAX_SESSIONS = max(10, int(get_config_value("FM_HISTORY_MAX_SESSIONS", dotenv_values, "200")))
 FM_HISTORY_MAX_TRACKS_PER_SESSION = max(20, int(get_config_value("FM_HISTORY_MAX_TRACKS_PER_SESSION", dotenv_values, "500")))
+
+# rock-radio mood: optional override if StreamTheWorld URL changes
+FM_SEED_ROCK_STREAM_URL = get_config_value("FM_SEED_ROCK_STREAM_URL", dotenv_values, "").strip()
+# How many rock tracks to queue immediately while waiting for shazamio
+FM_SEED_COLD_FILL_COUNT = max(0, min(8, int(get_config_value("FM_SEED_COLD_FILL_COUNT", dotenv_values, "2"))))
+# When Shazam misses for a while / ads: refill rock tracks so queue never dies
+FM_SEED_CONTINGENCY_FILL_COUNT = max(0, min(8, int(get_config_value("FM_SEED_CONTINGENCY_FILL_COUNT", dotenv_values, "2"))))
+FM_SEED_CONTINGENCY_COOLDOWN_SEC = max(15.0, _env_float("FM_SEED_CONTINGENCY_COOLDOWN_SEC", 60.0))
 
 LIBRARY_ENABLED = _env_bool("LIBRARY_ENABLED")
 LIBRARY_PATH = get_config_value("LIBRARY_PATH", dotenv_values, ".cache/library")

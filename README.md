@@ -181,6 +181,7 @@ Commands are prefixed with `!` and must be sent in the configured text channel.
 | `!radio profile playlist <url>` | Rotate tracks from a playlist |
 | `!radio profile off` | Fall back to guild play history |
 | `!mood <name>` | Set genre mood for recommendations |
+| `!mood rock-radio` | **Test:** seed from Rock & Pop 95.9 AR (shazamio → clean YT queue, no ads) |
 
 ### FM (internet radio)
 
@@ -194,6 +195,43 @@ Commands are prefixed with `!` and must be sent in the configured text channel.
 While FM is playing, the bot periodically samples the stream with FFmpeg and identifies the current track via **shazamio** (unofficial Shazam client; no API key). Matches appear on the player embed and optionally as a short chat message when the song changes. Disable with `FM_RECOGNIZER_ENABLED=false`.
 
 Detected tracks are stored as **FM sessions** in `.cache/fm_sessions.json` (sequence + previous-track links). Browse them in the data explorer under the **sesiones FM** tab — timeline per session and A→B transitions by station. No Discord commands; disable with `FM_HISTORY_ENABLED=false`.
+
+#### Mood `rock-radio` (stream-seeded, prueba)
+
+Escucha **Rock And Pop FM 95.9 (Argentina)** en background (estación hardcodeada, no favoritos), identifica con shazamio y encola **versiones limpias** vía yt-dlp/library. Discord **no** reproduce el stream de radio (sin publicidad).
+
+Al arrancar hace **cold fill** (por defecto 2 tracks de rock de la library/YouTube) para no esperar el primer poll de Shazam.
+
+```bash
+!mood rock-radio
+!radio on
+# audio casi inmediato (cold fill) + detecciones live después
+!play otra cancion   # se inserta delante de las de radio
+!radio off
+```
+
+| Env | Default | Uso |
+|-----|---------|-----|
+| `FM_SEED_ROCK_STREAM_URL` | (built-in) | Override del stream |
+| `FM_SEED_COLD_FILL_COUNT` | `2` | Tracks de arranque |
+
+### DJ announcer: ElevenLabs + mixer
+
+| Env | Default | Uso |
+|-----|---------|-----|
+| `DJ_TTS_PROVIDER` | `auto` | `auto` / `elevenlabs` / `edge` |
+| `ELEVENLABS_API_KEY` | vacío | Activa voces ElevenLabs (fallback edge-tts) |
+| `ELEVENLABS_VOICE_ID` | stock | ID de voz en el dashboard |
+| `ELEVENLABS_MODEL` | `eleven_multilingual_v2` | Modelo TTS |
+| `DJ_MIXER_ENABLED` | `false` | Voz del locutor **sobre** la música (solo tracks locales) |
+| `DJ_MIXER_MUSIC_DUCK` | `0.55` | Volumen de la música mientras habla el DJ |
+| `DJ_MIXER_FUN_FACTS` | `false` | Mezclar fun-facts cortos (si false, TTS secuencial si &lt; 4s) |
+| `DJ_MIXER_MIN_TTS_SEC` | `4` | Mínimo de duración TTS para intentar mix |
+| `DJ_WELCOME_TIMEOUT_SEC` | `15` | Timeout del saludo de arranque |
+| `FM_SEED_CONTINGENCY_FILL_COUNT` | `2` | Tracks de relleno si hay ads/no-match y cola baja |
+| `FM_SEED_CONTINGENCY_COOLDOWN_SEC` | `60` | Cooldown entre rellenos de contingencia |
+
+Con `DJ_MIXER_ENABLED=true` y un archivo en la library local, FFmpeg premezcla TTS largos + canción (duck suave). Covers de Shazam tienen prioridad sobre Genius en tracks detectados por FM seed.
 
 ### Library and likes
 
@@ -237,6 +275,7 @@ src/
 ├── fm_favorites.py   # Per-guild FM station favorites
 ├── fm_recognizer.py  # Real-time FM song ID (shazamio + FFmpeg sample)
 ├── fm_history.py     # FM session history (detections for explorer)
+├── fm_seed_radio.py  # rock-radio mood: FM listen → clean YT queue
 ├── library.py        # Local cache, stable IDs, downloads
 ├── likes.py          # Per-user likes and radio priority
 ├── spotify_taste.py  # Taste profile builder

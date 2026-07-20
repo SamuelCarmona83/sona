@@ -31,6 +31,8 @@ MOODS: dict[str, list[str]] = {
     "classical":["classical", "piano"],
     "reggae":   ["reggae", "dub"],
     "country":  ["country", "folk"],
+    # Stream-seeded test mood: listens to Rock & Pop AR, enqueues clean YT tracks
+    "rock-radio": [],
 }
 
 # Macro genre clusters: raw Spotify genre tags → cluster key.
@@ -301,6 +303,12 @@ def set_radio_active(guild_id: int, active: bool) -> None:
     _radio_active[guild_id] = active
     if not active:
         _filling.pop(guild_id, None)
+        try:
+            from src.fm_seed_radio import stop_fm_seed_listener
+
+            stop_fm_seed_listener(guild_id)
+        except Exception:
+            pass
 
 
 def get_mood(guild_id: int) -> str:
@@ -311,7 +319,16 @@ def set_mood(guild_id: int, mood: str) -> None:
     all_moods = {**MOODS, **_custom_moods.get(guild_id, {})}
     if mood not in all_moods:
         raise ValueError(f"Mood desconocido: '{mood}'. Disponibles: {', '.join(all_moods)}")
+    prev = _radio_mood.get(guild_id, "neutral")
     _radio_mood[guild_id] = mood
+    # Leaving a stream-seeded mood stops the FM listener; entering one is started by fill/ensure.
+    try:
+        from src.fm_seed_radio import is_stream_seeded_mood, stop_fm_seed_listener
+
+        if is_stream_seeded_mood(prev) and not is_stream_seeded_mood(mood):
+            stop_fm_seed_listener(guild_id)
+    except Exception:
+        pass
 
 
 def create_custom_mood(guild_id: int, name: str, genres: list[str]) -> None:
@@ -602,6 +619,36 @@ async def fill_radio_queue(
     early_play_triggered: dict[int, bool] = {}
 
     try:
+        # Stream-seeded moods (e.g. rock-radio): cold-fill rock tracks + FM listener.
+        try:
+            from src.fm_seed_radio import (
+                is_stream_seeded_mood,
+                ensure_fm_seed_listener,
+                cold_fill_stream_seed,
+            )
+
+            if is_stream_seeded_mood(get_mood(gid)):
+                from src.fm_seed_radio import maybe_contingency_fill
+
+                ensure_fm_seed_listener(guild, text_channel)
+                # Never force auto_play via early_play — welcome must play first on cold start
+                filled = await cold_fill_stream_seed(
+                    guild, vc, text_channel, auto_play=auto_play,
+                )
+                cont = await maybe_contingency_fill(
+                    guild, vc, text_channel, auto_play=auto_play,
+                )
+                logger.info(
+                    "radio.fill: stream-seeded mood=%s guild=%s cold_fill=%d contingency=%d — skipping Spotify",
+                    get_mood(gid),
+                    gid,
+                    filled,
+                    cont,
+                )
+                return
+        except Exception as exc:
+            logger.warning("radio.fill: stream-seed ensure failed: %s", exc)
+
         q = queues.get(gid, collections.deque())
         needed = RADIO_QUEUE_TARGET_SIZE - len(q)
         if needed <= 0:

@@ -189,18 +189,19 @@ def _build_v2_payload(guild_id: int) -> dict:
         # instead of the original YT thumbnail.
         try:
             from src.library import get_entry, get_best_artwork, track_id as _lib_track_id
-            ttid = track.get("track_id") or track.get("video_id")
-            if not ttid and (track.get("spotify_id") or track.get("video_id")):
-                ttid = _lib_track_id(track)
-            if ttid:
-                entry = get_entry(ttid)
-                if entry:
-                    best = get_best_artwork(ttid, entry)
-                    if best:
-                        track = dict(track)  # copy so we don't mutate the queue/session one permanently
-                        track["cover_url"] = best
-                        # also keep updating the live now_playing so future builds are good
-                        session.now_playing = track
+            # Shazam covers win over Genius/library enrichment
+            if not track.get("recognized_cover_url") and not track.get("prefer_shazam_cover"):
+                ttid = track.get("track_id") or track.get("video_id")
+                if not ttid and (track.get("spotify_id") or track.get("video_id")):
+                    ttid = _lib_track_id(track)
+                if ttid:
+                    entry = get_entry(ttid)
+                    if entry:
+                        best = get_best_artwork(ttid, entry)
+                        if best:
+                            track = dict(track)
+                            track["cover_url"] = best
+                            session.now_playing = track
         except Exception:
             pass  # non fatal, use whatever was in track
 
@@ -517,10 +518,17 @@ class PlayerView(discord.ui.View):
 
         mood_names = list(_radio.MOODS.keys())
         current = _radio.get_mood(gid)
-        options = [
-            discord.SelectOption(label=m.capitalize(), value=m, default=(m == current))
-            for m in mood_names
-        ]
+        # Discord select max 25 options; labels ≤100 chars
+        options = []
+        for m in mood_names[:25]:
+            kwargs = {
+                "label": (m if len(m) <= 25 else m[:22] + "…"),
+                "value": m,
+                "default": (m == current),
+            }
+            if m == "rock-radio":
+                kwargs["description"] = "FM→YouTube limpio"
+            options.append(discord.SelectOption(**kwargs))
         selected_mood = [current]
 
         class MoodSelect(discord.ui.Select):
@@ -857,8 +865,20 @@ async def _resolve_dj_audio_before_track(
         return None
 
 
-def stop_fm_recognition(guild_id: int) -> None:
-    """Stop the FM song-recognition sidecar for a guild and close history session."""
+def stop_fm_recognition(guild_id: int, *, force: bool = False) -> None:
+    """Stop live-stream FM recognition for a guild.
+
+    When *force* is False (default), leave a running rock-radio seed listener alone.
+    play_next used to call this for every non-stream track and killed shazamio mid-session.
+    """
+    if not force:
+        try:
+            from src.fm_seed_radio import is_seed_listener_running
+
+            if is_seed_listener_running(guild_id):
+                return
+        except Exception:
+            pass
     try:
         from src.fm_recognizer import stop_fm_recognizer
 
@@ -882,6 +902,14 @@ def start_fm_recognition(guild_id: int, track: dict, text_channel) -> None:
     if not stream_url:
         stop_fm_recognition(guild_id)
         return
+
+    # Live FM playback and rock-radio seed listener share the recognizer slot — pick one.
+    try:
+        from src.fm_seed_radio import stop_fm_seed_listener
+
+        stop_fm_seed_listener(guild_id)
+    except Exception:
+        pass
 
     from src.fm_recognizer import start_fm_recognizer
 
@@ -1051,26 +1079,63 @@ async def play_next(guild: discord.Guild, vc: discord.VoiceClient, text_channel)
             asyncio.run_coroutine_threadsafe(play_next(guild, vc, text_channel), bot.loop)
 
         if dj_file:
-            from src.dj_announcer import cleanup_dj_audio, get_dj_ffmpeg_options
+            from src.dj_announcer import (
+                cleanup_dj_audio,
+                get_dj_ffmpeg_options,
+                mix_dj_over_local_track,
+            )
+            from src.config import DJ_MIXER_ENABLED
 
-            def after_dj(error):
-                cleanup_dj_audio(dj_file)
-                if error:
-                    logger.warning("play_next: DJ TTS playback error: %s", error)
+            mix_path = None
+            song_url = track.get("url") or ""
+            is_local_file = bool(track.get("local")) or (
+                song_url and not song_url.startswith(("http://", "https://"))
+            )
+            if DJ_MIXER_ENABLED and is_local_file and song_url:
                 try:
-                    song_source = discord.FFmpegOpusAudio(track["url"], **ffmpeg_opts)
-                    vc.play(song_source, after=after)
-                except Exception as e:
-                    logger.warning("play_next: song source failed after DJ: %s", e)
-                    asyncio.run_coroutine_threadsafe(play_next(guild, vc, text_channel), bot.loop)
+                    mix_path = await mix_dj_over_local_track(song_url, dj_file, guild.id)
+                except Exception as exc:
+                    logger.debug("play_next: DJ mix failed: %s", exc)
+                    mix_path = None
 
-            try:
-                dj_source = discord.FFmpegOpusAudio(dj_file, **get_dj_ffmpeg_options())
-                vc.play(dj_source, after=after_dj)
-            except Exception as e:
-                logger.warning("play_next: DJ TTS source failed: %s", e)
+            if mix_path:
+                # Single immersive stream: voice ducked under music
                 cleanup_dj_audio(dj_file)
-                vc.play(source, after=after)
+                dj_file = None
+
+                def after_mix(error):
+                    cleanup_dj_audio(mix_path)
+                    after(error)
+
+                try:
+                    mix_source = discord.FFmpegOpusAudio(
+                        mix_path, **get_dj_ffmpeg_options()
+                    )
+                    vc.play(mix_source, after=after_mix)
+                    logger.info("play_next: DJ mixer active for '%s'", track.get("title"))
+                except Exception as e:
+                    logger.warning("play_next: mixed source failed: %s", e)
+                    cleanup_dj_audio(mix_path)
+                    vc.play(source, after=after)
+            else:
+                def after_dj(error):
+                    cleanup_dj_audio(dj_file)
+                    if error:
+                        logger.warning("play_next: DJ TTS playback error: %s", error)
+                    try:
+                        song_source = discord.FFmpegOpusAudio(track["url"], **ffmpeg_opts)
+                        vc.play(song_source, after=after)
+                    except Exception as e:
+                        logger.warning("play_next: song source failed after DJ: %s", e)
+                        asyncio.run_coroutine_threadsafe(play_next(guild, vc, text_channel), bot.loop)
+
+                try:
+                    dj_source = discord.FFmpegOpusAudio(dj_file, **get_dj_ffmpeg_options())
+                    vc.play(dj_source, after=after_dj)
+                except Exception as e:
+                    logger.warning("play_next: DJ TTS source failed: %s", e)
+                    cleanup_dj_audio(dj_file)
+                    vc.play(source, after=after)
         else:
             vc.play(source, after=after)
 
@@ -1091,6 +1156,8 @@ async def start_radio_with_welcome(
     text_channel,
 ) -> None:
     from src import radio as _radio
+    from src.config import DJ_WELCOME_TIMEOUT_SEC
+
     session = guild_session(guild.id)
     gid = guild.id
 
@@ -1109,8 +1176,9 @@ async def start_radio_with_welcome(
         return await synthesize_dj_audio(text, gid)
 
     async def _fill():
+        # auto_play=False so cold-fill does not steal the voice channel before welcome
         await _radio.fill_radio_queue(
-            guild, vc, text_channel, auto_play=False, early_play=True,
+            guild, vc, text_channel, auto_play=False, early_play=False,
         )
 
     try:
@@ -1120,16 +1188,31 @@ async def start_radio_with_welcome(
         dj_file: str | None = None
         if welcome_task:
             try:
-                dj_file = await asyncio.wait_for(asyncio.shield(welcome_task), timeout=10.0)
+                dj_file = await asyncio.wait_for(
+                    asyncio.shield(welcome_task),
+                    timeout=DJ_WELCOME_TIMEOUT_SEC,
+                )
             except asyncio.TimeoutError:
                 logger.warning("start_radio_with_welcome: welcome gen timed out, skipping")
             except Exception as exc:
                 logger.warning("start_radio_with_welcome: welcome gen error: %s", exc)
 
+        # Ensure queue is ready before deciding playback order
+        try:
+            await fill_task
+        except Exception as exc:
+            logger.warning("start_radio_with_welcome: fill error: %s", exc)
+
         if dj_file:
             from src.dj_announcer import cleanup_dj_audio, get_dj_ffmpeg_options
 
-            if vc.is_playing() or vc.is_paused() or session.queue:
+            # Queue may already have cold-fill tracks — still play welcome first
+            # unless something is already audible (user track / prior radio).
+            if vc.is_playing() or vc.is_paused():
+                logger.info(
+                    "start_radio_with_welcome: already playing, skip welcome guild=%s",
+                    gid,
+                )
                 cleanup_dj_audio(dj_file)
             else:
                 done_event = asyncio.Event()
@@ -1140,15 +1223,17 @@ async def start_radio_with_welcome(
                         logger.warning("start_radio_with_welcome: TTS error: %s", error)
                     bot.loop.call_soon_threadsafe(done_event.set)
 
-                dj_source = discord.FFmpegOpusAudio(dj_file, **get_dj_ffmpeg_options())
-                vc.play(dj_source, after=after_welcome)
-                logger.info("start_radio_with_welcome: playing welcome for guild=%s", gid)
                 try:
-                    await asyncio.wait_for(done_event.wait(), timeout=15.0)
-                except asyncio.TimeoutError:
-                    pass
-
-        await fill_task
+                    dj_source = discord.FFmpegOpusAudio(dj_file, **get_dj_ffmpeg_options())
+                    vc.play(dj_source, after=after_welcome)
+                    logger.info("start_radio_with_welcome: playing welcome for guild=%s", gid)
+                    try:
+                        await asyncio.wait_for(done_event.wait(), timeout=20.0)
+                    except asyncio.TimeoutError:
+                        pass
+                except Exception as exc:
+                    logger.warning("start_radio_with_welcome: welcome play failed: %s", exc)
+                    cleanup_dj_audio(dj_file)
 
         if not (vc.is_playing() or vc.is_paused()):
             if session.queue:

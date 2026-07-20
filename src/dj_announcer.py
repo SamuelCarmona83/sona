@@ -16,6 +16,14 @@ from src.config import (
     DJ_ANNOUNCE_COOLDOWN_SEC,
     DJ_VOLUME,
     DJ_FUN_FACT_INTERVAL_TRACKS,
+    DJ_TTS_PROVIDER,
+    DJ_MIXER_ENABLED,
+    DJ_MIXER_MUSIC_DUCK,
+    DJ_MIXER_FUN_FACTS,
+    DJ_MIXER_MIN_TTS_SEC,
+    ELEVENLABS_API_KEY,
+    ELEVENLABS_VOICE_ID,
+    ELEVENLABS_MODEL,
 )
 
 logger = logging.getLogger(__name__)
@@ -332,24 +340,104 @@ async def generate_fun_fact(
 
 
 # ---------------------------------------------------------------------------
-# TTS synthesis
+# TTS synthesis (ElevenLabs preferred, edge-tts fallback)
 # ---------------------------------------------------------------------------
 
-async def synthesize_dj_audio(text: str, guild_id: int) -> str | None:
-    """Synthesize text to an audio file via edge-tts. Returns file path or None."""
-    out_path = _DJ_CACHE_DIR / f"dj_{guild_id}_{int(time.time())}.mp3"
+_ELEVENLABS_TIMEOUT_SEC = 12.0
+
+
+def _use_elevenlabs() -> bool:
+    if not ELEVENLABS_API_KEY:
+        return False
+    provider = (DJ_TTS_PROVIDER or "auto").lower()
+    if provider == "edge":
+        return False
+    if provider == "elevenlabs":
+        return True
+    return provider == "auto"
+
+
+async def _synthesize_edge(text: str, out_path: pathlib.Path) -> bool:
     try:
         communicate = edge_tts.Communicate(text, DJ_VOICE)
         await communicate.save(str(out_path))
-        logger.info("dj_announcer: synthesized %d chars → %s", len(text), out_path)
-        return str(out_path)
+        return True
     except Exception as exc:
-        logger.error("dj_announcer: TTS synthesis failed: %s", exc)
+        logger.error("dj_announcer: edge-tts failed: %s", exc)
+        return False
+
+
+def _elevenlabs_sync(text: str, out_path: pathlib.Path) -> None:
+    import requests
+
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}"
+    headers = {
+        "xi-api-key": ELEVENLABS_API_KEY,
+        "Content-Type": "application/json",
+        "Accept": "audio/mpeg",
+    }
+    payload = {
+        "text": text,
+        "model_id": ELEVENLABS_MODEL,
+        "voice_settings": {
+            "stability": 0.45,
+            "similarity_boost": 0.75,
+        },
+    }
+    resp = requests.post(url, json=payload, headers=headers, timeout=_ELEVENLABS_TIMEOUT_SEC)
+    resp.raise_for_status()
+    out_path.write_bytes(resp.content)
+
+
+async def _synthesize_elevenlabs(text: str, out_path: pathlib.Path) -> bool:
+    try:
+        await asyncio.to_thread(_elevenlabs_sync, text, out_path)
+        if not out_path.is_file() or out_path.stat().st_size < 100:
+            logger.warning("dj_announcer: elevenlabs returned empty audio")
+            return False
+        return True
+    except Exception as exc:
+        logger.warning("dj_announcer: elevenlabs failed: %s", exc)
+        return False
+
+
+async def synthesize_dj_audio(text: str, guild_id: int) -> str | None:
+    """Synthesize text to an MP3. Prefer ElevenLabs when configured; else edge-tts."""
+    if not (text or "").strip():
         return None
+    out_path = _DJ_CACHE_DIR / f"dj_{guild_id}_{int(time.time())}.mp3"
+    provider_used = "edge"
+
+    if _use_elevenlabs():
+        if await _synthesize_elevenlabs(text, out_path):
+            provider_used = "elevenlabs"
+            logger.info(
+                "dj_announcer: synthesized %d chars via elevenlabs → %s",
+                len(text),
+                out_path,
+            )
+            return str(out_path)
+        logger.info("dj_announcer: falling back to edge-tts")
+        try:
+            if out_path.exists():
+                out_path.unlink()
+        except OSError:
+            pass
+
+    if await _synthesize_edge(text, out_path):
+        logger.info(
+            "dj_announcer: synthesized %d chars via edge → %s",
+            len(text),
+            out_path,
+        )
+        return str(out_path)
+    return None
 
 
 def cleanup_dj_audio(file_path: str) -> None:
-    """Delete a TTS audio file after playback."""
+    """Delete a TTS or mix audio file after playback."""
+    if not file_path:
+        return
     try:
         os.remove(file_path)
     except OSError:
@@ -362,3 +450,131 @@ def get_dj_ffmpeg_options() -> dict:
         "before_options": "",
         "options": f"-vn -af volume={DJ_VOLUME}",
     }
+
+
+def probe_audio_duration_sec(path: str) -> float:
+    """Return media duration in seconds via ffprobe, or 0 on failure."""
+    try:
+        import subprocess
+
+        res = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            return max(0.0, float(res.stdout.strip()))
+    except Exception as exc:
+        logger.debug("dj_announcer: ffprobe failed: %s", exc)
+    return 0.0
+
+
+async def mix_dj_over_local_track(
+    song_path: str,
+    tts_path: str,
+    guild_id: int,
+    *,
+    music_duck: float | None = None,
+    allow_short: bool = False,
+) -> str | None:
+    """Premix TTS over the start of a local song (ducked music). Returns mix path or None.
+
+    Discord only plays one Opus stream; this produces a single file for immersive DJ.
+    Short clips (fun-facts ~2–3s) skip mix unless allow_short / DJ_MIXER_FUN_FACTS.
+    """
+    if not DJ_MIXER_ENABLED:
+        return None
+    if not song_path or not tts_path:
+        return None
+    if not pathlib.Path(song_path).is_file() or not pathlib.Path(tts_path).is_file():
+        return None
+
+    duck = DJ_MIXER_MUSIC_DUCK if music_duck is None else music_duck
+    duck = max(0.1, min(1.0, float(duck)))
+    tts_dur = probe_audio_duration_sec(tts_path)
+    if tts_dur <= 0:
+        tts_dur = 4.0
+
+    # Avoid awkward 2–3s volume dips for short fun-facts
+    min_tts = DJ_MIXER_MIN_TTS_SEC
+    if tts_dur < min_tts and not (allow_short or DJ_MIXER_FUN_FACTS):
+        logger.info(
+            "dj_announcer: skip mix (tts=%.1fs < min=%.1fs); use sequential TTS",
+            tts_dur,
+            min_tts,
+        )
+        return None
+
+    # Soft duck: hold under voice, short pad, then ramp music back
+    pad = 0.6
+    fade = 0.45
+    duck_hold_end = tts_dur + pad
+    fade_end = duck_hold_end + fade
+
+    out_path = _DJ_CACHE_DIR / f"dj_mix_{guild_id}_{int(time.time())}.mp3"
+    # volume expression: duck while speaking, linear-ish restore after pad
+    # if(t < hold) duck; else if(t < fade_end) lerp; else 1.0
+    vol_expr = (
+        f"if(lt(t\\,{duck_hold_end:.2f})\\,{duck:.2f}\\,"
+        f"if(lt(t\\,{fade_end:.2f})\\,"
+        f"{duck:.2f}+(1-{duck:.2f})*(t-{duck_hold_end:.2f})/{fade:.2f}\\,1))"
+    )
+    filter_complex = (
+        f"[0:a]volume='{vol_expr}':eval=frame[song];"
+        f"[1:a]volume={DJ_VOLUME},afade=t=in:st=0:d=0.15[voice];"
+        f"[song][voice]amix=inputs=2:duration=first:dropout_transition=2[out]"
+    )
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        song_path,
+        "-i",
+        tts_path,
+        "-filter_complex",
+        filter_complex,
+        "-map",
+        "[out]",
+        "-vn",
+        "-ac",
+        "2",
+        "-ar",
+        "48000",
+        str(out_path),
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+        if proc.returncode != 0 or not out_path.is_file():
+            err = (stderr or b"").decode("utf-8", errors="replace")[:300]
+            logger.warning("dj_announcer: mix failed: %s", err)
+            cleanup_dj_audio(str(out_path))
+            return None
+        logger.info(
+            "dj_announcer: mixed DJ over local track (duck=%.2f tts=%.1fs) → %s",
+            duck,
+            tts_dur,
+            out_path,
+        )
+        return str(out_path)
+    except Exception as exc:
+        logger.warning("dj_announcer: mix error: %s", exc)
+        cleanup_dj_audio(str(out_path))
+        return None

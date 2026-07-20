@@ -1319,20 +1319,42 @@ async def radio_cmd(ctx: commands.Context, *, args: str = ""):
         _radio.set_radio_active(gid, active)
 
     if active:
+        mood_now = _radio.get_mood(gid)
         profile_line = ""
         if _radio.get_profile_mode(gid) != "off":
             profile_line = f"Perfil: **{_radio.describe_profile_mode(gid)}**\n"
-        embed = discord.Embed(
-            title=f"{RADIO_REQUESTER_LABEL} activado",
-            description=(
-                f"Mood actual: **{_radio.get_mood(gid).capitalize()}**\n"
+        try:
+            from src.fm_seed_radio import is_stream_seeded_mood, stream_seed_label, get_stream_seed_station
+
+            if is_stream_seeded_mood(mood_now):
+                st = get_stream_seed_station(mood_now) or {}
+                station_name = st.get("name") or stream_seed_label(mood_now)
+                desc = (
+                    f"Mood: **{mood_now}** — {stream_seed_label(mood_now)}\n"
+                    f"Escuchando **{station_name}** en background.\n"
+                    "Las detecciones se encolan como versiones limpias (sin publicidad).\n"
+                    "Podés pedir canciones con `!play` (van delante de la radio)."
+                )
+            else:
+                desc = (
+                    f"Mood actual: **{mood_now.capitalize()}**\n"
+                    f"{profile_line}"
+                    "La cola se rellena automaticamente con recomendaciones.\n"
+                    "Usa `!mood <nombre>` o `!radio profile` para personalizar."
+                )
+        except Exception:
+            desc = (
+                f"Mood actual: **{mood_now.capitalize()}**\n"
                 f"{profile_line}"
                 "La cola se rellena automaticamente con recomendaciones.\n"
                 "Usa `!mood <nombre>` o `!radio profile` para personalizar."
-            ),
+            )
+        embed = discord.Embed(
+            title=f"{RADIO_REQUESTER_LABEL} activado",
+            description=desc,
             color=0x1DB954,
         )
-        await ctx.send(embed=embed, delete_after=15)
+        await ctx.send(embed=embed, delete_after=18)
         await _start_radio_playback(ctx, gid)
     else:
         embed = discord.Embed(
@@ -1448,9 +1470,14 @@ async def mood_cmd(ctx: commands.Context, *, args: str = ""):
     elif not subcommand:
         current = _radio.get_mood(gid)
         lines = []
+        try:
+            from src.fm_seed_radio import is_stream_seeded_mood
+        except Exception:
+            is_stream_seeded_mood = lambda _m: False  # noqa: E731
         for m in _radio.MOODS:
             marker = " ← actual" if m == current else ""
-            lines.append(f"`{m}`{marker}")
+            tag = " [fm→yt]" if is_stream_seeded_mood(m) else ""
+            lines.append(f"`{m}`{tag}{marker}")
         custom = _radio._custom_moods.get(gid, {})
         if custom:
             lines.append("")
@@ -1481,12 +1508,37 @@ async def mood_cmd(ctx: commands.Context, *, args: str = ""):
             vc = ctx.guild.voice_client
             if vc:
                 asyncio.ensure_future(_radio.fill_radio_queue(ctx.guild, vc, ctx.channel))
+        try:
+            from src.fm_seed_radio import is_stream_seeded_mood, stream_seed_label, get_stream_seed_station
+
+            if is_stream_seeded_mood(name):
+                st = get_stream_seed_station(name) or {}
+                station_name = st.get("name") or stream_seed_label(name)
+                desc = (
+                    f"**{stream_seed_label(name)}**\n"
+                    f"Seed: **{station_name}** (background + shazamio).\n"
+                    "Activa `!radio on` si aún no está; la cola se llena con versiones limpias."
+                )
+                if removed:
+                    desc += f"\nSe removieron {removed} canciones del mood anterior."
+            else:
+                desc = (
+                    f"Se removieron {removed} canciones del mood anterior."
+                    if removed
+                    else "El siguiente batch usara este estilo."
+                )
+        except Exception:
+            desc = (
+                f"Se removieron {removed} canciones del mood anterior."
+                if removed
+                else "El siguiente batch usara este estilo."
+            )
         embed = discord.Embed(
-            title=f"🎭 Mood cambiado a {name.capitalize()}",
-            description=f"Se removieron {removed} canciones del mood anterior." if removed else "El siguiente batch usara este estilo.",
+            title=f"🎭 Mood cambiado a {name}",
+            description=desc,
             color=0x1DB954,
         )
-        await ctx.send(embed=embed, delete_after=10)
+        await ctx.send(embed=embed, delete_after=12)
 
     try:
         await ctx.message.delete()
