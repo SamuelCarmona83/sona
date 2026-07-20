@@ -131,6 +131,11 @@ FM_RECOGNIZER_ENABLED=true
 FM_RECOGNIZER_INTERVAL_SEC=30
 FM_RECOGNIZER_SAMPLE_SEC=8
 FM_RECOGNIZER_ANNOUNCE=true
+
+# FM session history (explorer: sesiones FM)
+FM_HISTORY_ENABLED=true
+FM_HISTORY_MAX_SESSIONS=200
+FM_HISTORY_MAX_TRACKS_PER_SESSION=500
 ```
 
 Docker Compose overrides several values for the container environment; see [`docker-compose.yml`](docker-compose.yml).
@@ -188,6 +193,8 @@ Commands are prefixed with `!` and must be sent in the configured text channel.
 
 While FM is playing, the bot periodically samples the stream with FFmpeg and identifies the current track via **shazamio** (unofficial Shazam client; no API key). Matches appear on the player embed and optionally as a short chat message when the song changes. Disable with `FM_RECOGNIZER_ENABLED=false`.
 
+Detected tracks are stored as **FM sessions** in `.cache/fm_sessions.json` (sequence + previous-track links). Browse them in the data explorer under the **sesiones FM** tab — timeline per session and A→B transitions by station. No Discord commands; disable with `FM_HISTORY_ENABLED=false`.
+
 ### Library and likes
 
 | Command | Description |
@@ -229,6 +236,7 @@ src/
 ├── radio_browser.py  # FM station search (Radio Browser API)
 ├── fm_favorites.py   # Per-guild FM station favorites
 ├── fm_recognizer.py  # Real-time FM song ID (shazamio + FFmpeg sample)
+├── fm_history.py     # FM session history (detections for explorer)
 ├── library.py        # Local cache, stable IDs, downloads
 ├── likes.py          # Per-user likes and radio priority
 ├── spotify_taste.py  # Taste profile builder

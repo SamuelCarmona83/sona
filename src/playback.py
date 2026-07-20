@@ -858,13 +858,19 @@ async def _resolve_dj_audio_before_track(
 
 
 def stop_fm_recognition(guild_id: int) -> None:
-    """Stop the FM song-recognition sidecar for a guild."""
+    """Stop the FM song-recognition sidecar for a guild and close history session."""
     try:
         from src.fm_recognizer import stop_fm_recognizer
 
         stop_fm_recognizer(guild_id)
     except Exception as exc:
         logger.debug("stop_fm_recognition: %s", exc)
+    try:
+        from src.fm_history import close_session
+
+        close_session(guild_id)
+    except Exception as exc:
+        logger.debug("stop_fm_recognition: history close failed: %s", exc)
 
 
 def start_fm_recognition(guild_id: int, track: dict, text_channel) -> None:
@@ -878,6 +884,13 @@ def start_fm_recognition(guild_id: int, track: dict, text_channel) -> None:
         return
 
     from src.fm_recognizer import start_fm_recognizer
+
+    try:
+        from src.fm_history import open_session
+
+        open_session(guild_id, track)
+    except Exception as exc:
+        logger.debug("start_fm_recognition: history open failed: %s", exc)
 
     def _is_active() -> bool:
         session = guild_session(guild_id)
@@ -902,6 +915,13 @@ def start_fm_recognition(guild_id: int, track: dict, text_channel) -> None:
         updated["recognized_shazam_url"] = match.get("shazam_url")
         updated["recognized_at"] = match.get("recognized_at")
         session.now_playing = updated
+
+        try:
+            from src.fm_history import append_detection
+
+            append_detection(gid, match)
+        except Exception as exc:
+            logger.debug("fm on_match: history append failed: %s", exc)
 
         guild = bot.get_guild(gid)
         channel = session.player_channel or text_channel

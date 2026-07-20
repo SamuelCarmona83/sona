@@ -63,10 +63,11 @@
       </div>
     </div>
 
-    <nav class="flex border-b border-black/10 mb-6">
+    <nav class="flex border-b border-black/10 mb-6 overflow-x-auto">
       <button type="button" class="px-5 py-3 text-sm font-medium text-ink border-b-2 border-ink" data-tab="searches">búsquedas</button>
       <button type="button" class="px-5 py-3 text-sm font-medium text-mute border-b-2 border-transparent hover:text-ink" data-tab="library">biblioteca</button>
       <button type="button" class="px-5 py-3 text-sm font-medium text-mute border-b-2 border-transparent hover:text-ink" data-tab="likes">likes</button>
+      <button type="button" class="px-5 py-3 text-sm font-medium text-mute border-b-2 border-transparent hover:text-ink" data-tab="fm">sesiones FM</button>
     </nav>
 
     <main>
@@ -95,6 +96,16 @@
         <p id="countLikes" class="text-[11px] text-ash mb-3"></p>
         <div id="gridLikes" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4"></div>
         <div id="tableLikes" class="hidden"></div>
+      </section>
+
+      <section id="panel-fm" class="hidden">
+        <p id="countFm" class="text-[11px] text-ash mb-3"></p>
+        <div id="fmLayout" class="grid grid-cols-1 lg:grid-cols-5 gap-4">
+          <div id="fmSessionList" class="lg:col-span-2 border border-black/10 divide-y divide-black/10 max-h-[70vh] overflow-y-auto"></div>
+          <div id="fmSessionDetail" class="lg:col-span-3 border border-black/10 min-h-[240px] p-4">
+            <p class="text-sm text-mute">seleccioná una sesión FM para ver el timeline y las transiciones.</p>
+          </div>
+        </div>
       </section>
     </main>
 
@@ -138,6 +149,8 @@
     let searches = [];
     let library = [];
     let likes = [];
+    let fmSessions = [];
+    let selectedFmSessionId = null;
     let playedCount = 0;
     let diskUsage = { total_bytes: 0, files: {}, tracks_on_disk: 0 };
     let dedupePreview = null;
@@ -281,6 +294,13 @@
       });
     }
 
+    function formatDateTime(unix) {
+      if (!unix) return "—";
+      return new Date(unix * 1000).toLocaleString("es", {
+        day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit",
+      });
+    }
+
     function spotifyUrl(id) {
       return id ? `https://open.spotify.com/track/${id}` : null;
     }
@@ -408,6 +428,84 @@
       return total;
     }
 
+    function transformFmSessions(raw) {
+      const list = raw && Array.isArray(raw.sessions) ? raw.sessions : [];
+      return list
+        .filter((s) => s && typeof s === "object")
+        .map((s) => {
+          const tracks = Array.isArray(s.tracks) ? s.tracks : [];
+          const started = Number(s.started_at) || 0;
+          const ended = s.ended_at == null ? null : Number(s.ended_at);
+          const durationSec = ended != null && started ? Math.max(0, ended - started) : (started ? Math.max(0, Date.now() / 1000 - started) : 0);
+          return {
+            id: s.id || "",
+            guild_id: s.guild_id,
+            stationuuid: s.stationuuid || "",
+            station_name: s.station_name || "FM",
+            countrycode: s.countrycode || "",
+            tags: s.tags || "",
+            stream_url: s.stream_url || "",
+            started_at: started,
+            ended_at: ended,
+            active: ended == null,
+            track_count: s.track_count != null ? s.track_count : tracks.length,
+            duration_sec: durationSec,
+            tracks,
+          };
+        })
+        .sort((a, b) => b.started_at - a.started_at);
+    }
+
+    function formatDurationSec(sec) {
+      const s = Math.floor(Number(sec) || 0);
+      if (s < 60) return `${s}s`;
+      const m = Math.floor(s / 60);
+      const r = s % 60;
+      if (m < 60) return `${m}m ${r}s`;
+      const h = Math.floor(m / 60);
+      return `${h}h ${m % 60}m`;
+    }
+
+    function buildTransitions(tracks, { byStation = false, stationKey = "" } = {}) {
+      const counts = new Map();
+      const labels = new Map();
+      for (const t of tracks) {
+        if (!t || !t.prev_match_key || !t.match_key) continue;
+        const edgeKey = `${t.prev_match_key}→${t.match_key}`;
+        counts.set(edgeKey, (counts.get(edgeKey) || 0) + 1);
+        if (!labels.has(t.prev_match_key)) {
+          // resolve label from any track with that key
+        }
+      }
+      // label map from all tracks in input
+      for (const t of tracks) {
+        if (t && t.match_key) {
+          labels.set(t.match_key, `${t.artist || "?"} — ${t.title || "?"}`);
+        }
+      }
+      return [...counts.entries()]
+        .map(([edge, count]) => {
+          const [from, to] = edge.split("→");
+          return {
+            from,
+            to,
+            fromLabel: labels.get(from) || from,
+            toLabel: labels.get(to) || to,
+            count,
+          };
+        })
+        .sort((a, b) => b.count - a.count || a.fromLabel.localeCompare(b.fromLabel));
+    }
+
+    function transitionsForStation(stationuuid) {
+      const tracks = [];
+      for (const s of fmSessions) {
+        if (stationuuid && s.stationuuid !== stationuuid) continue;
+        for (const t of s.tracks || []) tracks.push(t);
+      }
+      return buildTransitions(tracks);
+    }
+
     function getFilterText() {
       return document.getElementById("searchInput").value.trim().toLowerCase();
     }
@@ -426,6 +524,11 @@
         const filtered = library.filter((i) => matchesFilter(i, [i.title, i.artist, i.yt_query, i.trackId]));
         if (libraryGrouped && viewMode === "table") return groupLibraryItems(filtered);
         return filtered;
+      }
+      if (tab === "fm") {
+        return fmSessions.filter((i) =>
+          matchesFilter(i, [i.station_name, i.tags, i.countrycode, i.stationuuid])
+        );
       }
       return likes.filter((i) => matchesFilter(i, [i.title, i.artist, i.yt_query]));
     }
@@ -610,10 +713,125 @@
       if (filter) return "sin resultados";
       if (tab === "library") return "biblioteca vacía";
       if (tab === "likes") return "sin likes";
+      if (tab === "fm") return "sin sesiones FM — escuchá con !fm en discord";
       return "sin búsquedas";
     }
 
+    function renderFmPanel() {
+      const filter = getFilterText();
+      const items = getItemsForTab("fm");
+      const countEl = document.getElementById("countFm");
+      const listEl = document.getElementById("fmSessionList");
+      const detailEl = document.getElementById("fmSessionDetail");
+
+      if (items.length === 0) {
+        countEl.textContent = "";
+        listEl.innerHTML = emptyHtml(emptyMessage("fm", filter));
+        detailEl.innerHTML = `<p class="text-sm text-mute">${escapeHtml(emptyMessage("fm", filter))}</p>`;
+        return;
+      }
+
+      countEl.textContent = filter
+        ? `${items.length} sesiones / filtro`
+        : `${items.length} sesiones · ${items.reduce((n, s) => n + (s.track_count || 0), 0)} detecciones`;
+
+      if (!selectedFmSessionId || !items.some((s) => s.id === selectedFmSessionId)) {
+        selectedFmSessionId = items[0].id;
+      }
+
+      listEl.innerHTML = items.map((s) => {
+        const active = s.id === selectedFmSessionId;
+        const badge = s.active
+          ? `<span class="text-[10px] text-ok">live</span>`
+          : `<span class="text-[10px] text-ash">cerrada</span>`;
+        return `
+          <button type="button" data-fm-id="${escapeHtml(s.id)}"
+            class="w-full text-left px-3 py-2.5 hover:bg-soft ${active ? "bg-soft border-l-2 border-ink" : ""}">
+            <div class="text-sm font-medium text-ink truncate">${escapeHtml(s.station_name)}</div>
+            <div class="text-[11px] text-mute mt-0.5">
+              ${escapeHtml(s.countrycode || "—")} · ${s.track_count} tracks · ${formatDurationSec(s.duration_sec)} · ${badge}
+            </div>
+            <div class="text-[10px] text-ash mt-0.5">${formatDateTime(s.started_at)}</div>
+          </button>`;
+      }).join("");
+
+      listEl.querySelectorAll("[data-fm-id]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          selectedFmSessionId = btn.dataset.fmId;
+          renderFmPanel();
+        });
+      });
+
+      const session = items.find((s) => s.id === selectedFmSessionId) || items[0];
+      const tracks = session.tracks || [];
+      const sessionEdges = buildTransitions(tracks).slice(0, 12);
+      const stationEdges = transitionsForStation(session.stationuuid).slice(0, 12);
+
+      const timeline = tracks.length
+        ? tracks.map((t, i) => {
+            const cover = t.cover_url
+              ? `<img src="${escapeHtml(t.cover_url)}" alt="" class="w-9 h-9 object-cover bg-soft shrink-0" loading="lazy" />`
+              : `<div class="w-9 h-9 bg-soft shrink-0"></div>`;
+            const shazam = t.shazam_url ? linkHtml(t.shazam_url, "shazam") : "";
+            const prev = t.prev_match_key
+              ? `<div class="text-[10px] text-ash">← prev en sesión</div>`
+              : `<div class="text-[10px] text-ash">inicio</div>`;
+            return `
+              <div class="flex gap-3 py-2 border-t border-black/10 first:border-t-0">
+                ${cover}
+                <div class="min-w-0 flex-1">
+                  <div class="text-sm text-ink truncate">${escapeHtml(t.artist || "?")} — ${escapeHtml(t.title || "?")}</div>
+                  <div class="text-[11px] text-mute">${formatDateTime(t.detected_at)} · #${i + 1} ${shazam ? "· " + shazam : ""}</div>
+                  ${prev}
+                </div>
+              </div>`;
+          }).join("")
+        : `<p class="text-sm text-mute py-4">sin detecciones en esta sesión (shazam aún no matcheó).</p>`;
+
+      const edgeList = (edges, empty) => edges.length
+        ? edges.map((e) => `
+            <div class="text-[12px] text-body py-1 border-t border-black/10 first:border-t-0">
+              <span class="text-ink">${escapeHtml(e.fromLabel)}</span>
+              <span class="text-ash"> → </span>
+              <span class="text-ink">${escapeHtml(e.toLabel)}</span>
+              <span class="text-mute"> ×${e.count}</span>
+            </div>`).join("")
+        : `<p class="text-[12px] text-mute">${escapeHtml(empty)}</p>`;
+
+      detailEl.innerHTML = `
+        <div class="mb-4">
+          <h2 class="text-base font-bold text-ink">${escapeHtml(session.station_name)}</h2>
+          <p class="text-[12px] text-mute mt-1">
+            ${escapeHtml(session.countrycode || "—")}
+            ${session.tags ? " · " + escapeHtml(session.tags) : ""}
+            · ${session.track_count} tracks
+            · ${formatDurationSec(session.duration_sec)}
+            · ${session.active ? "activa" : "cerrada"}
+          </p>
+          <p class="text-[11px] text-ash mt-0.5">${formatDateTime(session.started_at)}${session.ended_at ? " → " + formatDateTime(session.ended_at) : ""}</p>
+        </div>
+        <div class="mb-5">
+          <h3 class="text-sm font-bold text-ink mb-2">timeline</h3>
+          <div>${timeline}</div>
+        </div>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div>
+            <h3 class="text-sm font-bold text-ink mb-2">transiciones en sesión</h3>
+            ${edgeList(sessionEdges, "hace falta al menos 2 temas seguidos")}
+          </div>
+          <div>
+            <h3 class="text-sm font-bold text-ink mb-2">transiciones en esta estación (todas las sesiones)</h3>
+            ${edgeList(stationEdges, "sin historial agregado aún")}
+          </div>
+        </div>`;
+    }
+
     function renderPanel(tab) {
+      if (tab === "fm") {
+        renderFmPanel();
+        return;
+      }
+
       const filter = getFilterText();
       let items = getItemsForTab(tab);
       items = viewMode === "table" ? sortByTable(items) : sortByDropdown(items, tab);
@@ -671,15 +889,21 @@
       renderPanel("searches");
       renderPanel("library");
       renderPanel("likes");
+      renderPanel("fm");
     }
 
     function updateStats() {
+      const fmTracks = fmSessions.reduce((n, s) => n + (s.track_count || 0), 0);
       const parts = [
         `<strong class="font-medium text-ink">${library.length}</strong> biblioteca`,
         `<strong class="font-medium text-ink">${searches.length}</strong> búsquedas`,
         `<strong class="font-medium text-ink">${likes.length}</strong> likes`,
+        `<strong class="font-medium text-ink">${fmSessions.length}</strong> fm`,
         `<strong class="font-medium text-ink">${formatBytes(diskUsage.total_bytes)}</strong> disco`,
       ];
+      if (fmTracks > 0) {
+        parts.splice(4, 0, `<strong class="font-medium text-ink">${fmTracks}</strong> detecciones`);
+      }
       if (dedupePreview && dedupePreview.wasted_bytes > 0) {
         parts.push(`<span class="text-warn">${dedupePreview.duplicate_groups} dup</span>`);
       }
@@ -771,14 +995,16 @@
     }
 
     async function reloadData() {
-      const [libIndex, disk, dedupe] = await Promise.all([
+      const [libIndex, fmRaw, disk, dedupe] = await Promise.all([
         loadCacheJson("library_index.json"),
+        loadCacheJson("fm_sessions.json"),
         loadDiskUsage(),
         fetch("/api/library/dedupe-preview").then((r) => r.ok ? r.json() : null).catch(() => null),
       ]);
       diskUsage = disk;
       dedupePreview = dedupe;
       library = transformLibrary(libIndex);
+      fmSessions = transformFmSessions(fmRaw);
       updateStats();
       updateDedupeUi();
       renderAll();
@@ -859,11 +1085,17 @@
       btn.addEventListener("click", () => {
         activeTab = btn.dataset.tab;
         setTab();
-        ["searches", "library", "likes"].forEach((name) => {
+        ["searches", "library", "likes", "fm"].forEach((name) => {
           const panel = document.getElementById(`panel-${name}`);
           panel.className = name === activeTab ? "block" : "hidden";
         });
-        if (viewMode === "table") tableSort = { ...DEFAULT_TABLE_SORT[activeTab] };
+        // View toggle is for card/table tabs only
+        const viewToggle = document.getElementById("viewGrid")?.parentElement;
+        if (viewToggle) {
+          viewToggle.classList.toggle("hidden", activeTab === "fm");
+        }
+        document.getElementById("sortSelect").classList.toggle("hidden", activeTab === "fm" || viewMode === "table");
+        if (viewMode === "table" && activeTab !== "fm") tableSort = { ...DEFAULT_TABLE_SORT[activeTab] || DEFAULT_TABLE_SORT.searches };
         updateSortOptions();
         updateDedupeUi();
         renderPanel(activeTab);
@@ -884,12 +1116,14 @@
         document.getElementById(`grid${name}`).innerHTML = loadingHtml();
         document.getElementById(`table${name}`).innerHTML = loadingHtml();
       });
+      document.getElementById("fmSessionList").innerHTML = loadingHtml();
 
-      const [ytMeta, libIndex, likesRaw, playedRaw, disk] = await Promise.all([
+      const [ytMeta, libIndex, likesRaw, playedRaw, fmRaw, disk] = await Promise.all([
         loadCacheJson("youtube_metadata.json"),
         loadCacheJson("library_index.json"),
         loadCacheJson("likes.json"),
         loadCacheJson("played_ids.json"),
+        loadCacheJson("fm_sessions.json"),
         loadDiskUsage(),
       ]);
 
@@ -899,6 +1133,7 @@
           document.getElementById(`grid${name}`).innerHTML = emptyHtml("sin datos disponibles.");
           document.getElementById(`table${name}`).innerHTML = "";
         });
+        document.getElementById("fmSessionList").innerHTML = emptyHtml("sin datos disponibles.");
         setCacheBadge();
         return;
       }
@@ -908,14 +1143,15 @@
       searches = transformSearches(ytMeta);
       library = transformLibrary(libIndex);
       likes = transformLikes(likesRaw);
+      fmSessions = transformFmSessions(fmRaw);
       playedCount = countPlayedIds(playedRaw);
 
       await loadDedupePreview();
       updateStats();
       renderAll();
 
-      if (searches.length === 0 && library.length === 0 && likes.length === 0) {
-        showBanner("caché vacía — usa !play en discord", "info");
+      if (searches.length === 0 && library.length === 0 && likes.length === 0 && fmSessions.length === 0) {
+        showBanner("caché vacía — usa !play / !fm en discord", "info");
       }
     }
 

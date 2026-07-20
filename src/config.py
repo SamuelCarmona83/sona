@@ -265,6 +265,11 @@ FM_RECOGNIZER_INTERVAL_SEC = max(10.0, _env_float("FM_RECOGNIZER_INTERVAL_SEC", 
 FM_RECOGNIZER_SAMPLE_SEC = max(3.0, min(15.0, _env_float("FM_RECOGNIZER_SAMPLE_SEC", 8.0)))
 FM_RECOGNIZER_ANNOUNCE = _env_bool("FM_RECOGNIZER_ANNOUNCE")
 
+# FM detection history (sessions for explorer web)
+FM_HISTORY_ENABLED = _env_bool("FM_HISTORY_ENABLED")
+FM_HISTORY_MAX_SESSIONS = max(10, int(get_config_value("FM_HISTORY_MAX_SESSIONS", dotenv_values, "200")))
+FM_HISTORY_MAX_TRACKS_PER_SESSION = max(20, int(get_config_value("FM_HISTORY_MAX_TRACKS_PER_SESSION", dotenv_values, "500")))
+
 LIBRARY_ENABLED = _env_bool("LIBRARY_ENABLED")
 LIBRARY_PATH = get_config_value("LIBRARY_PATH", dotenv_values, ".cache/library")
 LIBRARY_MAX_TRACKS = max(10, int(get_config_value("LIBRARY_MAX_TRACKS", dotenv_values, "500")))
