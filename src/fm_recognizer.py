@@ -39,8 +39,31 @@ _FFMPEG_TIMEOUT_PAD_SEC = 12.0
 
 
 def match_key(artist: str, title: str) -> str:
-    """Stable dedupe key for a recognized track."""
+    """Stable dedupe key for a recognized track (exact normalized title)."""
     return f"{_normalize_key(artist)}|{_normalize_key(title)}"
+
+
+def soft_match_key(artist: str, title: str) -> str:
+    """Dedupe key that ignores live/remaster suffixes and bracket noise.
+
+    Shazam often returns near-duplicates like:
+      Break On Through … [Live … England, 1970]
+      Break On Through … [Live … 1970]
+    """
+    a = _normalize_key(artist)
+    t = _normalize_key(title)
+    t = re.sub(r"[\(\[].*?[\)\]]", " ", t)
+    t = re.sub(
+        r"\b("
+        r"live|remaster(?:ed)?|official|audio|visualizer|lyrics|lyric|"
+        r"hd|hq|4k|mv|version|edit|radio\s*edit|bonus|deluxe"
+        r")\b",
+        " ",
+        t,
+    )
+    t = re.sub(r"[^\w\s]", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return f"{a}|{t}"
 
 
 def _normalize_key(value: str) -> str:

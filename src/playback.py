@@ -1185,6 +1185,12 @@ async def start_radio_with_welcome(
         fill_task = asyncio.create_task(_fill())
         welcome_task = asyncio.create_task(_gen_welcome()) if DJ_ANNOUNCER_ENABLED else None
 
+        # Show player UI ASAP (while TTS / cold-fill still running)
+        try:
+            await update_player_embed(guild, text_channel)
+        except Exception as exc:
+            logger.debug("start_radio_with_welcome: early embed failed: %s", exc)
+
         dj_file: str | None = None
         if welcome_task:
             try:
@@ -1202,6 +1208,12 @@ async def start_radio_with_welcome(
             await fill_task
         except Exception as exc:
             logger.warning("start_radio_with_welcome: fill error: %s", exc)
+
+        # Refresh embed once queue is populated (cold-fill titles)
+        try:
+            await update_player_embed(guild, text_channel)
+        except Exception as exc:
+            logger.debug("start_radio_with_welcome: post-fill embed failed: %s", exc)
 
         if dj_file:
             from src.dj_announcer import cleanup_dj_audio, get_dj_ffmpeg_options

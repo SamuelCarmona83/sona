@@ -4,6 +4,7 @@ import json
 import os
 import pathlib
 import sys
+import time
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from typing import Optional
 from urllib.parse import urlparse
@@ -22,16 +23,33 @@ def _get_enrich_fns():
 CACHE_DIRS = (ROOT / ".cache", ROOT / "spotify_cache")
 SKIP_SUFFIXES = {".part", ".ytdl"}
 
+# Short TTL cache so explorer startup does not re-stat the whole library every load
+_DISK_USAGE_TTL_SEC = 45.0
+_disk_usage_cache: dict | None = None
+_disk_usage_cache_at: float = 0.0
 
-def build_disk_usage() -> dict:
+
+def build_disk_usage(*, force: bool = False) -> dict:
+    global _disk_usage_cache, _disk_usage_cache_at
+    now = time.time()
+    if (
+        not force
+        and _disk_usage_cache is not None
+        and (now - _disk_usage_cache_at) < _DISK_USAGE_TTL_SEC
+    ):
+        return _disk_usage_cache
+
     cache_dir = resolve_cache_dir(ROOT)
     if not cache_dir:
-        return {
+        result = {
             "total_bytes": 0,
             "files": {},
             "tracks_on_disk": 0,
             "library_path": None,
         }
+        _disk_usage_cache = result
+        _disk_usage_cache_at = now
+        return result
 
     library_dir = cache_dir / "library"
     files: dict[str, int] = {}
@@ -44,12 +62,15 @@ def build_disk_usage() -> dict:
             files[path.stem] = size
             total += size
 
-    return {
+    result = {
         "total_bytes": total,
         "files": files,
         "tracks_on_disk": len(files),
         "library_path": str(library_dir),
     }
+    _disk_usage_cache = result
+    _disk_usage_cache_at = now
+    return result
 
 
 class ExplorerHandler(SimpleHTTPRequestHandler):

@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from src.fm_recognizer import (
     match_key,
+    soft_match_key,
     parse_shazam_response,
     start_fm_recognizer,
     stop_fm_recognizer,
@@ -72,6 +73,21 @@ class MatchKeyTests(unittest.TestCase):
         self.assertNotEqual(
             match_key("Queen", "Don't Stop Me Now"),
             match_key("Queen", "Bohemian Rhapsody"),
+        )
+
+    def test_soft_key_collapses_live_variants(self) -> None:
+        a = soft_match_key(
+            "The Doors",
+            "Break On Through (To the Other Side) [Live at the Isle of Wight Festival, England, 1970]",
+        )
+        b = soft_match_key(
+            "The Doors",
+            "Break On Through (To the Other Side) [Live at the Isle of Wight Festival, 1970]",
+        )
+        self.assertEqual(a, b)
+        self.assertNotEqual(
+            soft_match_key("The Doors", "Break On Through"),
+            soft_match_key("The Doors", "Riders On The Storm"),
         )
 
 

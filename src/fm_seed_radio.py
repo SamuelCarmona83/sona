@@ -20,7 +20,12 @@ from src.config import (
     RADIO_QUEUE_TARGET_SIZE,
     RADIO_REQUESTER_LABEL,
 )
-from src.fm_recognizer import match_key, start_fm_recognizer, stop_fm_recognizer
+from src.fm_recognizer import (
+    match_key,
+    soft_match_key,
+    start_fm_recognizer,
+    stop_fm_recognizer,
+)
 
 # Genre seeds used for cold-fill when mood has no Spotify genres (e.g. rock-radio)
 _COLD_FILL_GENRE_MOOD: dict[str, str] = {
@@ -435,23 +440,24 @@ def _count_seed_tracks_in_queue(guild_id: int) -> int:
 
 def _already_queued_or_playing(guild_id: int, key: str, title: str, artist: str) -> bool:
     from src.playback import guild_session
-    from src.fm_recognizer import match_key as mk
 
+    soft = soft_match_key(artist, title)
     session = guild_session(guild_id)
     candidates = []
     if session.now_playing:
         candidates.append(session.now_playing)
     candidates.extend(list(session.queue))
     for t in candidates:
-        if t.get("fm_match_key") == key:
+        if t.get("fm_match_key") == key or t.get("fm_soft_key") == soft:
             return True
         t_title = (t.get("title") or "").strip()
         t_artist = (t.get("artist") or "").strip()
-        if t_title and mk(t_artist, t_title) == key:
+        if t_title and soft_match_key(t_artist, t_title) == soft:
             return True
-        # loose: yt_query contains both
-        yq = (t.get("yt_query") or "").lower()
-        if artist.lower() in yq and title.lower() in yq:
+        # loose: core words of title appear in yt_query / title
+        yq = (t.get("yt_query") or t.get("title") or "").lower()
+        core = soft.split("|", 1)[-1]
+        if artist.lower() in yq and core and core in yq:
             return True
     return False
 
@@ -474,17 +480,19 @@ async def _handle_seed_match(guild: Any, text_channel: Any, mood: str, match: di
     if not title:
         return
     key = match_key(artist, title)
+    soft = soft_match_key(artist, title)
+
+    # Dedupe near-identical Shazam titles before writing history
+    if _last_enqueued_key.get(guild_id) in (key, soft):
+        return
+    if _already_queued_or_playing(guild_id, key, title, artist):
+        _last_enqueued_key[guild_id] = soft
+        return
 
     try:
         append_detection(guild_id, match)
     except Exception as exc:
         logger.debug("fm_seed: history append: %s", exc)
-
-    if _last_enqueued_key.get(guild_id) == key:
-        return
-    if _already_queued_or_playing(guild_id, key, title, artist):
-        _last_enqueued_key[guild_id] = key
-        return
     if _count_seed_tracks_in_queue(guild_id) >= RADIO_QUEUE_TARGET_SIZE:
         logger.debug("fm_seed: queue full of seed tracks guild=%s", guild_id)
         return
@@ -505,6 +513,7 @@ async def _handle_seed_match(guild: Any, text_channel: Any, mood: str, match: di
         "from_fm_seed": True,
         "fm_seed_mood": mood,
         "fm_match_key": key,
+        "fm_soft_key": soft,
         "recognized_shazam_url": match.get("shazam_url"),
     }
 
@@ -524,6 +533,7 @@ async def _handle_seed_match(guild: Any, text_channel: Any, mood: str, match: di
             track["from_fm_seed"] = True
             track["fm_seed_mood"] = mood
             track["fm_match_key"] = key
+            track["fm_soft_key"] = soft
             track["requester"] = RADIO_REQUESTER_LABEL
             track["recognized_shazam_url"] = match.get("shazam_url")
             track = _apply_shazam_cover(track)
@@ -576,13 +586,14 @@ async def _handle_seed_match(guild: Any, text_channel: Any, mood: str, match: di
     session = guild_session(guild_id)
     session.queue.append(track)
     queues[guild_id] = session.queue
-    _last_enqueued_key[guild_id] = key
+    _last_enqueued_key[guild_id] = soft
     logger.info(
-        "fm_seed: enqueued '%s' — '%s' guild=%s mood=%s",
+        "fm_seed: enqueued '%s' — '%s' guild=%s mood=%s soft_key=%s",
         artist,
         title,
         guild_id,
         mood,
+        soft,
     )
 
     vc = guild.voice_client

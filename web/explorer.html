@@ -155,6 +155,11 @@
     let diskUsage = { total_bytes: 0, files: {}, tracks_on_disk: 0 };
     let dedupePreview = null;
     let libraryGrouped = true;
+    /** First paint only shows this many cards (full list remains filterable). */
+    const GRID_INITIAL_LIMIT = 36;
+    let gridLimit = { searches: GRID_INITIAL_LIMIT, library: GRID_INITIAL_LIMIT, likes: GRID_INITIAL_LIMIT };
+    let secondaryDataLoaded = false;
+    let searchDebounceTimer = null;
 
     const TABLE_COLUMNS = {
       searches: [
@@ -191,7 +196,9 @@
     };
 
     async function loadCacheJson(filename) {
-      for (const dir of CACHE_DIRS) {
+      // Sticky cache dir: avoid re-probing .cache then spotify_cache on every file
+      const dirs = cacheDir ? [cacheDir, ...CACHE_DIRS.filter((d) => d !== cacheDir)] : CACHE_DIRS;
+      for (const dir of dirs) {
         try {
           const res = await fetch(`/${dir}/${filename}`);
           if (res.ok) {
@@ -859,13 +866,31 @@
         return;
       }
 
-      countEl.textContent = filter ? `${items.length} / filtro` : "";
+      const total = items.length;
+      countEl.textContent = filter ? `${total} / filtro` : `${total}`;
 
       if (viewMode === "grid") {
-        grid.innerHTML = items.map(renderFns[tab]).join("");
+        const limit = gridLimit[tab] || GRID_INITIAL_LIMIT;
+        const visible = items.slice(0, limit);
+        let html = visible.map(renderFns[tab]).join("");
+        if (total > visible.length) {
+          html += `
+            <button type="button" data-show-more="${tab}"
+              class="col-span-full py-3 text-sm font-medium text-ink border border-black/10 hover:bg-soft">
+              mostrar más (${total - visible.length} restantes)
+            </button>`;
+        }
+        grid.innerHTML = html;
         grid.classList.remove("hidden");
         table.classList.add("hidden");
         table.innerHTML = "";
+        grid.querySelectorAll("[data-show-more]").forEach((btn) => {
+          btn.addEventListener("click", () => {
+            const t = btn.dataset.showMore;
+            gridLimit[t] = (gridLimit[t] || GRID_INITIAL_LIMIT) + GRID_INITIAL_LIMIT;
+            renderPanel(t);
+          });
+        });
       } else {
         table.innerHTML = renderTable(tab, items);
         table.classList.remove("hidden");
@@ -886,10 +911,8 @@
     }
 
     function renderAll() {
-      renderPanel("searches");
-      renderPanel("library");
-      renderPanel("likes");
-      renderPanel("fm");
+      // Only paint the visible tab — hidden tabs wait until selected
+      renderPanel(activeTab);
     }
 
     function updateStats() {
@@ -1005,6 +1028,7 @@
       dedupePreview = dedupe;
       library = transformLibrary(libIndex);
       fmSessions = transformFmSessions(fmRaw);
+      secondaryDataLoaded = true;
       updateStats();
       updateDedupeUi();
       renderAll();
@@ -1098,7 +1122,11 @@
         if (viewMode === "table" && activeTab !== "fm") tableSort = { ...DEFAULT_TABLE_SORT[activeTab] || DEFAULT_TABLE_SORT.searches };
         updateSortOptions();
         updateDedupeUi();
-        renderPanel(activeTab);
+        if (!secondaryDataLoaded && (activeTab === "likes" || activeTab === "fm")) {
+          loadSecondaryData().then(() => renderPanel(activeTab)).catch(() => renderPanel(activeTab));
+        } else {
+          renderPanel(activeTab);
+        }
       });
     });
 
@@ -1108,8 +1136,36 @@
     document.getElementById("libDetailed").addEventListener("click", () => setLibraryGrouped(false));
     document.getElementById("dedupeBtn").addEventListener("click", runDedupe);
     document.getElementById("enrichBtn").addEventListener("click", runEnrich);
-    document.getElementById("searchInput").addEventListener("input", renderAll);
+    document.getElementById("searchInput").addEventListener("input", () => {
+      clearTimeout(searchDebounceTimer);
+      searchDebounceTimer = setTimeout(() => {
+        // Reset page limits on new filter so "mostrar más" stays sensible
+        gridLimit = { searches: GRID_INITIAL_LIMIT, library: GRID_INITIAL_LIMIT, likes: GRID_INITIAL_LIMIT };
+        renderAll();
+      }, 180);
+    });
     document.getElementById("sortSelect").addEventListener("change", renderAll);
+
+    async function loadSecondaryData() {
+      if (secondaryDataLoaded) return;
+      const [likesRaw, playedRaw, fmRaw, libIndex] = await Promise.all([
+        loadCacheJson("likes.json"),
+        loadCacheJson("played_ids.json"),
+        loadCacheJson("fm_sessions.json"),
+        library.length ? Promise.resolve(null) : loadCacheJson("library_index.json"),
+      ]);
+      likes = transformLikes(likesRaw);
+      fmSessions = transformFmSessions(fmRaw);
+      playedCount = countPlayedIds(playedRaw);
+      if (libIndex) library = transformLibrary(libIndex);
+      secondaryDataLoaded = true;
+      updateStats();
+      // Refresh active tab if it needed secondary data
+      if (["likes", "fm", "library"].includes(activeTab)) {
+        renderPanel(activeTab);
+      }
+      loadDedupePreview().catch(() => {});
+    }
 
     async function init() {
       ["Searches", "Library", "Likes"].forEach((name) => {
@@ -1117,13 +1173,12 @@
         document.getElementById(`table${name}`).innerHTML = loadingHtml();
       });
       document.getElementById("fmSessionList").innerHTML = loadingHtml();
+      document.getElementById("statsLine").innerHTML = "cargando…";
 
-      const [ytMeta, libIndex, likesRaw, playedRaw, fmRaw, disk] = await Promise.all([
+      // Phase 1: critical path for default tab (searches) + disk + library for stats
+      const [ytMeta, libIndex, disk] = await Promise.all([
         loadCacheJson("youtube_metadata.json"),
         loadCacheJson("library_index.json"),
-        loadCacheJson("likes.json"),
-        loadCacheJson("played_ids.json"),
-        loadCacheJson("fm_sessions.json"),
         loadDiskUsage(),
       ]);
 
@@ -1142,15 +1197,16 @@
       setCacheBadge();
       searches = transformSearches(ytMeta);
       library = transformLibrary(libIndex);
-      likes = transformLikes(likesRaw);
-      fmSessions = transformFmSessions(fmRaw);
-      playedCount = countPlayedIds(playedRaw);
-
-      await loadDedupePreview();
       updateStats();
-      renderAll();
+      renderPanel(activeTab); // first paint — only visible tab
 
-      if (searches.length === 0 && library.length === 0 && likes.length === 0 && fmSessions.length === 0) {
+      // Phase 2: secondary JSON + dedupe off the critical path
+      const idle = window.requestIdleCallback || ((fn) => setTimeout(fn, 50));
+      idle(() => {
+        loadSecondaryData().catch((err) => console.warn("secondary load", err));
+      });
+
+      if (searches.length === 0 && library.length === 0) {
         showBanner("caché vacía — usa !play / !fm en discord", "info");
       }
     }
