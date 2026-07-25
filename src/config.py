@@ -270,13 +270,16 @@ def apply_cookie_strategy(*, log_stale: bool = True) -> None:
         else:
             logger.info("yt-dlp: no cookies configured — running without cookies (optional)")
     elif preference == "file":
+        # Explicit file mode (Docker default): never fall back to browser cookies.
+        # Inside containers there is no Chrome profile; missing file = cookieless.
         if exists:
             _apply_ytdl_cookie_file(status, log_stale=log_stale)
-        elif COOKIE_BROWSER_ENABLED:
-            logger.warning("yt-dlp: cookies file not found; falling back to browser cookies")
-            _apply_ytdl_browser_cookies()
         else:
-            logger.info("yt-dlp: no cookies file — running without cookies (optional)")
+            logger.info(
+                "yt-dlp: cookies file not found at %s — running without cookies (optional). "
+                "Mount a Netscape cookies.txt or run ./refresh_cookies.sh on the host to enable them.",
+                COOKIES_FILE,
+            )
     else:
         if exists and fresh:
             _apply_ytdl_cookie_file(status, log_stale=log_stale)

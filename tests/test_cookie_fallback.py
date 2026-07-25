@@ -54,7 +54,34 @@ class TestCookieLoadErrorDetection(unittest.TestCase):
         self.assertTrue(is_cookie_load_error(outer))
 
 
+class TestFilePreferenceNoBrowserFallback(unittest.TestCase):
+    def test_file_mode_missing_file_stays_cookieless(self):
+        """Docker default preference=file must not fall back to browser cookies."""
+        import src.config as cfg
+
+        prev_pref = cfg.COOKIES_PREFERENCE
+        prev_file = cfg.COOKIES_FILE
+        prev_browser = cfg.COOKIE_BROWSER_ENABLED
+        prev_unusable = cfg._cookies_unusable
+        try:
+            cfg.COOKIES_PREFERENCE = "file"
+            cfg.COOKIES_FILE = "/tmp/definitely-missing-sona-cookies.txt"
+            cfg.COOKIE_BROWSER_ENABLED = True
+            cfg._cookies_unusable = False
+            cfg.apply_cookie_strategy(log_stale=False)
+            status = cfg.get_cookie_status()
+            self.assertFalse(status["using_file"])
+            self.assertFalse(status["using_browser"])
+        finally:
+            cfg.COOKIES_PREFERENCE = prev_pref
+            cfg.COOKIES_FILE = prev_file
+            cfg.COOKIE_BROWSER_ENABLED = prev_browser
+            cfg._cookies_unusable = prev_unusable
+            cfg.apply_cookie_strategy(log_stale=False)
+
+
 class TestCookieFallbackYDL(unittest.TestCase):
+
     def setUp(self):
         import src.config as cfg
 

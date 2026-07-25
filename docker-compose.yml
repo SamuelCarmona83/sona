@@ -17,7 +17,9 @@ services:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       NORMALIZE_AUDIO: true
       YTDL_COOKIES_FILE: /app/cookies.txt
+      # file-only in containers: browser cookie extraction never works headless
       YTDL_COOKIES_PREFERENCE: file
+      YTDL_COOKIES_FROM_BROWSER: ""
       YTDL_SEARCH_CONCURRENCY: 1
       YTDL_SEARCH_DELAY_SEC: 7.0
       YTDL_SEARCH_DELAY_URGENT_SEC: 0.5
