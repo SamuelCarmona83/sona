@@ -16,6 +16,8 @@ from src.config import (
     YTDL_OPTIONS,
     YTDL_OPTIONS_NO_COOKIES,
     get_cookie_status,
+    is_cookie_load_error,
+    mark_cookies_unusable,
     SEARCH_RESULT_COUNT,
     MIN_SEARCH_SCORE,
     LLM_SCORE_MARGIN,
@@ -83,12 +85,18 @@ async def extract_youtube_tracks(url: str) -> list[dict]:
         with _CookieFallbackYDL(opts) as ydl:
             try:
                 info = ydl.extract_info(url, download=False)
-            except yt_dlp.utils.DownloadError as e:
-                err = str(e)
-                maybe_detect_rate_limit(err)
-                maybe_detect_auth_failure(err)
-                logger.warning("extract_youtube_tracks: DownloadError: %s", e)
-                return []
+            except Exception as e:
+                if is_cookie_load_error(e):
+                    mark_cookies_unusable(str(e))
+                    logger.warning("extract_youtube_tracks: cookie load failed, giving up this request: %s", e)
+                    return []
+                if isinstance(e, yt_dlp.utils.DownloadError):
+                    err = str(e)
+                    maybe_detect_rate_limit(err)
+                    maybe_detect_auth_failure(err)
+                    logger.warning("extract_youtube_tracks: DownloadError: %s", e)
+                    return []
+                raise
             if not info:
                 return []
 
@@ -287,12 +295,18 @@ def _extract_video_sync(video_id: str, base_opts: dict) -> dict | None:
                 f"https://www.youtube.com/watch?v={video_id}",
                 download=False,
             )
-        except yt_dlp.utils.DownloadError as e:
-            err = str(e)
-            maybe_detect_rate_limit(err)
-            maybe_detect_auth_failure(err)
-            logger.warning("youtube.refresh_url: DownloadError for %s: %s", video_id, e)
-            return None
+        except Exception as e:
+            if is_cookie_load_error(e):
+                mark_cookies_unusable(str(e))
+                logger.warning("youtube.refresh_url: cookie load failed for %s: %s", video_id, e)
+                return None
+            if isinstance(e, yt_dlp.utils.DownloadError):
+                err = str(e)
+                maybe_detect_rate_limit(err)
+                maybe_detect_auth_failure(err)
+                logger.warning("youtube.refresh_url: DownloadError for %s: %s", video_id, e)
+                return None
+            raise
     if not info or not info.get("url"):
         return None
     return {
@@ -476,12 +490,18 @@ def _search_sync(query: str, base_opts: dict) -> list[dict]:
     with _CookieFallbackYDL(opts) as ydl:
         try:
             info = ydl.extract_info(f"ytsearch{SEARCH_RESULT_COUNT}:{query}", download=False)
-        except yt_dlp.utils.DownloadError as e:
-            err = str(e)
-            maybe_detect_rate_limit(err)
-            maybe_detect_auth_failure(err)
-            logger.warning("_search_candidates: DownloadError buscando '%s': %s", query, e)
-            return []
+        except Exception as e:
+            if is_cookie_load_error(e):
+                mark_cookies_unusable(str(e))
+                logger.warning("_search_candidates: cookie load failed for '%s': %s", query, e)
+                return []
+            if isinstance(e, yt_dlp.utils.DownloadError):
+                err = str(e)
+                maybe_detect_rate_limit(err)
+                maybe_detect_auth_failure(err)
+                logger.warning("_search_candidates: DownloadError buscando '%s': %s", query, e)
+                return []
+            raise
     return _parse_search_entries(query, info)
 
 

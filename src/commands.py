@@ -577,6 +577,21 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
         logger.warning("[ERROR] %s: voice/timeout error: %s", ctx.command, cause)
         return
 
+    # Cookies are optional; a load failure should not surface as a cryptic exception.
+    try:
+        from src.config import is_cookie_load_error, mark_cookies_unusable
+        if is_cookie_load_error(cause):
+            mark_cookies_unusable(str(cause))
+            await ctx.send(
+                "No pude cargar las cookies de YouTube (son opcionales). "
+                "Sigo sin cookies; si falla la busqueda, el admin puede refrescar con "
+                "`./refresh_cookies.sh chrome` o revisar `!cookies`."
+            )
+            logger.warning("[ERROR] %s: cookie load error (degraded to cookieless): %s", ctx.command, cause)
+            return
+    except ImportError:
+        pass
+
     await ctx.send(f"Error inesperado: `{error}`")
     logger.error(f"[ERROR] {ctx.command}: {error}")
 
@@ -630,8 +645,21 @@ async def cookies_cmd(ctx: commands.Context):
     age = s.get("age_h")
     age_str = f"{age:.1f}h" if age is not None else "n/a"
     fresh = "si" if s.get("fresh") else "no"
-    embed = discord.Embed(title="Estado de cookies YouTube", color=0xFFAA00 if s.get("fresh") else 0xFF5555)
+    if s.get("unusable"):
+        mode = "deshabilitadas (cookieless)"
+        color = 0xFFAA00
+    elif s.get("using_file"):
+        mode = "archivo"
+        color = 0x57F287 if s.get("fresh") else 0xFFAA00
+    elif s.get("using_browser"):
+        mode = "browser"
+        color = 0x57F287
+    else:
+        mode = "sin cookies (opcional)"
+        color = 0x99AAB5
+    embed = discord.Embed(title="Estado de cookies YouTube", color=color)
     embed.add_field(name="Archivo", value=f"`{s.get('path')}`", inline=False)
+    embed.add_field(name="Modo activo", value=mode, inline=True)
     embed.add_field(name="Edad", value=age_str, inline=True)
     embed.add_field(name="Frescas", value=fresh, inline=True)
     embed.add_field(name="Cookies exportadas", value=str(s.get("count", 0)), inline=True)
@@ -644,7 +672,11 @@ async def cookies_cmd(ctx: commands.Context):
     )
     embed.add_field(
         name="Si necesitas refrescar",
-        value="En el Mac: `./refresh_cookies.sh chrome`\nEl bot detecta el cambio sin reiniciar Docker.",
+        value=(
+            "Cookies son opcionales: sin ellas el bot sigue en modo cookieless.\n"
+            "En el Mac: `./refresh_cookies.sh chrome`\n"
+            "El bot detecta el cambio sin reiniciar Docker."
+        ),
         inline=False,
     )
     await ctx.send(embed=embed, delete_after=60)

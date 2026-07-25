@@ -671,6 +671,12 @@ def _download_sync(video_id: str, tid: str, track: dict) -> str | None:
         logger.warning("library: download failed for %s: %s", video_id, exc)
         return None
     except Exception as exc:
+        try:
+            from src.config import is_cookie_load_error, mark_cookies_unusable
+            if is_cookie_load_error(exc):
+                mark_cookies_unusable(str(exc))
+        except Exception:
+            pass
         logger.warning("library: download failed for %s: %s", video_id, exc)
         return None
 

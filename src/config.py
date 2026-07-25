@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 import time
 
 import spotipy
@@ -77,6 +78,34 @@ COOKIE_ALERT_COOLDOWN_SEC = max(3600, int(get_config_value("COOKIE_ALERT_COOLDOW
 
 _cookie_mtime: float = 0.0
 _last_cookie_reload: float = 0.0
+# Cookies are optional. After a load failure we stay cookieless until cookies.txt changes.
+_cookies_unusable: bool = False
+
+# CookieLoadError introduced in newer yt-dlp; guard for older versions.
+try:
+    from yt_dlp.cookies import CookieLoadError
+except ImportError:  # pragma: no cover
+    CookieLoadError = None  # type: ignore[assignment,misc]
+
+_COOKIE_ERROR_KEYWORDS = (
+    "cookie",
+    "netscape",
+    "cookiefile",
+    "cookiesfrombrowser",
+    "failed to load cookies",
+    "failed to parse cookies",
+    "_parse_browser_specification",
+)
+
+# Same shape as yt-dlp CLI --cookies-from-browser (see yt_dlp/__init__.py).
+_BROWSER_COOKIES_SPEC_RE = re.compile(
+    r"""(?x)
+    (?P<name>[^+:]+)
+    (?:\s*\+\s*(?P<keyring>[^:]+))?
+    (?:\s*:\s*(?!:)(?P<profile>.+?))?
+    (?:\s*::\s*(?P<container>.+))?
+    """
+)
 
 
 def _count_cookie_lines(path: str) -> int:
@@ -114,12 +143,80 @@ def get_cookie_status() -> dict:
         "last_reload": _last_cookie_reload,
         "using_file": "cookiefile" in _ytdl_base_options,
         "using_browser": "cookiesfrombrowser" in _ytdl_base_options,
+        "unusable": _cookies_unusable,
     }
 
 
 def _clear_ytdl_cookie_options() -> None:
     _ytdl_base_options.pop("cookiefile", None)
     _ytdl_base_options.pop("cookiesfrombrowser", None)
+
+
+def is_cookie_load_error(exc: BaseException) -> bool:
+    """True when yt-dlp failed to load/parse cookies (optional feature)."""
+    seen: set[int] = set()
+    stack: list[BaseException] = [exc]
+    while stack:
+        cur = stack.pop()
+        if cur is None or id(cur) in seen:
+            continue
+        seen.add(id(cur))
+        if CookieLoadError is not None and isinstance(cur, CookieLoadError):
+            return True
+        err_msg = str(cur).lower()
+        if any(keyword in err_msg for keyword in _COOKIE_ERROR_KEYWORDS):
+            return True
+        for attr in ("__cause__", "__context__"):
+            nested = getattr(cur, attr, None)
+            if isinstance(nested, BaseException):
+                stack.append(nested)
+    return False
+
+
+def mark_cookies_unusable(reason: str) -> None:
+    """Disable cookie options globally until cookies.txt is refreshed."""
+    global _cookies_unusable
+    if _cookies_unusable and "cookiefile" not in _ytdl_base_options and "cookiesfrombrowser" not in _ytdl_base_options:
+        return
+    _cookies_unusable = True
+    _clear_ytdl_cookie_options()
+    logger.warning(
+        "yt-dlp: cookies disabled after load failure (%s); continuing without cookies",
+        reason,
+    )
+
+
+def cookieless_merged_opts(opts: dict) -> dict:
+    """Caller opts on top of the cookieless base, with cookie keys stripped."""
+    merged = {**YTDL_OPTIONS_NO_COOKIES, **opts}
+    merged.pop("cookiefile", None)
+    merged.pop("cookiesfrombrowser", None)
+    return merged
+
+
+def _parse_browser_cookies_spec(spec: str):
+    """Return yt-dlp cookiesfrombrowser tuple, or None if invalid.
+
+    Accepts CLI-style strings: chrome, firefox:Profile, chrome+KEYRING:Profile.
+    Legacy multi-browser values like "chrome,firefox" use the first entry only.
+    """
+    raw = (spec or "").strip()
+    if not raw:
+        return None
+    # Historical default was "chrome,firefox"; API only supports one browser.
+    if "," in raw and "+" not in raw.split(",", 1)[0]:
+        raw = raw.split(",", 1)[0].strip()
+    mobj = _BROWSER_COOKIES_SPEC_RE.fullmatch(raw)
+    if mobj is None:
+        logger.warning("yt-dlp: invalid YTDL_COOKIES_FROM_BROWSER=%r", spec)
+        return None
+    browser_name = mobj.group("name").lower()
+    keyring = mobj.group("keyring")
+    profile = mobj.group("profile")
+    container = mobj.group("container")
+    if keyring is not None:
+        keyring = keyring.upper()
+    return (browser_name, profile, keyring, container)
 
 
 def _apply_ytdl_cookie_file(status: dict, *, log_stale: bool) -> None:
@@ -134,9 +231,13 @@ def _apply_ytdl_cookie_file(status: dict, *, log_stale: bool) -> None:
 
 
 def _apply_ytdl_browser_cookies() -> None:
-    browser_spec = COOKIES_BROWSER or "chrome,firefox"
-    _ytdl_base_options["cookiesfrombrowser"] = browser_spec
-    logger.info("yt-dlp: using browser cookies: %s", browser_spec)
+    browser_spec = COOKIES_BROWSER or "chrome"
+    parsed = _parse_browser_cookies_spec(browser_spec)
+    if parsed is None:
+        logger.warning("yt-dlp: browser cookies requested but spec is invalid; skipping")
+        return
+    _ytdl_base_options["cookiesfrombrowser"] = parsed
+    logger.info("yt-dlp: using browser cookies: %s", parsed[0])
 
 
 def apply_cookie_strategy(*, log_stale: bool = True) -> None:
@@ -150,6 +251,13 @@ def apply_cookie_strategy(*, log_stale: bool = True) -> None:
     status = get_cookie_status()
     _clear_ytdl_cookie_options()
 
+    if _cookies_unusable:
+        logger.info("yt-dlp: cookies marked unusable; running cookieless until cookies.txt changes")
+        if status["exists"]:
+            _cookie_mtime = status["mtime"]
+        _last_cookie_reload = time.time()
+        return
+
     exists = status["exists"]
     fresh = status["fresh"]
 
@@ -160,7 +268,7 @@ def apply_cookie_strategy(*, log_stale: bool = True) -> None:
             logger.warning("yt-dlp: browser cookies requested but not enabled; falling back to cookies file")
             _apply_ytdl_cookie_file(status, log_stale=log_stale)
         else:
-            logger.warning("yt-dlp: no browser cookies configured and no cookies file found")
+            logger.info("yt-dlp: no cookies configured — running without cookies (optional)")
     elif preference == "file":
         if exists:
             _apply_ytdl_cookie_file(status, log_stale=log_stale)
@@ -168,7 +276,7 @@ def apply_cookie_strategy(*, log_stale: bool = True) -> None:
             logger.warning("yt-dlp: cookies file not found; falling back to browser cookies")
             _apply_ytdl_browser_cookies()
         else:
-            logger.warning("yt-dlp: no cookies file or browser cookies configured")
+            logger.info("yt-dlp: no cookies file — running without cookies (optional)")
     else:
         if exists and fresh:
             _apply_ytdl_cookie_file(status, log_stale=log_stale)
@@ -182,7 +290,7 @@ def apply_cookie_strategy(*, log_stale: bool = True) -> None:
         elif exists:
             _apply_ytdl_cookie_file(status, log_stale=log_stale)
         else:
-            logger.warning("yt-dlp: no cookies file or browser cookies configured")
+            logger.info("yt-dlp: no cookies configured — running without cookies (optional)")
 
     if exists:
         _cookie_mtime = status["mtime"]
@@ -190,12 +298,17 @@ def apply_cookie_strategy(*, log_stale: bool = True) -> None:
 
 
 def reload_cookies_if_changed() -> bool:
+    global _cookies_unusable
     if not COOKIES_FILE or not os.path.isfile(COOKIES_FILE):
         return False
     mtime = os.path.getmtime(COOKIES_FILE)
-    if mtime == _cookie_mtime:
+    if mtime == _cookie_mtime and not _cookies_unusable:
+        return False
+    if mtime == _cookie_mtime and _cookies_unusable:
+        # Same file still marked bad — nothing new to try.
         return False
     logger.info("cookie_health: cookies.txt changed on disk, reloading session")
+    _cookies_unusable = False
     apply_cookie_strategy(log_stale=True)
     return True
 
@@ -214,24 +327,13 @@ YTDL_OPTIONS_NO_COOKIES = {
 YTDL_OPTIONS_NO_COOKIES.pop("cookiefile", None)
 YTDL_OPTIONS_NO_COOKIES.pop("cookiesfrombrowser", None)
 
-# CookieLoadError introduced in newer yt-dlp; guard for older versions.
-try:
-    from yt_dlp.cookies import CookieLoadError
-except ImportError:  # pragma: no cover
-    CookieLoadError = None  # type: ignore[assignment]
-
-_COOKIE_ERROR_KEYWORDS = (
-    "cookie",
-    "netscape",
-    "cookiefile",
-    "failed to load cookies",
-    "failed to parse cookies",
-)
-
 
 class _CookieFallbackYDL:
-    """Context manager that catches cookie-related errors during YoutubeDL init
-    and retries with YTDL_OPTIONS_NO_COOKIES merged with caller opts automatically."""
+    """YoutubeDL session that treats cookies as optional.
+
+    Cookie load is lazy inside yt-dlp (cookiejar property). We force it on enter
+    so CookieLoadError is caught here and the session is rebuilt cookieless.
+    """
 
     def __init__(self, opts: dict):
         self._opts = opts
@@ -239,24 +341,20 @@ class _CookieFallbackYDL:
 
     def __enter__(self):
         import yt_dlp  # lazy
+
+        opts = self._opts
+        if _cookies_unusable:
+            opts = cookieless_merged_opts(opts)
+
         try:
-            self._ydl = yt_dlp.YoutubeDL(self._opts)
+            self._ydl = yt_dlp.YoutubeDL(opts)
+            # Eager cookie load: failure happens here, not mid extract_info.
+            if opts.get("cookiefile") or opts.get("cookiesfrombrowser"):
+                _ = self._ydl.cookiejar
         except Exception as exc:
-            err_msg = str(exc).lower()
-            is_cookie_error = (
-                (CookieLoadError is not None and isinstance(exc, CookieLoadError))
-                or any(keyword in err_msg for keyword in _COOKIE_ERROR_KEYWORDS)
-            )
-            if is_cookie_error:
-                logging.getLogger(__name__).warning(
-                    "Cookie load failed (%s), falling back to cookieless yt-dlp session",
-                    type(exc).__name__,
-                )
-                # Merge: NO_COOKIES base + caller's specific opts, strip cookie refs
-                merged = {**YTDL_OPTIONS_NO_COOKIES, **self._opts}
-                merged.pop("cookiefile", None)
-                merged.pop("cookiesfrombrowser", None)
-                self._ydl = yt_dlp.YoutubeDL(merged)
+            if is_cookie_load_error(exc):
+                mark_cookies_unusable(f"{type(exc).__name__}: {exc}")
+                self._ydl = yt_dlp.YoutubeDL(cookieless_merged_opts(self._opts))
             else:
                 raise
         return self._ydl
