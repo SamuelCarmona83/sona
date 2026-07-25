@@ -399,11 +399,12 @@ FFMPEG_OPTIONS = _build_ffmpeg_options(for_streaming=True)
 SEARCH_RESULT_COUNT = 5
 MIN_SEARCH_SCORE = 6.0
 RADIO_REQUESTER_LABEL = "📻 Radio"
-RADIO_QUEUE_REFILL_THRESHOLD = 4
-RADIO_QUEUE_TARGET_SIZE = 8
+RADIO_QUEUE_REFILL_THRESHOLD = max(2, int(get_config_value("RADIO_QUEUE_REFILL_THRESHOLD", dotenv_values, "3")))
+RADIO_QUEUE_TARGET_SIZE = max(4, int(get_config_value("RADIO_QUEUE_TARGET_SIZE", dotenv_values, "6")))
+RADIO_RECS_OVERFETCH = max(1, int(get_config_value("RADIO_RECS_OVERFETCH", dotenv_values, "2")))
 LLM_SCORE_MARGIN = 4.5
 LLM_RANKING_TIMEOUT = 8.0
-LLM_ALBUM_TRACK_RANKING_LIMIT = 3
+LLM_ALBUM_TRACK_RANKING_LIMIT = max(0, int(get_config_value("LLM_ALBUM_TRACK_RANKING_LIMIT", dotenv_values, "2")))
 ANTHROPIC_API_KEY = get_config_value("ANTHROPIC_API_KEY", dotenv_values, "")
 ANTHROPIC_MODEL = "claude-haiku-4-5"
 

@@ -10,6 +10,7 @@ from src.config import (
     LLM_ALBUM_TRACK_RANKING_LIMIT,
     RADIO_QUEUE_REFILL_THRESHOLD,
     RADIO_QUEUE_TARGET_SIZE,
+    RADIO_RECS_OVERFETCH,
 )
 
 logger = logging.getLogger(__name__)
@@ -864,14 +865,14 @@ async def fill_radio_queue(
                         await play_next(guild, vc, text_channel)
                     return
 
-        recs = await _get_recommendations_hybrid(seed_tracks, seed_genres, limit=needed + 3)
+        recs = await _get_recommendations_hybrid(seed_tracks, seed_genres, limit=needed + RADIO_RECS_OVERFETCH)
         using_fallback = False
         if not recs:
             logger.warning(
                 "radio.fill: Hybrid recommendations exhausted for guild=%s, usando fallback YouTube",
                 gid,
             )
-            recs = await _youtube_fallback_fill(gid, needed + 3)
+            recs = await _youtube_fallback_fill(gid, needed + RADIO_RECS_OVERFETCH)
             using_fallback = True
 
         if not recs:
