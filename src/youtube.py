@@ -80,7 +80,7 @@ async def extract_youtube_tracks(url: str) -> list[dict]:
             "logger": _YtDlpLogger(),
             "noplaylist": url_type == "track",
         }
-        with yt_dlp.YoutubeDL(opts) as ydl:
+        with _CookieFallbackYDL(opts) as ydl:
             try:
                 info = ydl.extract_info(url, download=False)
             except yt_dlp.utils.DownloadError as e:
@@ -200,6 +200,58 @@ def _should_try_cookieless() -> bool:
     return not status.get("fresh", True)
 
 
+# CookieLoadError introduced in newer yt-dlp; guard for older versions.
+try:
+    from yt_dlp.cookies import CookieLoadError
+except ImportError:  # pragma: no cover
+    CookieLoadError = None  # type: ignore[assignment]
+
+
+_COOKIE_ERROR_KEYWORDS = (
+    "cookie",
+    "netscape",
+    "cookiefile",
+    "failed to load cookies",
+    "failed to parse cookies",
+)
+
+
+class _CookieFallbackYDL:
+    """Context manager that catches cookie-related errors during YoutubeDL init
+    and retries with YTDL_OPTIONS_NO_COOKIES automatically."""
+
+    def __init__(self, opts: dict, fallback_opts: dict | None = None):
+        self._opts = opts
+        self._fallback = fallback_opts if fallback_opts is not None else YTDL_OPTIONS_NO_COOKIES
+        self._ydl = None
+
+    def __enter__(self):
+        import yt_dlp  # lazy
+        try:
+            self._ydl = yt_dlp.YoutubeDL(self._opts)
+        except Exception as exc:
+            err_msg = str(exc).lower()
+            is_cookie_error = (
+                (CookieLoadError is not None and isinstance(exc, CookieLoadError))
+                or any(keyword in err_msg for keyword in _COOKIE_ERROR_KEYWORDS)
+            )
+            if is_cookie_error:
+                logger.warning(
+                    "Cookie load failed (%s), falling back to cookieless yt-dlp session",
+                    type(exc).__name__,
+                )
+                set_youtube_auth_failed()
+                self._ydl = yt_dlp.YoutubeDL(self._fallback)
+            else:
+                raise
+        return self._ydl
+
+    def __exit__(self, *args):
+        if self._ydl is not None:
+            self._ydl.close()
+        return False
+
+
 def _load_metadata_index() -> None:
     global _metadata_index
     if not _METADATA_PATH.exists():
@@ -278,7 +330,7 @@ def _set_cached_url(cache_key: str, candidate: dict) -> dict:
 def _extract_video_sync(video_id: str, base_opts: dict) -> dict | None:
     import yt_dlp  # lazy
     opts = {**base_opts, "logger": _YtDlpLogger()}
-    with yt_dlp.YoutubeDL(opts) as ydl:
+    with _CookieFallbackYDL(opts) as ydl:
         try:
             info = ydl.extract_info(
                 f"https://www.youtube.com/watch?v={video_id}",
@@ -470,7 +522,7 @@ def _parse_search_entries(query: str, info: dict | None) -> list[dict]:
 def _search_sync(query: str, base_opts: dict) -> list[dict]:
     import yt_dlp  # lazy
     opts = {**base_opts, "logger": _YtDlpLogger()}
-    with yt_dlp.YoutubeDL(opts) as ydl:
+    with _CookieFallbackYDL(opts) as ydl:
         try:
             info = ydl.extract_info(f"ytsearch{SEARCH_RESULT_COUNT}:{query}", download=False)
         except yt_dlp.utils.DownloadError as e:
