@@ -214,6 +214,59 @@ YTDL_OPTIONS_NO_COOKIES = {
 YTDL_OPTIONS_NO_COOKIES.pop("cookiefile", None)
 YTDL_OPTIONS_NO_COOKIES.pop("cookiesfrombrowser", None)
 
+# CookieLoadError introduced in newer yt-dlp; guard for older versions.
+try:
+    from yt_dlp.cookies import CookieLoadError
+except ImportError:  # pragma: no cover
+    CookieLoadError = None  # type: ignore[assignment]
+
+_COOKIE_ERROR_KEYWORDS = (
+    "cookie",
+    "netscape",
+    "cookiefile",
+    "failed to load cookies",
+    "failed to parse cookies",
+)
+
+
+class _CookieFallbackYDL:
+    """Context manager that catches cookie-related errors during YoutubeDL init
+    and retries with YTDL_OPTIONS_NO_COOKIES merged with caller opts automatically."""
+
+    def __init__(self, opts: dict):
+        self._opts = opts
+        self._ydl = None
+
+    def __enter__(self):
+        import yt_dlp  # lazy
+        try:
+            self._ydl = yt_dlp.YoutubeDL(self._opts)
+        except Exception as exc:
+            err_msg = str(exc).lower()
+            is_cookie_error = (
+                (CookieLoadError is not None and isinstance(exc, CookieLoadError))
+                or any(keyword in err_msg for keyword in _COOKIE_ERROR_KEYWORDS)
+            )
+            if is_cookie_error:
+                logging.getLogger(__name__).warning(
+                    "Cookie load failed (%s), falling back to cookieless yt-dlp session",
+                    type(exc).__name__,
+                )
+                # Merge: NO_COOKIES base + caller's specific opts, strip cookie refs
+                merged = {**YTDL_OPTIONS_NO_COOKIES, **self._opts}
+                merged.pop("cookiefile", None)
+                merged.pop("cookiesfrombrowser", None)
+                self._ydl = yt_dlp.YoutubeDL(merged)
+            else:
+                raise
+        return self._ydl
+
+    def __exit__(self, *args):
+        if self._ydl is not None:
+            self._ydl.close()
+        return False
+
+
 YTDL_SEARCH_CONCURRENCY = max(1, int(get_config_value("YTDL_SEARCH_CONCURRENCY", dotenv_values, "2")))
 YTDL_SEARCH_DELAY_SEC = _env_float("YTDL_SEARCH_DELAY_SEC", 0.75)
 YTDL_SEARCH_JITTER_SEC = _env_float("YTDL_SEARCH_JITTER_SEC", 0.35)

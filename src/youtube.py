@@ -200,56 +200,7 @@ def _should_try_cookieless() -> bool:
     return not status.get("fresh", True)
 
 
-# CookieLoadError introduced in newer yt-dlp; guard for older versions.
-try:
-    from yt_dlp.cookies import CookieLoadError
-except ImportError:  # pragma: no cover
-    CookieLoadError = None  # type: ignore[assignment]
-
-
-_COOKIE_ERROR_KEYWORDS = (
-    "cookie",
-    "netscape",
-    "cookiefile",
-    "failed to load cookies",
-    "failed to parse cookies",
-)
-
-
-class _CookieFallbackYDL:
-    """Context manager that catches cookie-related errors during YoutubeDL init
-    and retries with YTDL_OPTIONS_NO_COOKIES automatically."""
-
-    def __init__(self, opts: dict, fallback_opts: dict | None = None):
-        self._opts = opts
-        self._fallback = fallback_opts if fallback_opts is not None else YTDL_OPTIONS_NO_COOKIES
-        self._ydl = None
-
-    def __enter__(self):
-        import yt_dlp  # lazy
-        try:
-            self._ydl = yt_dlp.YoutubeDL(self._opts)
-        except Exception as exc:
-            err_msg = str(exc).lower()
-            is_cookie_error = (
-                (CookieLoadError is not None and isinstance(exc, CookieLoadError))
-                or any(keyword in err_msg for keyword in _COOKIE_ERROR_KEYWORDS)
-            )
-            if is_cookie_error:
-                logger.warning(
-                    "Cookie load failed (%s), falling back to cookieless yt-dlp session",
-                    type(exc).__name__,
-                )
-                set_youtube_auth_failed()
-                self._ydl = yt_dlp.YoutubeDL(self._fallback)
-            else:
-                raise
-        return self._ydl
-
-    def __exit__(self, *args):
-        if self._ydl is not None:
-            self._ydl.close()
-        return False
+from src.config import _CookieFallbackYDL  # noqa: E402
 
 
 def _load_metadata_index() -> None:

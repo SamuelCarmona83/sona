@@ -660,7 +660,8 @@ def _download_sync(video_id: str, tid: str, track: dict) -> str | None:
                 {"key": "FFmpegMetadata"},
                 {"key": "EmbedThumbnail", "already_have_thumbnail": False},
             ]
-        with yt_dlp.YoutubeDL(opts) as ydl:
+        from src.config import _CookieFallbackYDL
+        with _CookieFallbackYDL(opts) as ydl:
             ydl.download([url])
 
     try:
