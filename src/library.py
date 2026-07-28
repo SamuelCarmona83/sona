@@ -17,10 +17,13 @@ from src.config import (
     LIBRARY_FETCH_COVERS,
     LIBRARY_LOCAL_HIT_MIN_SCORE,
     LIBRARY_LOCAL_HIT_VALIDATION_ENABLED,
+    LIBRARY_MAX_DURATION_SEC,
+    LIBRARY_MAX_FILE_MB,
     LIBRARY_MAX_MB,
     LIBRARY_MAX_TRACKS,
     LIBRARY_MIN_PLAYS_TO_PIN,
     LIBRARY_PATH,
+    LIBRARY_REJECT_LIVE,
     YTDL_OPTIONS,
 )
 from src.scoring import _score_candidate
@@ -46,8 +49,29 @@ _INDEX_PATH.parent.mkdir(parents=True, exist_ok=True)
 _COVERS_DIR = get_covers_dir()  # delegated to metadata for single source of truth
 
 _index: dict[str, dict] = {}
+_index_mtime: float | None = None
 _download_sem = asyncio.Semaphore(1)
 _pending_downloads: set[str] = set()
+
+# Allowed on-disk formats for library cache (never keep full video containers).
+_LIBRARY_AUDIO_SUFFIXES = {".m4a", ".opus", ".webm", ".mp3", ".ogg", ".flac", ".wav", ".aac"}
+_LIBRARY_SKIP_SUFFIXES = {".part", ".ytdl", ".jpg", ".jpeg", ".png", ".webp", ".json", ".vtt", ".srt"}
+
+# 24/7 radio / livestream title patterns — not individual songs.
+# Avoid bare "radio" (would block e.g. "Video Killed the Radio Star").
+_LIVE_STREAM_TITLE_RE = re.compile(
+    r"(?:"
+    r"\b24\s*/\s*7\b"
+    r"|\bnon[\s-]?stop\b"
+    r"|\bnonstop\b"
+    r"|\blive\s+stream\b"
+    r"|\blivestream\b"
+    r"|\blistening\s+party\b"
+    r"|\bradio\s+(?:hits|mix|station|stream|live|24)"
+    r"|\b(?:classic\s+)?(?:rock|jazz|pop|hits)\s+radio\b"
+    r")",
+    re.IGNORECASE,
+)
 
 
 def _stable_query_hash(key: str) -> str:
@@ -200,27 +224,107 @@ def _migrate_index_duplicates() -> None:
         logger.info("library: migrated duplicate index entries by spotify_id")
 
 
+def _index_file_mtime() -> float | None:
+    try:
+        return _INDEX_PATH.stat().st_mtime
+    except OSError:
+        return None
+
+
 def _load_index() -> None:
-    global _index
+    global _index, _index_mtime
     if not _INDEX_PATH.exists():
+        _index = {}
+        _index_mtime = None
         return
     try:
         data = json.loads(_INDEX_PATH.read_text())
         if isinstance(data, dict):
             _index = data
+        _index_mtime = _index_file_mtime()
     except Exception as exc:
         logger.warning("library: failed to load index: %s", exc)
 
 
+def _maybe_reload_index() -> None:
+    """Pick up external edits (explorer delete/dedupe) without restarting the bot."""
+    global _index_mtime
+    current = _index_file_mtime()
+    if current is None:
+        if _index_mtime is not None:
+            _load_index()
+        return
+    if _index_mtime is None or current != _index_mtime:
+        logger.info("library: reloading index (mtime changed)")
+        _load_index()
+
+
 def _save_index() -> None:
+    global _index_mtime
     try:
-        _INDEX_PATH.write_text(json.dumps(_index, indent=2))
+        tmp = _INDEX_PATH.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(_index, indent=2))
+        tmp.replace(_INDEX_PATH)
+        _index_mtime = _index_file_mtime()
     except Exception as exc:
         logger.warning("library: failed to save index: %s", exc)
 
 
 _load_index()
 _migrate_index_duplicates()
+
+
+def cache_reject_reason(meta: dict) -> str | None:
+    """Return a short reason if *meta* must not be written into the library cache.
+
+    Used before/after download so live radio streams and huge files never land
+    on small disks. Does not gate playback selection by itself.
+    """
+    title = str(meta.get("title") or "")
+    blob = f"{title} {meta.get('yt_query') or meta.get('artist') or ''}"
+
+    if LIBRARY_REJECT_LIVE:
+        if meta.get("is_live") is True:
+            return "is_live"
+        live_status = str(meta.get("live_status") or "").lower()
+        if live_status in ("is_live", "is_upcoming", "was_live") and not meta.get("duration"):
+            return f"live_status={live_status}"
+        if _LIVE_STREAM_TITLE_RE.search(blob):
+            return "live_or_radio_title"
+
+    duration = meta.get("duration")
+    if duration is not None:
+        try:
+            duration = int(duration)
+        except (TypeError, ValueError):
+            duration = None
+    if duration is not None:
+        if duration <= 0:
+            return "duration_zero_or_unknown"
+        if duration > LIBRARY_MAX_DURATION_SEC:
+            return f"duration>{LIBRARY_MAX_DURATION_SEC}s"
+
+    max_bytes = LIBRARY_MAX_FILE_MB * 1024 * 1024
+    for key in ("file_size_bytes", "filesize", "filesize_approx"):
+        size = meta.get(key)
+        if size is None:
+            continue
+        try:
+            size = int(size)
+        except (TypeError, ValueError):
+            continue
+        if size > max_bytes:
+            return f"filesize>{LIBRARY_MAX_FILE_MB}MB"
+
+    path = meta.get("file_path") or meta.get("filepath")
+    if path:
+        suffix = pathlib.Path(str(path)).suffix.lower()
+        if suffix and suffix not in _LIBRARY_AUDIO_SUFFIXES and suffix not in _LIBRARY_SKIP_SUFFIXES:
+            # .mp4 video containers are the main offender (multi-GB streams).
+            if suffix in {".mp4", ".mkv", ".avi", ".mov"}:
+                return f"non_audio_ext={suffix}"
+
+    return None
 
 
 def _file_size_mb() -> float:
@@ -235,6 +339,7 @@ def _file_size_mb() -> float:
 def get_local_path(tid: str) -> pathlib.Path | None:
     if not LIBRARY_ENABLED:
         return None
+    _maybe_reload_index()
     entry = _index.get(tid)
     if not entry:
         return None
@@ -245,6 +350,108 @@ def get_local_path(tid: str) -> pathlib.Path | None:
     if path.is_file():
         return path.resolve()
     return None
+
+
+def _path_is_under(path: pathlib.Path, root: pathlib.Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except (ValueError, OSError):
+        return False
+
+
+def delete_track_entry(
+    index: dict[str, dict],
+    tid: str,
+    *,
+    library_dir: pathlib.Path,
+    covers_dir: pathlib.Path | None = None,
+) -> dict:
+    """Remove *tid* from *index* and delete files under *library_dir*.
+
+    Safe for use by the bot and the explorer. Mutates *index*. Only unlinks
+    paths that resolve inside *library_dir* (or *covers_dir* for local covers).
+    """
+    library_dir = library_dir.resolve()
+    entry = index.get(tid)
+    files_removed: list[str] = []
+    bytes_freed = 0
+
+    candidates: list[pathlib.Path] = []
+    if entry and entry.get("file_path"):
+        candidates.append(pathlib.Path(entry["file_path"]))
+    if library_dir.is_dir():
+        candidates.extend(library_dir.glob(f"{tid}.*"))
+
+    seen: set[pathlib.Path] = set()
+    for raw in candidates:
+        try:
+            path = raw.resolve()
+        except OSError:
+            continue
+        if path in seen:
+            continue
+        seen.add(path)
+        if not path.is_file():
+            continue
+        if not _path_is_under(path, library_dir):
+            logger.warning("library: refuse delete outside library dir: %s", path)
+            continue
+        try:
+            size = path.stat().st_size
+            path.unlink()
+            files_removed.append(str(path))
+            bytes_freed += size
+        except OSError as exc:
+            logger.warning("library: could not delete %s: %s", path, exc)
+
+    if entry and covers_dir is not None:
+        cover = entry.get("local_cover")
+        if cover:
+            cover_path = pathlib.Path(cover)
+            try:
+                cover_resolved = cover_path.resolve()
+                covers_root = covers_dir.resolve()
+                if cover_resolved.is_file() and _path_is_under(cover_resolved, covers_root):
+                    # Only remove cover if basename is tied to this tid (avoid shared art).
+                    if tid in cover_resolved.stem or cover_resolved.stem.startswith(tid):
+                        size = cover_resolved.stat().st_size
+                        cover_resolved.unlink()
+                        files_removed.append(str(cover_resolved))
+                        bytes_freed += size
+            except OSError as exc:
+                logger.warning("library: could not delete cover %s: %s", cover, exc)
+
+    existed = tid in index
+    if existed:
+        del index[tid]
+
+    return {
+        "deleted": existed or bool(files_removed),
+        "track_id": tid,
+        "bytes_freed": bytes_freed,
+        "files_removed": files_removed,
+        "had_index_entry": existed,
+        "title": (entry or {}).get("title", ""),
+    }
+
+
+def delete_track(tid: str) -> dict:
+    """Delete a library track from the bot's index + library directory."""
+    _maybe_reload_index()
+    result = delete_track_entry(
+        _index,
+        tid,
+        library_dir=_LIBRARY_DIR,
+        covers_dir=_COVERS_DIR,
+    )
+    if result["deleted"]:
+        _save_index()
+        logger.info(
+            "library: deleted %s ('%s') freed %s bytes",
+            tid, result.get("title") or "?", result.get("bytes_freed", 0),
+        )
+    return result
 
 
 def get_entry(tid: str) -> dict | None:
@@ -636,10 +843,59 @@ def _evict_if_needed() -> None:
     _save_index()
 
 
+def _cleanup_tid_artifacts(tid: str) -> None:
+    """Remove partial/rejected download artifacts for *tid* under the library dir."""
+    if not _LIBRARY_DIR.is_dir():
+        return
+    for path in _LIBRARY_DIR.glob(f"{tid}.*"):
+        if not path.is_file():
+            continue
+        try:
+            path.unlink()
+        except OSError as exc:
+            logger.warning("library: could not remove artifact %s: %s", path, exc)
+
+
+def _validate_downloaded_file(path: str, track: dict) -> str | None:
+    """Return resolved path if cacheable, else delete and return None."""
+    p = pathlib.Path(path)
+    meta = {
+        **track,
+        "file_path": str(p),
+        "file_size_bytes": p.stat().st_size if p.is_file() else None,
+        "duration": track.get("duration"),
+        "title": track.get("title"),
+    }
+    reason = cache_reject_reason(meta)
+    if reason:
+        logger.warning(
+            "library: rejecting cached file for '%s' (%s): %s",
+            track.get("title", p.name), p, reason,
+        )
+        try:
+            p.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning("library: could not remove rejected file %s: %s", p, exc)
+        # Also drop sidecars / wrong-ext downloads for this tid stem.
+        stem = p.stem
+        if stem:
+            _cleanup_tid_artifacts(stem)
+        return None
+    return str(p.resolve())
+
+
 def _download_sync(video_id: str, tid: str, track: dict) -> str | None:
     from src.youtube import _YtDlpLogger, is_youtube_rate_limited, maybe_detect_rate_limit
 
     if is_youtube_rate_limited():
+        return None
+
+    reason = cache_reject_reason(track)
+    if reason:
+        logger.info(
+            "library: skip download for %s ('%s'): %s",
+            video_id, track.get("title", "?"), reason,
+        )
         return None
 
     url = f"https://www.youtube.com/watch?v={video_id}"
@@ -662,15 +918,46 @@ def _download_sync(video_id: str, tid: str, track: dict) -> str | None:
             ]
         from src.config import _CookieFallbackYDL
         with _CookieFallbackYDL(opts) as ydl:
+            # Pre-check metadata when possible (live flag, duration, approx size).
+            try:
+                info = ydl.extract_info(url, download=False)
+            except Exception as exc:
+                logger.debug("library: extract_info precheck failed for %s: %s", video_id, exc)
+                info = None
+            if info:
+                pre = {
+                    **track,
+                    "title": info.get("title") or track.get("title"),
+                    "duration": info.get("duration") if info.get("duration") is not None else track.get("duration"),
+                    "is_live": info.get("is_live"),
+                    "live_status": info.get("live_status"),
+                    "filesize": info.get("filesize"),
+                    "filesize_approx": info.get("filesize_approx"),
+                }
+                pre_reason = cache_reject_reason(pre)
+                if pre_reason:
+                    logger.info(
+                        "library: skip download after extract for %s ('%s'): %s",
+                        video_id, pre.get("title", "?"), pre_reason,
+                    )
+                    return
+                # Keep richer metadata for post-validation.
+                track.update({
+                    k: pre[k] for k in ("title", "duration", "is_live", "live_status")
+                    if pre.get(k) is not None
+                })
             ydl.download([url])
 
     try:
         _run()
-    except yt_dlp.utils.DownloadError as exc:
-        maybe_detect_rate_limit(str(exc))
-        logger.warning("library: download failed for %s: %s", video_id, exc)
-        return None
     except Exception as exc:
+        # yt_dlp may not be imported if failure was earlier; treat generically.
+        try:
+            import yt_dlp
+            if isinstance(exc, yt_dlp.utils.DownloadError):
+                maybe_detect_rate_limit(str(exc))
+        except Exception:
+            pass
         try:
             from src.config import is_cookie_load_error, mark_cookies_unusable
             if is_cookie_load_error(exc):
@@ -678,18 +965,39 @@ def _download_sync(video_id: str, tid: str, track: dict) -> str | None:
         except Exception:
             pass
         logger.warning("library: download failed for %s: %s", video_id, exc)
+        _cleanup_tid_artifacts(tid)
         return None
 
     for path in sorted(_LIBRARY_DIR.glob(f"{tid}.*")):
-        if path.is_file() and path.suffix not in (".part", ".ytdl"):
-            resolved = str(path.resolve())
-            resolved = _sanitize_audio_file(resolved)
-            return resolved
+        if not path.is_file():
+            continue
+        if path.suffix.lower() in _LIBRARY_SKIP_SUFFIXES or path.suffix in (".part", ".ytdl"):
+            continue
+        if path.suffix.lower() not in _LIBRARY_AUDIO_SUFFIXES:
+            logger.warning("library: removing non-audio download %s", path)
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            continue
+        resolved = str(path.resolve())
+        resolved = _sanitize_audio_file(resolved)
+        return _validate_downloaded_file(resolved, track)
     return None
 
 
 async def enqueue_download(track: dict, video_ref: str | None = None) -> None:
     if not LIBRARY_ENABLED or not LIBRARY_AUTO_DOWNLOAD:
+        return
+
+    _maybe_reload_index()
+
+    reason = cache_reject_reason(track)
+    if reason:
+        logger.info(
+            "library: skip enqueue for '%s': %s",
+            track.get("title", "?"), reason,
+        )
         return
 
     video_id = track_video_id(track, video_ref)
@@ -737,6 +1045,7 @@ async def get_radio_candidates(
     limit: int,
 ) -> list[dict]:
     """Return playable tracks from the local library for offline radio."""
+    _maybe_reload_index()
     if not LIBRARY_ENABLED or not _index:
         return []
 

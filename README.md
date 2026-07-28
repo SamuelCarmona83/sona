@@ -305,18 +305,20 @@ A read/write UI for cache data on disk. Useful for debugging searches, monitorin
 | `GET` | `/api/disk-usage` | Library size and per-file breakdown |
 | `GET` | `/api/library/dedupe-preview` | Duplicate groups and reclaimable space |
 | `POST` | `/api/library/dedupe` | Merge duplicates and delete extra files |
+| `POST` | `/api/library/track/delete` | Delete one track (`{"track_id":"yt_…"}`) — file + index |
+| `DELETE` | `/api/library/track/{track_id}` | Same delete via REST path |
 
 **Tabs**
 
 | Tab | Source | Content |
 |-----|--------|---------|
 | Búsquedas | `youtube_metadata.json` | Cached search metadata |
-| Biblioteca | `library_index.json` | Tracks, play counts, file sizes |
+| Biblioteca | `library_index.json` | Tracks, play counts, file sizes; **[x]** deletes one entry |
 | Likes | `likes.json` | Per-user liked tracks |
 
-Library table supports grouped view (one row per `video_id`) and detailed view (raw index entries).
+Library table supports grouped view (one row per `video_id`) and detailed view (raw index entries). Outliers (huge size, duration 0 / very long, radio-stream titles) are highlighted; delete asks for confirmation and reports bytes freed.
 
-Cache resolution checks `.cache/` (inside Docker) and `spotify_cache/` (host volume) and uses whichever contains data.
+Cache resolution checks `.cache/` (inside Docker) and `spotify_cache/` (host volume) and uses whichever contains data. The bot reloads `library_index.json` when its mtime changes (explorer deletes apply without a full bot restart on the next library access).
 
 ## Local library
 
@@ -330,6 +332,19 @@ After successful playback, audio can be saved under `.cache/library/` (host: `sp
 | `played_ids.json` | Radio deduplication history |
 
 When YouTube rate-limits the bot, radio mode falls back to local tracks automatically.
+
+### Cache guards (anti-live / anti-bloat)
+
+Before and after download, the library refuses content that is not a normal single:
+
+| Guard | Default | Env |
+|-------|---------|-----|
+| Max duration | 900 s (15 min) | `LIBRARY_MAX_DURATION_SEC` |
+| Max file size | 25 MB | `LIBRARY_MAX_FILE_MB` |
+| Reject live / radio titles (`24/7`, `nonstop`, `radio`, …) | on | `LIBRARY_REJECT_LIVE` |
+| Non-audio containers (e.g. `.mp4`) | always rejected | — |
+
+This prevents multi-GB livestreams (e.g. “Classic Rock Radio 24/7”) from filling small disks. Use the explorer **[x]** control to remove existing edge cases.
 
 ### Deduplication
 

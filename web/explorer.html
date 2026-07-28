@@ -172,6 +172,7 @@
         { key: "artist", label: "artista" },
         { key: "play_count", label: "plays", numeric: true, narrow: true },
         { key: "file_size_bytes", label: "tamaño", numeric: true, narrow: true },
+        { key: "actions", label: "", narrow: true },
       ],
       libraryGrouped: [
         { key: "title", label: "título", wide: true },
@@ -179,6 +180,7 @@
         { key: "play_count", label: "plays", numeric: true, narrow: true },
         { key: "file_size_bytes", label: "tamaño", numeric: true, narrow: true },
         { key: "copies", label: "dup", numeric: true, narrow: true },
+        { key: "actions", label: "", narrow: true },
       ],
       likes: [
         { key: "title", label: "título", wide: true },
@@ -187,7 +189,10 @@
       ],
     };
 
-    const COL_WIDTHS = { wide: "44%", artist: "24%", default: "14%", narrow: "9%" };
+    const COL_WIDTHS = { wide: "40%", artist: "22%", default: "14%", narrow: "9%", actions: "7%" };
+    const OUTLIER_MAX_BYTES = 25 * 1024 * 1024;
+    const OUTLIER_MAX_DURATION = 900;
+    const LIVE_RADIO_TITLE_RE = /24\s*\/\s*7|non[\s-]?stop|nonstop|live\s*stream|livestream|listening\s+party|radio\s+(?:hits|mix|station|stream|live|24)|(?:classic\s+)?(?:rock|jazz|pop|hits)\s+radio/i;
 
     const DEFAULT_TABLE_SORT = {
       searches: { column: "cached_at", dir: "desc" },
@@ -292,6 +297,25 @@
         i++;
       }
       return `${n.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
+    }
+
+    function isLibraryOutlier(item) {
+      if (!item) return false;
+      if ((item.file_size_bytes || 0) > OUTLIER_MAX_BYTES) return true;
+      const dur = item.duration || 0;
+      if (dur === 0 && item.on_disk) return true;
+      if (dur > OUTLIER_MAX_DURATION) return true;
+      const blob = `${item.title || ""} ${item.yt_query || ""}`;
+      if (LIVE_RADIO_TITLE_RE.test(blob)) return true;
+      return false;
+    }
+
+    function deleteButtonHtml(item) {
+      const tid = item.trackId || "";
+      if (!tid) return "";
+      return `<button type="button" data-delete-tid="${escapeHtml(tid)}"
+        class="text-[11px] font-medium text-danger hover:underline underline-offset-2"
+        title="eliminar de la biblioteca">[x]</button>`;
     }
 
     function formatTimestamp(unix) {
@@ -598,14 +622,21 @@
       const yt = youtubeUrl(item);
       const sp = spotifyUrl(item.spotify_id);
       const size = item.on_disk ? formatBytes(item.file_size_bytes) : "—";
+      const outlier = isLibraryOutlier(item);
+      const cardClass = outlier
+        ? `${UI.card} border-warn/50`
+        : UI.card;
+      const warn = outlier
+        ? `<span class="text-[10px] text-warn ml-1">outlier</span>`
+        : "";
       return `
-        <article class="${UI.card}">
+        <article class="${cardClass}">
           <div class="${UI.cardThumb}">${thumbHtml(item.thumbnail, item.title, item.best_artwork || item.cover_url)}</div>
           <div class="${UI.cardBody}">
-            <div class="${UI.cardTitle}">${escapeHtml(item.title)}</div>
+            <div class="${UI.cardTitle}">${escapeHtml(item.title)}${warn}</div>
             <div class="${UI.cardMeta}">${escapeHtml(item.artist)} · ${item.play_count} · ${size}</div>
             ${item.album ? `<div class="text-[10px] text-ash mt-0.5">${escapeHtml(item.album)}</div>` : ""}
-            <div class="${UI.cardLinks}">${linkHtml(yt, "yt")}${sp ? " · " + linkHtml(sp, "sp") : ""}${item.genius_url ? " · " + linkHtml(item.genius_url, "genius") : ""}</div>
+            <div class="${UI.cardLinks}">${linkHtml(yt, "yt")}${sp ? " · " + linkHtml(sp, "sp") : ""}${item.genius_url ? " · " + linkHtml(item.genius_url, "genius") : ""}${" · " + deleteButtonHtml(item)}</div>
           </div>
         </article>`;
     }
@@ -643,19 +674,33 @@
     }
 
     function cellValue(tab, item, key) {
-      if (key === "title") return titleCell(tab, item);
+      if (key === "title") {
+        const base = titleCell(tab, item);
+        if (tab === "library" && isLibraryOutlier(item)) {
+          return base + `<span class="block text-[10px] text-warn mt-0.5">outlier</span>`;
+        }
+        return base;
+      }
       if (key === "duration") return formatDuration(item.duration);
       if (key === "cached_at" || key === "liked_at") return formatTimestamp(item[key]);
-      if (key === "file_size_bytes") return item.on_disk ? formatBytes(item.file_size_bytes) : "—";
+      if (key === "file_size_bytes") {
+        const label = item.on_disk ? formatBytes(item.file_size_bytes) : "—";
+        if (tab === "library" && (item.file_size_bytes || 0) > OUTLIER_MAX_BYTES) {
+          return `<span class="text-warn font-medium">${label}</span>`;
+        }
+        return label;
+      }
       if (key === "copies") {
         if (item.copies <= 1) return "—";
         const extra = item.wasted_bytes > 0 ? ` ${formatBytes(item.wasted_bytes)}` : "";
         return `<span class="text-warn">${item.copies}${extra}</span>`;
       }
+      if (key === "actions") return deleteButtonHtml(item);
       return escapeHtml(String(item[key] ?? "—"));
     }
 
     function colWidth(col) {
+      if (col.key === "actions") return COL_WIDTHS.actions;
       if (col.wide) return COL_WIDTHS.wide;
       if (col.narrow) return COL_WIDTHS.narrow;
       if (col.key === "artist") return COL_WIDTHS.artist;
@@ -699,11 +744,13 @@
         </th>
       `).join("");
 
-      const rows = items.map((item) => `
-        <tr class="${UI.rowHover}">
+      const rows = items.map((item) => {
+        const rowWarn = tab === "library" && isLibraryOutlier(item) ? " bg-warn/5" : "";
+        return `
+        <tr class="${UI.rowHover}${rowWarn}">
           ${cols.map((col) => `<td class="${tdClass(col)}">${cellValue(tab, item, col.key)}</td>`).join("")}
-        </tr>
-      `).join("");
+        </tr>`;
+      }).join("");
 
       return `
         <div class="${UI.tableWrap}">
@@ -891,6 +938,7 @@
             renderPanel(t);
           });
         });
+        bindDeleteButtons(grid);
       } else {
         table.innerHTML = renderTable(tab, items);
         table.classList.remove("hidden");
@@ -899,6 +947,7 @@
         table.querySelectorAll("th[data-sort]").forEach((th) => {
           th.addEventListener("click", () => {
             const col = th.dataset.sort;
+            if (!col || col === "actions") return;
             if (tableSort.column === col) {
               tableSort.dir = tableSort.dir === "asc" ? "desc" : "asc";
             } else {
@@ -907,6 +956,66 @@
             renderPanel(activeTab);
           });
         });
+        bindDeleteButtons(table);
+      }
+    }
+
+    function bindDeleteButtons(root) {
+      if (!root) return;
+      root.querySelectorAll("[data-delete-tid]").forEach((btn) => {
+        btn.addEventListener("click", (ev) => {
+          ev.preventDefault();
+          ev.stopPropagation();
+          deleteLibraryTrack(btn.dataset.deleteTid);
+        });
+      });
+    }
+
+    async function deleteLibraryTrack(trackId) {
+      if (!trackId) return;
+      const item = library.find((i) => i.trackId === trackId);
+      const title = item?.title || trackId;
+      const size = item?.on_disk ? formatBytes(item.file_size_bytes) : "—";
+      const ok = confirm(
+        `¿eliminar de la biblioteca?\n\n` +
+        `${title}\n` +
+        `id: ${trackId}\n` +
+        `tamaño: ${size}\n\n` +
+        `borra el archivo y la entrada del índice. no se puede deshacer.`
+      );
+      if (!ok) return;
+
+      try {
+        const res = await fetch("/api/library/track/delete", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ track_id: trackId }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          showBanner(data.error || `error al eliminar (${res.status})`, "error");
+          return;
+        }
+        library = library.filter((i) => i.trackId !== trackId);
+        // Drop disk map entry so sizes stay coherent
+        if (diskUsage.files && diskUsage.files[trackId] != null) {
+          diskUsage.total_bytes = Math.max(0, (diskUsage.total_bytes || 0) - (diskUsage.files[trackId] || 0));
+          delete diskUsage.files[trackId];
+          diskUsage.tracks_on_disk = Math.max(0, (diskUsage.tracks_on_disk || 1) - 1);
+        }
+        // Refresh authoritative disk usage in background
+        loadDiskUsage().then((disk) => {
+          diskUsage = disk;
+          updateStats();
+        }).catch(() => {});
+        updateStats();
+        renderPanel("library");
+        showBanner(
+          `eliminado · ${formatBytes(data.bytes_freed || 0)} liberados · ${trackId}`,
+          "info",
+        );
+      } catch (err) {
+        showBanner(`error al eliminar: ${err}`, "error");
       }
     }
 

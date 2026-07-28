@@ -462,6 +462,10 @@ LIBRARY_AUTO_ENRICH = _env_bool("LIBRARY_AUTO_ENRICH", "false")  # background en
 LIBRARY_EMBED_METADATA = _env_bool("LIBRARY_EMBED_METADATA")
 LIBRARY_LOCAL_HIT_VALIDATION_ENABLED = _env_bool("LIBRARY_LOCAL_HIT_VALIDATION_ENABLED")
 LIBRARY_LOCAL_HIT_MIN_SCORE = _env_float("LIBRARY_LOCAL_HIT_MIN_SCORE", 5.0)
+# Hard caps so live radio / full albums never fill a small disk (e.g. e2-micro 30GB).
+LIBRARY_MAX_DURATION_SEC = max(60, int(get_config_value("LIBRARY_MAX_DURATION_SEC", dotenv_values, "900")))
+LIBRARY_MAX_FILE_MB = max(5, int(get_config_value("LIBRARY_MAX_FILE_MB", dotenv_values, "25")))
+LIBRARY_REJECT_LIVE = _env_bool("LIBRARY_REJECT_LIVE")
 YOUTUBE_URL_CACHE_TTL_SEC = max(60, int(get_config_value("YOUTUBE_URL_CACHE_TTL_SEC", dotenv_values, "1800")))
 
 GENIUS_CLIENT_ID = get_config_value("GENIUS_CLIENT_ID", dotenv_values, "")

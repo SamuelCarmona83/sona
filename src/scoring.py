@@ -203,6 +203,25 @@ def _score_candidate(query: str, candidate: dict) -> float:
             score += 1.5
         elif duration > 900:
             score -= 2.0
+        if duration > 1200:
+            score -= 6.0  # full albums / long mixes — rarely the intended single
+    else:
+        # Missing/zero duration often means livestream or unfinished radio dump.
+        score -= 3.0
+
+    # 24/7 radio / nonstop streams are never good song matches.
+    if re.search(
+        r"\b24\s*/\s*7\b|\bnon[\s-]?stop\b|\bnonstop\b|\blive\s+stream\b|"
+        r"\blivestream\b|\blistening\s+party\b|"
+        r"\bradio\s+(?:hits|mix|station|stream|live|24)|"
+        r"\b(?:classic\s+)?(?:rock|jazz|pop|hits)\s+radio\b",
+        normalized_blob,
+        re.IGNORECASE,
+    ):
+        score -= 12.0
+
+    if candidate.get("is_live") is True:
+        score -= 10.0
 
     uploader_normalized = _normalize_text(candidate_uploader)
     if any(hint in uploader_normalized for hint in YOUTUBE_PREFERRED_CHANNEL_HINTS):

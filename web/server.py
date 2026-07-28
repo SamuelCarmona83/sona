@@ -20,6 +20,57 @@ def _get_enrich_fns():
     from src.library import scan_and_enrich_library, get_stats  # noqa: E402
     return scan_and_enrich_library, get_stats
 
+
+def _delete_library_track(cache_dir: pathlib.Path, track_id: str) -> dict:
+    """Delete one library track from disk + index (explorer admin)."""
+    from src.library import delete_track_entry  # noqa: E402
+
+    track_id = (track_id or "").strip()
+    if not track_id:
+        return {"deleted": False, "error": "track_id required", "status": 400}
+
+    index_path = cache_dir / "library_index.json"
+    library_dir = cache_dir / "library"
+    covers_dir = library_dir / "covers"
+    if not index_path.is_file() and not library_dir.is_dir():
+        return {"deleted": False, "error": "Library not found", "status": 404}
+
+    index: dict = {}
+    if index_path.is_file():
+        try:
+            data = json.loads(index_path.read_text())
+            if isinstance(data, dict):
+                index = data
+        except Exception as exc:
+            return {"deleted": False, "error": f"Failed to read index: {exc}", "status": 500}
+
+    if track_id not in index:
+        # Still try to remove orphan files matching the id.
+        has_orphan = library_dir.is_dir() and any(library_dir.glob(f"{track_id}.*"))
+        if not has_orphan:
+            return {"deleted": False, "error": f"Track not found: {track_id}", "status": 404}
+
+    result = delete_track_entry(
+        index,
+        track_id,
+        library_dir=library_dir,
+        covers_dir=covers_dir if covers_dir.is_dir() else None,
+    )
+    if not result.get("deleted"):
+        return {**result, "error": "Nothing deleted", "status": 404}
+
+    try:
+        tmp = index_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(index, indent=2))
+        tmp.replace(index_path)
+    except Exception as exc:
+        return {
+            **result,
+            "error": f"Files removed but index save failed: {exc}",
+            "status": 500,
+        }
+    return {**result, "status": 200}
+
 CACHE_DIRS = (ROOT / ".cache", ROOT / "spotify_cache")
 SKIP_SUFFIXES = {".part", ".ytdl"}
 
@@ -141,6 +192,49 @@ class ExplorerHandler(SimpleHTTPRequestHandler):
                 self._send_json(result)
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=500)
+            return
+        if path == "/api/library/track/delete":
+            cache_dir = resolve_cache_dir(ROOT)
+            if not cache_dir:
+                self._send_json({"error": "No cache directory found"}, status=404)
+                return
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                raw = self.rfile.read(length) if length else b"{}"
+                body = json.loads(raw.decode() or "{}")
+            except Exception as exc:
+                self._send_json({"error": f"Invalid JSON body: {exc}"}, status=400)
+                return
+            track_id = body.get("track_id") or body.get("tid") or ""
+            result = _delete_library_track(cache_dir, track_id)
+            status = int(result.pop("status", 200))
+            if status >= 400:
+                self._send_json(result, status=status)
+                return
+            # Force disk-usage refresh after delete
+            build_disk_usage(force=True)
+            self._send_json(result)
+            return
+        self.send_error(404)
+
+    def do_DELETE(self):
+        path = urlparse(self.path).path
+        # Allow REST-style DELETE /api/library/track/{track_id}
+        prefix = "/api/library/track/"
+        if path.startswith(prefix):
+            track_id = path[len(prefix):].strip("/")
+            cache_dir = resolve_cache_dir(ROOT)
+            if not cache_dir:
+                self._send_json({"error": "No cache directory found"}, status=404)
+                return
+            if not track_id:
+                self._send_json({"error": "track_id required"}, status=400)
+                return
+            result = _delete_library_track(cache_dir, track_id)
+            status = int(result.pop("status", 200))
+            if status < 400:
+                build_disk_usage(force=True)
+            self._send_json(result, status=status)
             return
         self.send_error(404)
 
