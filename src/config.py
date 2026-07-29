@@ -475,8 +475,18 @@ LIBRARY_TARGET_FREE_MB = max(
 )
 # When free disk is critical and every track is pinned, still reclaim LRU pins.
 LIBRARY_EMERGENCY_EVICT_PINS = _env_bool("LIBRARY_EMERGENCY_EVICT_PINS")
-# Background reclaim interval (seconds); 0 disables a future reaper loop.
+# Background reaper interval (seconds); 0 disables the periodic loop.
 LIBRARY_RECLAIM_INTERVAL_SEC = max(0, int(get_config_value("LIBRARY_RECLAIM_INTERVAL_SEC", dotenv_values, "300")))
+# Orphan library files (on disk, not in index) must be older than this before delete.
+LIBRARY_ORPHAN_MIN_AGE_SEC = max(60, int(get_config_value("LIBRARY_ORPHAN_MIN_AGE_SEC", dotenv_values, "86400")))
+# Rate-limit Discord/admin alerts when free disk stays below MIN after reclaim.
+LIBRARY_DISK_ALERT_COOLDOWN_SEC = max(
+    300,
+    int(get_config_value("LIBRARY_DISK_ALERT_COOLDOWN_SEC", dotenv_values, "21600")),
+)
+# DJ TTS cache under .cache/dj_audio — reaper TTL + total size cap.
+DJ_AUDIO_MAX_AGE_SEC = max(300, int(get_config_value("DJ_AUDIO_MAX_AGE_SEC", dotenv_values, "172800")))
+DJ_AUDIO_MAX_MB = max(10, int(get_config_value("DJ_AUDIO_MAX_MB", dotenv_values, "100")))
 YOUTUBE_URL_CACHE_TTL_SEC = max(60, int(get_config_value("YOUTUBE_URL_CACHE_TTL_SEC", dotenv_values, "1800")))
 
 GENIUS_CLIENT_ID = get_config_value("GENIUS_CLIENT_ID", dotenv_values, "")

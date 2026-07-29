@@ -526,8 +526,10 @@ async def only_allowed_channel(ctx: commands.Context) -> bool:
 async def on_ready():
     from src.playback import PlayerView
     from src.cookie_health import start_cookie_watchdog
+    from src.disk_reaper import start_disk_reaper
     bot.add_view(PlayerView(0))
     start_cookie_watchdog()
+    start_disk_reaper()
     logger.info(f"Bot conectado como {bot.user} (id={bot.user.id})")
     logger.info(f"Guilds: {[g.name for g in bot.guilds]}")
     global _startup_announced

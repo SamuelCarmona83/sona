@@ -12,6 +12,8 @@ import edge_tts
 from src.config import (
     ANTHROPIC_API_KEY,
     ANTHROPIC_MODEL,
+    DJ_AUDIO_MAX_AGE_SEC,
+    DJ_AUDIO_MAX_MB,
     DJ_VOICE,
     DJ_ANNOUNCE_COOLDOWN_SEC,
     DJ_VOLUME,
@@ -442,6 +444,72 @@ def cleanup_dj_audio(file_path: str) -> None:
         os.remove(file_path)
     except OSError:
         pass
+
+
+def sweep_dj_audio_cache(
+    *,
+    max_age_sec: int | None = None,
+    max_mb: int | None = None,
+) -> dict:
+    """Delete old / excess DJ TTS files under ``.cache/dj_audio``.
+
+    1) Remove files older than *max_age_sec*.
+    2) If total size still exceeds *max_mb*, delete oldest remaining files.
+    """
+    age_limit = DJ_AUDIO_MAX_AGE_SEC if max_age_sec is None else max(0, max_age_sec)
+    size_cap_mb = DJ_AUDIO_MAX_MB if max_mb is None else max(1, max_mb)
+    size_cap = size_cap_mb * 1024 * 1024
+
+    removed = 0
+    bytes_freed = 0
+    if not _DJ_CACHE_DIR.is_dir():
+        return {"removed": 0, "bytes_freed": 0}
+
+    now = time.time()
+    files: list[tuple[float, int, pathlib.Path]] = []
+    for path in _DJ_CACHE_DIR.iterdir():
+        if not path.is_file():
+            continue
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        files.append((st.st_mtime, st.st_size, path))
+
+    files.sort(key=lambda item: item[0])  # oldest first
+
+    kept: list[tuple[float, int, pathlib.Path]] = []
+    for mtime, size, path in files:
+        if now - mtime >= age_limit:
+            try:
+                path.unlink()
+                removed += 1
+                bytes_freed += size
+            except OSError as exc:
+                logger.warning("dj_announcer: could not remove old %s: %s", path, exc)
+            continue
+        kept.append((mtime, size, path))
+
+    total = sum(size for _m, size, _p in kept)
+    while total > size_cap and kept:
+        _mtime, size, path = kept.pop(0)
+        try:
+            path.unlink()
+            removed += 1
+            bytes_freed += size
+            total -= size
+        except OSError as exc:
+            logger.warning("dj_announcer: could not remove oversized-cache %s: %s", path, exc)
+
+    if removed:
+        logger.info(
+            "dj_announcer: swept %s dj_audio files (%s bytes, cap=%sMB age=%ss)",
+            removed,
+            bytes_freed,
+            size_cap_mb,
+            age_limit,
+        )
+    return {"removed": removed, "bytes_freed": bytes_freed}
 
 
 def get_dj_ffmpeg_options() -> dict:

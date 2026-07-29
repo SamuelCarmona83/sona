@@ -25,6 +25,7 @@ from src.config import (
     LIBRARY_MAX_TRACKS,
     LIBRARY_MIN_FREE_MB,
     LIBRARY_MIN_PLAYS_TO_PIN,
+    LIBRARY_ORPHAN_MIN_AGE_SEC,
     LIBRARY_PATH,
     LIBRARY_REJECT_LIVE,
     LIBRARY_TARGET_FREE_MB,
@@ -470,6 +471,166 @@ def reclaim_disk(
             stats["evicted"],
         )
     return stats
+
+
+def _is_temp_artifact_name(name: str) -> bool:
+    lower = name.lower()
+    if lower.endswith((".part", ".ytdl")):
+        return True
+    if ".temp." in lower or lower.endswith(".temp"):
+        return True
+    return False
+
+
+def sweep_library_temps() -> dict:
+    """Remove yt-dlp partials and temp remux artifacts under the library dir."""
+    removed = 0
+    bytes_freed = 0
+    if not _LIBRARY_DIR.is_dir():
+        return {"removed": 0, "bytes_freed": 0}
+    for path in _LIBRARY_DIR.iterdir():
+        if not path.is_file() or not _is_temp_artifact_name(path.name):
+            continue
+        try:
+            size = path.stat().st_size
+            path.unlink()
+            removed += 1
+            bytes_freed += size
+        except OSError as exc:
+            logger.warning("library: could not remove temp %s: %s", path, exc)
+    if removed:
+        logger.info("library: swept %s temp artifacts (%s bytes)", removed, bytes_freed)
+    return {"removed": removed, "bytes_freed": bytes_freed}
+
+
+def sweep_orphan_index_entries() -> dict:
+    """Drop index rows whose audio file is missing on disk."""
+    removed = 0
+    stale = [
+        tid
+        for tid, entry in list(_index.items())
+        if not pathlib.Path(entry.get("file_path") or "").is_file()
+    ]
+    for tid in stale:
+        del _index[tid]
+        removed += 1
+    if removed:
+        _save_index()
+        logger.info("library: removed %s orphan index entries (missing files)", removed)
+    return {"removed": removed, "bytes_freed": 0}
+
+
+def sweep_orphan_files(*, min_age_sec: int | None = None) -> dict:
+    """Delete library audio files not referenced by the index (age-gated)."""
+    age_gate = LIBRARY_ORPHAN_MIN_AGE_SEC if min_age_sec is None else max(0, min_age_sec)
+    removed = 0
+    bytes_freed = 0
+    if not _LIBRARY_DIR.is_dir():
+        return {"removed": 0, "bytes_freed": 0}
+
+    referenced: set[pathlib.Path] = set()
+    referenced_stems: set[str] = set()
+    for tid, entry in _index.items():
+        referenced_stems.add(tid)
+        fp = entry.get("file_path")
+        if not fp:
+            continue
+        try:
+            referenced.add(pathlib.Path(fp).resolve())
+        except OSError:
+            pass
+
+    now = time.time()
+    for path in _LIBRARY_DIR.iterdir():
+        if not path.is_file():
+            continue
+        if _is_temp_artifact_name(path.name):
+            continue  # temps handled separately
+        if path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".json"}:
+            continue
+        stem = path.name.split(".", 1)[0]
+        if stem in _pending_downloads or stem in referenced_stems:
+            continue
+        try:
+            resolved = path.resolve()
+        except OSError:
+            continue
+        if resolved in referenced:
+            continue
+        try:
+            st = path.stat()
+            if now - st.st_mtime < age_gate:
+                continue
+            size = st.st_size
+            path.unlink()
+            removed += 1
+            bytes_freed += size
+        except OSError as exc:
+            logger.warning("library: could not remove orphan file %s: %s", path, exc)
+
+    if removed:
+        logger.info("library: swept %s orphan files (%s bytes)", removed, bytes_freed)
+    return {"removed": removed, "bytes_freed": bytes_freed}
+
+
+def run_disk_maintenance(*, reason: str = "reaper") -> dict:
+    """Full maintenance pass: temps, orphans, DJ cache, then reclaim.
+
+    Safe to call from a background thread via ``asyncio.to_thread``.
+    """
+    _maybe_reload_index()
+    free_before = disk_free_mb()
+    summary: dict = {
+        "reason": reason,
+        "free_mb_before": None if free_before == float("inf") else round(free_before, 1),
+        "temps": {"removed": 0, "bytes_freed": 0},
+        "orphan_index": {"removed": 0, "bytes_freed": 0},
+        "orphan_files": {"removed": 0, "bytes_freed": 0},
+        "dj_audio": {"removed": 0, "bytes_freed": 0},
+        "reclaim": {"evicted": 0, "bytes_freed": 0, "emergency_pins": 0},
+    }
+
+    summary["temps"] = sweep_library_temps()
+    if LIBRARY_ENABLED:
+        summary["orphan_index"] = sweep_orphan_index_entries()
+        summary["orphan_files"] = sweep_orphan_files()
+
+    try:
+        from src.dj_announcer import sweep_dj_audio_cache
+
+        summary["dj_audio"] = sweep_dj_audio_cache()
+    except Exception as exc:
+        logger.warning("library: dj_audio sweep failed: %s", exc)
+
+    if LIBRARY_ENABLED:
+        summary["reclaim"] = reclaim_disk(reason=reason)
+
+    free_after = disk_free_mb()
+    summary["free_mb_after"] = None if free_after == float("inf") else round(free_after, 1)
+    summary["disk_pressure"] = (
+        free_after != float("inf") and free_after < LIBRARY_MIN_FREE_MB
+    )
+    summary["bytes_freed_total"] = (
+        int(summary["temps"].get("bytes_freed") or 0)
+        + int(summary["orphan_files"].get("bytes_freed") or 0)
+        + int(summary["dj_audio"].get("bytes_freed") or 0)
+        + int(summary["reclaim"].get("bytes_freed") or 0)
+    )
+    logger.info(
+        "library: maintenance done reason=%s free=%.0f→%sMB freed=%sB "
+        "temps=%s orphans_idx=%s orphans_fs=%s dj=%s evicted=%s pressure=%s",
+        reason,
+        free_before if free_before != float("inf") else -1,
+        summary["free_mb_after"],
+        summary["bytes_freed_total"],
+        summary["temps"].get("removed"),
+        summary["orphan_index"].get("removed"),
+        summary["orphan_files"].get("removed"),
+        summary["dj_audio"].get("removed"),
+        summary["reclaim"].get("evicted"),
+        summary["disk_pressure"],
+    )
+    return summary
 
 
 def get_local_path(tid: str) -> pathlib.Path | None:

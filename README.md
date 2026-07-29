@@ -370,6 +370,18 @@ On tight hosts (e.g. **e2-micro**), free space on the library filesystem is the 
 | Min free disk | 1500 MB | `LIBRARY_MIN_FREE_MB` |
 | Target free after reclaim | 2000 MB | `LIBRARY_TARGET_FREE_MB` |
 | Evict pinned tracks if free is critical | on | `LIBRARY_EMERGENCY_EVICT_PINS` |
+| Background reaper interval | 300 s | `LIBRARY_RECLAIM_INTERVAL_SEC` (`0` disables) |
+| Orphan file min age before delete | 86400 s | `LIBRARY_ORPHAN_MIN_AGE_SEC` |
+| DJ TTS cache max age / size | 48 h / 100 MB | `DJ_AUDIO_MAX_AGE_SEC` / `DJ_AUDIO_MAX_MB` |
+
+A background **disk reaper** (started on bot ready) periodically:
+
+1. Deletes yt-dlp temps (`.part`, `.temp.*`)
+2. Drops index entries with missing files and age-gated orphan audio
+3. Sweeps `dj_audio/` by age and total size
+4. Runs free-space-aware reclaim
+
+If free space stays below `LIBRARY_MIN_FREE_MB` after maintenance, the admin gets a rate-limited DM/channel alert (`LIBRARY_DISK_ALERT_COOLDOWN_SEC`, default 6 h).
 
 Configure via **`.env`** (not `docker-compose.yml`). If an old `.env` still sets `LIBRARY_MAX_MB=2048` / `LIBRARY_MAX_TRACKS=500`, lower or remove those lines so the new defaults apply. After reclaim of last resort, check host space with `df -h` and prune unused Docker images (`docker image prune -f`).
 
