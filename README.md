@@ -125,6 +125,8 @@ NORMALIZE_AUDIO=true               # FFmpeg loudness normalization
 DJ_ANNOUNCER_ENABLED=true
 LIBRARY_ENABLED=true
 LIBRARY_AUTO_DOWNLOAD=true
+# LIBRARY_MAX_MB=1024            # library size cap (default tight for small VMs)
+# LIBRARY_MIN_FREE_MB=1500       # skip cache / reclaim below this free space
 
 # FM song recognition (shazamio)
 FM_RECOGNIZER_ENABLED=true
@@ -356,6 +358,20 @@ Before and after download, the library refuses content that is not a normal sing
 | Non-audio containers (e.g. `.mp4`) | always rejected | — |
 
 This prevents multi-GB livestreams (e.g. “Classic Rock Radio 24/7”) from filling small disks. Use the explorer **[x]** control to remove existing edge cases.
+
+### Disk auto-regulation (small VMs)
+
+On tight hosts (e.g. **e2-micro**), free space on the library filesystem is the source of truth—not only the sum of cached files. Before caching, and after each successful cache, the bot **reclaims** LRU tracks until caps and headroom are met. Playback still works when the disk is full: only caching is skipped.
+
+| Knob | Default | Env |
+|------|---------|-----|
+| Max library size | 1024 MB | `LIBRARY_MAX_MB` |
+| Max tracks | 250 | `LIBRARY_MAX_TRACKS` |
+| Min free disk | 1500 MB | `LIBRARY_MIN_FREE_MB` |
+| Target free after reclaim | 2000 MB | `LIBRARY_TARGET_FREE_MB` |
+| Evict pinned tracks if free is critical | on | `LIBRARY_EMERGENCY_EVICT_PINS` |
+
+Configure via **`.env`** (not `docker-compose.yml`). If an old `.env` still sets `LIBRARY_MAX_MB=2048` / `LIBRARY_MAX_TRACKS=500`, lower or remove those lines so the new defaults apply. After reclaim of last resort, check host space with `df -h` and prune unused Docker images (`docker image prune -f`).
 
 ### Deduplication
 

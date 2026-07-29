@@ -453,8 +453,9 @@ FM_SEED_CONTINGENCY_COOLDOWN_SEC = max(15.0, _env_float("FM_SEED_CONTINGENCY_COO
 
 LIBRARY_ENABLED = _env_bool("LIBRARY_ENABLED")
 LIBRARY_PATH = get_config_value("LIBRARY_PATH", dotenv_values, ".cache/library")
-LIBRARY_MAX_TRACKS = max(10, int(get_config_value("LIBRARY_MAX_TRACKS", dotenv_values, "500")))
-LIBRARY_MAX_MB = max(100, int(get_config_value("LIBRARY_MAX_MB", dotenv_values, "2048")))
+# Tight defaults for small VMs (e2-micro). Override in .env if you have more disk.
+LIBRARY_MAX_TRACKS = max(10, int(get_config_value("LIBRARY_MAX_TRACKS", dotenv_values, "250")))
+LIBRARY_MAX_MB = max(100, int(get_config_value("LIBRARY_MAX_MB", dotenv_values, "1024")))
 LIBRARY_AUTO_DOWNLOAD = _env_bool("LIBRARY_AUTO_DOWNLOAD")
 LIBRARY_MIN_PLAYS_TO_PIN = max(1, int(get_config_value("LIBRARY_MIN_PLAYS_TO_PIN", dotenv_values, "3")))
 LIBRARY_FETCH_COVERS = _env_bool("LIBRARY_FETCH_COVERS")
@@ -466,6 +467,16 @@ LIBRARY_LOCAL_HIT_MIN_SCORE = _env_float("LIBRARY_LOCAL_HIT_MIN_SCORE", 5.0)
 LIBRARY_MAX_DURATION_SEC = max(60, int(get_config_value("LIBRARY_MAX_DURATION_SEC", dotenv_values, "900")))
 LIBRARY_MAX_FILE_MB = max(5, int(get_config_value("LIBRARY_MAX_FILE_MB", dotenv_values, "25")))
 LIBRARY_REJECT_LIVE = _env_bool("LIBRARY_REJECT_LIVE")
+# Free-space headroom on the library filesystem (source of truth for auto-regulation).
+LIBRARY_MIN_FREE_MB = max(0, int(get_config_value("LIBRARY_MIN_FREE_MB", dotenv_values, "1500")))
+LIBRARY_TARGET_FREE_MB = max(
+    LIBRARY_MIN_FREE_MB,
+    int(get_config_value("LIBRARY_TARGET_FREE_MB", dotenv_values, "2000")),
+)
+# When free disk is critical and every track is pinned, still reclaim LRU pins.
+LIBRARY_EMERGENCY_EVICT_PINS = _env_bool("LIBRARY_EMERGENCY_EVICT_PINS")
+# Background reclaim interval (seconds); 0 disables a future reaper loop.
+LIBRARY_RECLAIM_INTERVAL_SEC = max(0, int(get_config_value("LIBRARY_RECLAIM_INTERVAL_SEC", dotenv_values, "300")))
 YOUTUBE_URL_CACHE_TTL_SEC = max(60, int(get_config_value("YOUTUBE_URL_CACHE_TTL_SEC", dotenv_values, "1800")))
 
 GENIUS_CLIENT_ID = get_config_value("GENIUS_CLIENT_ID", dotenv_values, "")

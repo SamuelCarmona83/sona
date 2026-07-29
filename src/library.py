@@ -6,6 +6,7 @@ import logging
 import pathlib
 import random
 import re
+import shutil
 import subprocess
 import time
 
@@ -13,6 +14,7 @@ from src.config import (
     LIBRARY_AUTO_DOWNLOAD,
     LIBRARY_AUTO_ENRICH,
     LIBRARY_EMBED_METADATA,
+    LIBRARY_EMERGENCY_EVICT_PINS,
     LIBRARY_ENABLED,
     LIBRARY_FETCH_COVERS,
     LIBRARY_LOCAL_HIT_MIN_SCORE,
@@ -21,9 +23,11 @@ from src.config import (
     LIBRARY_MAX_FILE_MB,
     LIBRARY_MAX_MB,
     LIBRARY_MAX_TRACKS,
+    LIBRARY_MIN_FREE_MB,
     LIBRARY_MIN_PLAYS_TO_PIN,
     LIBRARY_PATH,
     LIBRARY_REJECT_LIVE,
+    LIBRARY_TARGET_FREE_MB,
     YTDL_OPTIONS,
 )
 from src.scoring import _score_candidate
@@ -334,6 +338,138 @@ def _file_size_mb() -> float:
         if path.is_file():
             total += path.stat().st_size
     return total / (1024 * 1024)
+
+
+def disk_free_mb(path: pathlib.Path | None = None) -> float:
+    """Free space (MiB) on the filesystem that holds the library.
+
+    Returns +inf if the path cannot be measured so callers fail open
+    (do not wipe the library or block playback on a flaky stat).
+    """
+    root = path or _LIBRARY_DIR
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        return shutil.disk_usage(root).free / (1024 * 1024)
+    except OSError as exc:
+        logger.warning("library: disk_usage failed for %s: %s", root, exc)
+        return float("inf")
+
+
+def _is_pinned(entry: dict) -> bool:
+    return entry.get("play_count", 0) >= LIBRARY_MIN_PLAYS_TO_PIN
+
+
+def _pick_eviction_victim(
+    *,
+    protect_tid: str | None = None,
+    allow_pins: bool = False,
+) -> str | None:
+    """Return the LRU track id eligible for eviction, or None."""
+    candidates: list[tuple[float, str]] = []
+    for tid, entry in _index.items():
+        if protect_tid and tid == protect_tid:
+            continue
+        if _is_pinned(entry) and not allow_pins:
+            continue
+        sort_key = float(entry.get("last_played") or entry.get("cached_at") or 0)
+        candidates.append((sort_key, tid))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0])
+    return candidates[0][1]
+
+
+def reclaim_disk(
+    *,
+    reason: str = "",
+    protect_tid: str | None = None,
+) -> dict:
+    """Evict library tracks until under caps and free-space headroom.
+
+    Source of truth for disk pressure is ``disk_free_mb()`` on the library
+    filesystem, plus ``LIBRARY_MAX_MB`` / ``LIBRARY_MAX_TRACKS``. When free
+    space starts below ``LIBRARY_MIN_FREE_MB``, reclaim until
+    ``LIBRARY_TARGET_FREE_MB`` (hysteresis). Never deletes *protect_tid*.
+    """
+    stats = {
+        "evicted": 0,
+        "bytes_freed": 0,
+        "emergency_pins": 0,
+        "reason": reason,
+        "free_mb_before": round(disk_free_mb(), 1),
+    }
+    if not _index:
+        stats["free_mb_after"] = stats["free_mb_before"]
+        return stats
+
+    free_pressure = disk_free_mb() < LIBRARY_MIN_FREE_MB
+
+    def _needs_more() -> bool:
+        if len(_index) > LIBRARY_MAX_TRACKS:
+            return True
+        if _file_size_mb() > LIBRARY_MAX_MB:
+            return True
+        free = disk_free_mb()
+        if free == float("inf"):
+            return False
+        # Under free-space pressure, reclaim up to TARGET; otherwise only enforce MIN.
+        target = LIBRARY_TARGET_FREE_MB if free_pressure else LIBRARY_MIN_FREE_MB
+        return free < target
+
+    while _needs_more():
+        victim = _pick_eviction_victim(protect_tid=protect_tid, allow_pins=False)
+        used_emergency = False
+        if victim is None and LIBRARY_EMERGENCY_EVICT_PINS and disk_free_mb() < LIBRARY_MIN_FREE_MB:
+            victim = _pick_eviction_victim(protect_tid=protect_tid, allow_pins=True)
+            used_emergency = victim is not None
+        if victim is None:
+            logger.warning(
+                "library: reclaim stopped (%s); no victims free=%.0fMB size=%.0fMB tracks=%s",
+                reason or "?",
+                disk_free_mb(),
+                _file_size_mb(),
+                len(_index),
+            )
+            break
+
+        result = delete_track_entry(
+            _index,
+            victim,
+            library_dir=_LIBRARY_DIR,
+            covers_dir=_COVERS_DIR,
+        )
+        stats["evicted"] += 1
+        stats["bytes_freed"] += int(result.get("bytes_freed") or 0)
+        if used_emergency:
+            stats["emergency_pins"] += 1
+            logger.warning(
+                "library: emergency pin eviction %s ('%s') reason=%s",
+                victim,
+                result.get("title") or "?",
+                reason or "?",
+            )
+        else:
+            logger.info(
+                "library: reclaimed %s ('%s') reason=%s",
+                victim,
+                result.get("title") or "?",
+                reason or "?",
+            )
+
+    if stats["evicted"]:
+        _save_index()
+
+    free_after = disk_free_mb()
+    stats["free_mb_after"] = round(free_after, 1) if free_after != float("inf") else None
+    if free_after < LIBRARY_MIN_FREE_MB:
+        logger.warning(
+            "library: disk pressure after reclaim free=%.0fMB min=%s (reason=%s, evicted=%s)",
+            free_after,
+            LIBRARY_MIN_FREE_MB,
+            reason or "?",
+            stats["evicted"],
+        )
+    return stats
 
 
 def get_local_path(tid: str) -> pathlib.Path | None:
@@ -815,32 +951,9 @@ def _upsert_entry_from_track(
     _save_index()
 
 
-def _evict_if_needed() -> None:
-    if not _index:
-        return
-
-    def _is_pinned(entry: dict) -> bool:
-        return entry.get("play_count", 0) >= LIBRARY_MIN_PLAYS_TO_PIN
-
-    while len(_index) > LIBRARY_MAX_TRACKS or _file_size_mb() > LIBRARY_MAX_MB:
-        evictable = [
-            (tid, entry) for tid, entry in _index.items()
-            if not _is_pinned(entry)
-        ]
-        if not evictable:
-            logger.warning("library: at capacity but all tracks are pinned")
-            break
-        evictable.sort(key=lambda x: x[1].get("last_played", x[1].get("cached_at", 0)))
-        tid, entry = evictable[0]
-        path = pathlib.Path(entry.get("file_path", ""))
-        if path.is_file():
-            try:
-                path.unlink()
-            except OSError as exc:
-                logger.warning("library: could not delete %s: %s", path, exc)
-        del _index[tid]
-        logger.info("library: evicted %s ('%s')", tid, entry.get("title", "?"))
-    _save_index()
+def _evict_if_needed(*, protect_tid: str | None = None) -> None:
+    """Best-effort reclaim after caching a new file (caps + free-space headroom)."""
+    reclaim_disk(reason="post-cache", protect_tid=protect_tid)
 
 
 def _cleanup_tid_artifacts(tid: str) -> None:
@@ -895,6 +1008,20 @@ def _download_sync(video_id: str, tid: str, track: dict) -> str | None:
         logger.info(
             "library: skip download for %s ('%s'): %s",
             video_id, track.get("title", "?"), reason,
+        )
+        return None
+
+    # Free-space first: reclaim LRU (and emergency pins if needed), then skip cache
+    # if the host is still under MIN_FREE. Playback can continue without caching.
+    reclaim_disk(reason="pre-download", protect_tid=tid)
+    free_now = disk_free_mb()
+    if free_now < LIBRARY_MIN_FREE_MB:
+        logger.warning(
+            "library: skip download %s ('%s') — free disk %.0fMB < min %sMB",
+            video_id,
+            track.get("title", "?"),
+            free_now,
+            LIBRARY_MIN_FREE_MB,
         )
         return None
 
@@ -1025,7 +1152,7 @@ async def enqueue_download(track: dict, video_ref: str | None = None) -> None:
                 file_path = await asyncio.to_thread(_download_sync, video_id, tid, track)
             if file_path:
                 _upsert_entry_from_track(track, file_path, video_id, tid=tid)
-                _evict_if_needed()
+                _evict_if_needed(protect_tid=tid)
                 logger.info("library: cached '%s' -> %s", track.get("title", tid), file_path)
                 # Always enrich on first addition to the local library (when a song is searched/played for the first time).
                 # This ensures artwork and rich metadata (Spotify/Genius/Last.fm) are fetched autonomously at discovery time.
@@ -1102,10 +1229,16 @@ def get_stats() -> dict:
         key=lambda x: x[1].get("play_count", 0),
         reverse=True,
     )[:10]
+    free = disk_free_mb()
     return {
         "total_indexed": len(_index),
         "on_disk": on_disk,
         "size_mb": round(_file_size_mb(), 1),
+        "max_mb": LIBRARY_MAX_MB,
+        "max_tracks": LIBRARY_MAX_TRACKS,
+        "free_mb": None if free == float("inf") else round(free, 1),
+        "min_free_mb": LIBRARY_MIN_FREE_MB,
+        "target_free_mb": LIBRARY_TARGET_FREE_MB,
         "pinned": pinned,
         "with_cover": with_cover,
         "enriched": enriched,
