@@ -97,3 +97,8 @@ desktop.ini
 venv
 .env
 .cache
+
+# Vue / Vite explorer frontend
+web/explorer/node_modules/
+web/explorer/dist/
+web/explorer/.vscode/

@@ -58,7 +58,7 @@ docker compose up -d
 | `bot` | 8888 | Discord bot + Spotify OAuth callback |
 | `explorer` | 8080 | Data explorer UI |
 
-Open the explorer at [http://localhost:8080/web/explorer.html](http://localhost:8080/web/explorer.html).
+Open the explorer at [http://localhost:8080/](http://localhost:8080/) (Vue build) or [http://localhost:8080/web/explorer.html](http://localhost:8080/web/explorer.html) (legacy HTML fallback).
 
 ### Local development
 
@@ -284,8 +284,10 @@ src/
 └── config.py         # Environment, yt-dlp, FFmpeg options
 
 web/
-├── explorer.html     # Data explorer UI (Tailwind)
+├── explorer/         # Vue 3 + Vite + Tailwind SPA (npm run build → dist/)
+├── explorer.html     # Legacy single-file UI (fallback if dist missing)
 ├── server.py         # Static server + disk/dedupe API
+├── DESIGN.md         # Design tokens
 └── dedupe_library.py # Deduplication engine
 
 scripts/
@@ -297,6 +299,15 @@ Entry point: [`bot.py`](bot.py) → [`src/main.py`](src/main.py).
 ## Data explorer
 
 A read/write UI for cache data on disk. Useful for debugging searches, monitoring disk usage, and cleaning duplicate library entries.
+
+The primary UI is a **Vue 3 SPA** under [`web/explorer/`](web/explorer/). Build with `cd web/explorer && npm install && npm run build`; `web/server.py` serves `dist/` at `/`. Without a build, the legacy [`web/explorer.html`](web/explorer.html) is used.
+
+**Local frontend dev** (HMR via Vite, API on :8080):
+
+```bash
+python3 web/server.py          # terminal A
+cd web/explorer && npm run dev # terminal B → http://localhost:5173
+```
 
 **Endpoints**
 

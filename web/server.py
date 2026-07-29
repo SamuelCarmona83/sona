@@ -15,6 +15,10 @@ sys.path.insert(0, str(ROOT))  # for src.*
 
 from dedupe_library import analyze, apply, resolve_cache_dir  # noqa: E402
 
+# Built Vue SPA (npm run build in web/explorer); falls back to legacy explorer.html
+EXPLORER_DIST = ROOT / "web" / "explorer" / "dist"
+LEGACY_EXPLORER = ROOT / "web" / "explorer.html"
+
 # Lazy to avoid import side effects until needed
 def _get_enrich_fns():
     from src.library import scan_and_enrich_library, get_stats  # noqa: E402
@@ -137,6 +141,61 @@ class ExplorerHandler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_file(self, file_path: pathlib.Path, content_type: Optional[str] = None) -> None:
+        try:
+            data = file_path.read_bytes()
+        except OSError:
+            self.send_error(404)
+            return
+        suffix = file_path.suffix.lower()
+        if content_type is None:
+            content_type = {
+                ".html": "text/html; charset=utf-8",
+                ".js": "application/javascript; charset=utf-8",
+                ".css": "text/css; charset=utf-8",
+                ".svg": "image/svg+xml",
+                ".json": "application/json",
+                ".png": "image/png",
+                ".jpg": "image/jpeg",
+                ".jpeg": "image/jpeg",
+                ".webp": "image/webp",
+                ".woff": "font/woff",
+                ".woff2": "font/woff2",
+                ".ico": "image/x-icon",
+            }.get(suffix, "application/octet-stream")
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        if suffix in {".html", ".js", ".css"}:
+            self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _serve_spa(self, path: str) -> bool:
+        """Serve Vue dist if built; return True if handled."""
+        if not EXPLORER_DIST.is_dir():
+            return False
+        # Root and SPA deep-links → index.html
+        if path in ("/", "/index.html", "/web/", "/web/explorer", "/web/explorer/", "/web/explorer.html"):
+            index = EXPLORER_DIST / "index.html"
+            if index.is_file():
+                self._send_file(index)
+                return True
+            return False
+        # Asset files from dist (e.g. /assets/index-xxx.js)
+        rel = path.lstrip("/")
+        candidate = EXPLORER_DIST / rel
+        if candidate.is_file() and EXPLORER_DIST in candidate.resolve().parents:
+            self._send_file(candidate)
+            return True
+        # Vite assets under /assets/
+        if path.startswith("/assets/"):
+            asset = EXPLORER_DIST / path.lstrip("/")
+            if asset.is_file():
+                self._send_file(asset)
+                return True
+        return False
+
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/api/disk-usage":
@@ -165,6 +224,13 @@ class ExplorerHandler(SimpleHTTPRequestHandler):
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=500)
             return
+        if self._serve_spa(path):
+            return
+        # Legacy HTML when dist is missing
+        if path in ("/", "/web/", "/web/explorer", "/web/explorer/", "/web/explorer.html"):
+            if LEGACY_EXPLORER.is_file():
+                self._send_file(LEGACY_EXPLORER)
+                return
         super().do_GET()
 
     def do_POST(self):
@@ -248,7 +314,13 @@ def main():
     port = int(os.environ.get("EXPLORER_PORT", "8080"))
     host = os.environ.get("EXPLORER_HOST", "0.0.0.0")
     server = HTTPServer((host, port), ExplorerHandler)
-    print(f"Spoty Scanner — Explorador en http://localhost:{port}/web/explorer.html")
+    if EXPLORER_DIST.is_dir() and (EXPLORER_DIST / "index.html").is_file():
+        print(f"Sona explorer (Vue) → http://localhost:{port}/")
+    else:
+        print(
+            f"Sona explorer (legacy) → http://localhost:{port}/web/explorer.html"
+            f"\n  (build Vue UI: cd web/explorer && npm install && npm run build)"
+        )
     server.serve_forever()
 
 

@@ -1,0 +1,22 @@
+@import "tailwindcss";
+
+@theme {
+  --color-ink: #201d1d;
+  --color-canvas: #fdfcfc;
+  --color-body: #424245;
+  --color-mute: #646262;
+  --color-ash: #9a9898;
+  --color-soft: #f8f7f7;
+  --color-accent: #007aff;
+  --color-warn: #ff9f0a;
+  --color-danger: #ff3b30;
+  --color-ok: #30d158;
+  --font-mono: "JetBrains Mono", "IBM Plex Mono", ui-monospace, Menlo, Monaco, Consolas, monospace;
+  --max-width-content: 960px;
+}
+
+html,
+body,
+#app {
+  min-height: 100%;
+}
