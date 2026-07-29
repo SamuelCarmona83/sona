@@ -223,11 +223,12 @@ Header row `{colors.mute}` caption weight; row hover `{colors.surface-soft}`; so
 
 ## Implementation
 
-Styles are implemented with **Tailwind CSS CDN** in [`web/explorer.html`](explorer.html):
+Primary UI is the **Vue 3 SPA** at [`web/explorer/`](explorer/) (Vite + Tailwind CSS v4):
 
-- `tailwind.config.theme.extend` maps design tokens (`ink`, `canvas`, `mute`, `warn`, etc.) to utility classes
-- Reusable class strings live in the `UI` object in the page script (buttons, tabs, tables, cards)
-- No custom `<style>` block; spinner uses Tailwind `animate-spin`
-- JetBrains Mono loaded via Google Fonts; applied with `font-mono`
+- Design tokens live in [`web/explorer/src/style.css`](explorer/src/style.css) (`@theme`)
+- Reusable class recipes live in [`web/explorer/src/ui.ts`](explorer/src/ui.ts)
+- Shell chrome: `src/components/shell/*` and `src/components/chrome/*`
+- JetBrains Mono via Google Fonts in `index.html`
+- Legacy fallback: [`web/explorer.html`](explorer.html) (Tailwind CDN) when `dist/` is missing
 
-When adding UI, prefer Tailwind utilities and extend the theme before introducing inline CSS.
+When adding UI, prefer tokens + `UI` recipes before one-off utilities.

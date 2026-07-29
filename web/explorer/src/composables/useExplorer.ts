@@ -9,11 +9,13 @@ import type {
   LikeItem,
   SearchItem,
   SortKey,
+  StatTile,
   TabId,
   TableSort,
   ViewMode,
 } from '../types'
 import { formatBytes } from '../utils/format'
+import { isLibraryOutlier } from '../utils/outliers'
 import {
   buildTransitions,
   countPlayedIds,
@@ -24,6 +26,14 @@ import {
   transformSearches,
 } from '../utils/transform'
 import { DEFAULT_TABLE_SORT, GRID_INITIAL_LIMIT } from '../ui'
+
+export interface ConfirmRequest {
+  title: string
+  body: string
+  confirmLabel?: string
+  cancelLabel?: string
+  danger?: boolean
+}
 
 export function useExplorer() {
   const loading = ref(true)
@@ -48,6 +58,7 @@ export function useExplorer() {
   })
   const dedupePreview = ref<DedupePreview | null>(null)
   const secondaryDataLoaded = ref(false)
+  const secondaryLoading = ref(false)
   const gridLimit = ref({
     searches: GRID_INITIAL_LIMIT,
     library: GRID_INITIAL_LIMIT,
@@ -57,9 +68,33 @@ export function useExplorer() {
   const banner = ref<{ msg: string; type: BannerType } | null>(null)
   const busyDedupe = ref(false)
   const busyEnrich = ref(false)
+  const showOutliersOnly = ref(false)
+  const enrichSuggest = ref<number | null>(null)
+  const confirmDialog = ref<(ConfirmRequest & { busy?: boolean }) | null>(
+    null,
+  )
+  let confirmResolve: ((ok: boolean) => void) | null = null
 
   function showBanner(msg: string, type: BannerType = 'info') {
     banner.value = { msg, type }
+  }
+
+  function clearBanner() {
+    banner.value = null
+  }
+
+  function askConfirm(req: ConfirmRequest): Promise<boolean> {
+    return new Promise((resolve) => {
+      confirmResolve = resolve
+      confirmDialog.value = { ...req, busy: false }
+    })
+  }
+
+  function resolveConfirm(ok: boolean) {
+    const resolve = confirmResolve
+    confirmResolve = null
+    confirmDialog.value = null
+    resolve?.(ok)
   }
 
   function matchesFilter(fields: unknown[]): boolean {
@@ -83,10 +118,17 @@ export function useExplorer() {
     return sortItems(items, 'searches')
   })
 
+  const outlierCount = computed(
+    () => library.value.filter((i) => isLibraryOutlier(i)).length,
+  )
+
   const filteredLibrary = computed(() => {
     let items = library.value.filter((i) =>
       matchesFilter([i.title, i.artist, i.yt_query, i.trackId]),
     )
+    if (showOutliersOnly.value) {
+      items = items.filter((i) => isLibraryOutlier(i))
+    }
     if (libraryGrouped.value && viewMode.value === 'table') {
       items = groupLibraryItems(items)
     }
@@ -197,26 +239,36 @@ export function useExplorer() {
     return sorted
   }
 
-  const statsParts = computed(() => {
+  const statsTiles = computed((): StatTile[] => {
+    if (loading.value) return []
     const fmTracks = fmSessions.value.reduce(
       (n, s) => n + (s.track_count || 0),
       0,
     )
-    const parts: { text: string; warn?: boolean }[] = [
-      { text: `${library.value.length} biblioteca` },
-      { text: `${searches.value.length} búsquedas` },
-      { text: `${likes.value.length} likes` },
-      { text: `${fmSessions.value.length} fm` },
+    const tiles: StatTile[] = [
+      { value: String(library.value.length), label: 'biblioteca' },
+      { value: String(searches.value.length), label: 'búsquedas' },
+      { value: String(likes.value.length), label: 'likes' },
+      {
+        value:
+          fmTracks > 0
+            ? `${fmSessions.value.length}/${fmTracks}`
+            : String(fmSessions.value.length),
+        label: fmTracks > 0 ? 'fm / det.' : 'fm',
+      },
+      {
+        value: formatBytes(diskUsage.value.total_bytes),
+        label: 'disco',
+      },
     ]
-    if (fmTracks > 0) parts.push({ text: `${fmTracks} detecciones` })
-    parts.push({ text: `${formatBytes(diskUsage.value.total_bytes)} disco` })
     if (dedupePreview.value && dedupePreview.value.wasted_bytes > 0) {
-      parts.push({
-        text: `${dedupePreview.value.duplicate_groups} dup`,
+      tiles.push({
+        value: String(dedupePreview.value.duplicate_groups),
+        label: `dup · ${formatBytes(dedupePreview.value.wasted_bytes)}`,
         warn: true,
       })
     }
-    return parts
+    return tiles
   })
 
   function setTab(tab: TabId) {
@@ -289,13 +341,16 @@ export function useExplorer() {
     const item = library.value.find((i) => i.trackId === trackId)
     const title = item?.title || trackId
     const size = item?.on_disk ? formatBytes(item.file_size_bytes) : '—'
-    const ok = confirm(
-      `¿eliminar de la biblioteca?\n\n` +
+    const ok = await askConfirm({
+      title: '¿eliminar de la biblioteca?',
+      body:
         `${title}\n` +
         `id: ${trackId}\n` +
         `tamaño: ${size}\n\n` +
-        `borra el archivo y la entrada del índice. no se puede deshacer.`,
-    )
+        'borra el archivo y la entrada del índice. no se puede deshacer.',
+      confirmLabel: 'eliminar',
+      danger: true,
+    })
     if (!ok) return
 
     try {
@@ -330,9 +385,10 @@ export function useExplorer() {
       void api.loadDiskUsage().then((disk) => {
         diskUsage.value = disk
       })
+      void refreshEnrichSuggest()
       showBanner(
         `eliminado · ${formatBytes(Number(data.bytes_freed) || 0)} liberados · ${trackId}`,
-        'info',
+        'success',
       )
     } catch (err) {
       showBanner(`error al eliminar: ${err}`, 'error')
@@ -341,20 +397,26 @@ export function useExplorer() {
 
   async function doDedupe() {
     if (!dedupePreview.value || dedupePreview.value.wasted_bytes <= 0) return
-    const msg =
-      `¿eliminar duplicados y recuperar ~${formatBytes(dedupePreview.value.wasted_bytes)}?\n\n` +
-      `${dedupePreview.value.duplicate_groups} grupos · ${dedupePreview.value.files_to_delete?.length || 0} archivos\n\n` +
-      'recomendado: detener el bot antes (docker compose stop bot).'
-    if (!confirm(msg)) return
+    const ok = await askConfirm({
+      title: '¿eliminar duplicados?',
+      body:
+        `recuperar ~${formatBytes(dedupePreview.value.wasted_bytes)}\n\n` +
+        `${dedupePreview.value.duplicate_groups} grupos · ${dedupePreview.value.files_to_delete?.length || 0} archivos\n\n` +
+        'recomendado: detener el bot antes (docker compose stop bot).',
+      confirmLabel: 'dedupe',
+      danger: true,
+    })
+    if (!ok) return
 
     busyDedupe.value = true
     try {
       const data = await api.runDedupe()
       showBanner(
         `liberados ${formatBytes(Number(data.bytes_freed) || dedupePreview.value.wasted_bytes)} · ${data.entries_after} entradas`,
-        'info',
+        'success',
       )
       await reloadData()
+      void refreshEnrichSuggest()
     } catch (err) {
       showBanner(
         `[-] error: ${err instanceof Error ? err.message : err}`,
@@ -365,23 +427,53 @@ export function useExplorer() {
     }
   }
 
-  async function doEnrich() {
-    busyEnrich.value = true
+  async function refreshEnrichSuggest() {
     try {
       const pre = await api.enrichPreview()
-      const suggest = pre.suggest_enrich || 0
-      if (
-        suggest <= 0 &&
-        !confirm('No hay muchas entradas por enriquecer. ¿Ejecutar de todas formas?')
-      ) {
-        return
+      enrichSuggest.value =
+        typeof pre.suggest_enrich === 'number' ? pre.suggest_enrich : null
+    } catch {
+      /* API optional */
+    }
+  }
+
+  async function doEnrich() {
+    let suggest = enrichSuggest.value
+    if (suggest == null) {
+      try {
+        const pre = await api.enrichPreview()
+        suggest = pre.suggest_enrich || 0
+        enrichSuggest.value = suggest
+      } catch {
+        suggest = 0
       }
+    }
+
+    if (suggest <= 0) {
+      const ok = await askConfirm({
+        title: '¿enriquecer de todas formas?',
+        body: 'no hay muchas entradas pendientes de enriquecer.',
+        confirmLabel: 'enriquecer',
+      })
+      if (!ok) return
+    } else {
+      const ok = await askConfirm({
+        title: '¿enriquecer biblioteca?',
+        body: `se intentará enriquecer ~${suggest} entradas (cover / metadata).`,
+        confirmLabel: `enriquecer · ${suggest}`,
+      })
+      if (!ok) return
+    }
+
+    busyEnrich.value = true
+    try {
       const data = await api.runEnrich()
       showBanner(
         `enriquecidas: ${data.updated || 0} (de ${data.processed || 0})`,
-        'info',
+        'success',
       )
       await reloadData()
+      void refreshEnrichSuggest()
     } catch (err) {
       showBanner(
         `[-] error enriquecer: ${err instanceof Error ? err.message : err}`,
@@ -404,27 +496,42 @@ export function useExplorer() {
     library.value = transformLibrary(libIndex, disk)
     fmSessions.value = transformFmSessions(fmRaw)
     secondaryDataLoaded.value = true
+    secondaryLoading.value = false
   }
 
   async function loadSecondaryData() {
-    if (secondaryDataLoaded.value) return
-    const [likesRaw, playedRaw, fmRaw, libIndex] = await Promise.all([
-      api.loadCacheJson('likes.json'),
-      api.loadCacheJson('played_ids.json'),
-      api.loadCacheJson('fm_sessions.json'),
-      library.value.length
-        ? Promise.resolve(null)
-        : api.loadCacheJson('library_index.json'),
-    ])
-    likes.value = transformLikes(likesRaw)
-    fmSessions.value = transformFmSessions(fmRaw)
-    playedCount.value = countPlayedIds(playedRaw)
-    if (libIndex) library.value = transformLibrary(libIndex, diskUsage.value)
-    secondaryDataLoaded.value = true
-    void api.loadDedupePreview().then((d) => {
-      dedupePreview.value = d
-    })
+    if (secondaryDataLoaded.value || secondaryLoading.value) return
+    secondaryLoading.value = true
+    try {
+      const [likesRaw, playedRaw, fmRaw, libIndex] = await Promise.all([
+        api.loadCacheJson('likes.json'),
+        api.loadCacheJson('played_ids.json'),
+        api.loadCacheJson('fm_sessions.json'),
+        library.value.length
+          ? Promise.resolve(null)
+          : api.loadCacheJson('library_index.json'),
+      ])
+      likes.value = transformLikes(likesRaw)
+      fmSessions.value = transformFmSessions(fmRaw)
+      playedCount.value = countPlayedIds(playedRaw)
+      if (libIndex) library.value = transformLibrary(libIndex, diskUsage.value)
+      secondaryDataLoaded.value = true
+      void api.loadDedupePreview().then((d) => {
+        dedupePreview.value = d
+      })
+    } finally {
+      secondaryLoading.value = false
+    }
   }
+
+  const tabBusy = computed(() => {
+    if (loading.value) return false
+    if (secondaryDataLoaded.value) return false
+    return (
+      secondaryLoading.value &&
+      (activeTab.value === 'likes' || activeTab.value === 'fm')
+    )
+  })
 
   async function init() {
     loading.value = true
@@ -445,6 +552,7 @@ export function useExplorer() {
     searches.value = transformSearches(ytMeta)
     library.value = transformLibrary(libIndex, disk)
     loading.value = false
+    void refreshEnrichSuggest()
 
     const idle =
       window.requestIdleCallback ||
@@ -480,12 +588,21 @@ export function useExplorer() {
     banner,
     busyDedupe,
     busyEnrich,
+    showOutliersOnly,
+    outlierCount,
+    enrichSuggest,
+    confirmDialog,
+    secondaryDataLoaded,
+    secondaryLoading,
+    tabBusy,
     filteredSearches,
     filteredLibrary,
     filteredLikes,
     filteredFm,
-    statsParts,
+    statsTiles,
     showBanner,
+    clearBanner,
+    resolveConfirm,
     emptyMessage,
     setTab,
     setViewMode,

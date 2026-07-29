@@ -1,23 +1,81 @@
 <script setup lang="ts">
-import { computed, onMounted } from 'vue'
+import { computed, onBeforeUnmount, onMounted } from 'vue'
+import ConfirmModal from './components/chrome/ConfirmModal.vue'
+import EmptyState from './components/chrome/EmptyState.vue'
+import LoadingBlock from './components/chrome/LoadingBlock.vue'
+import TabNav from './components/chrome/TabNav.vue'
+import Toolbar from './components/chrome/Toolbar.vue'
 import DataTable from './components/DataTable.vue'
 import FmSessionPanel from './components/FmSessionPanel.vue'
+import LibraryToolbar from './components/library/LibraryToolbar.vue'
+import AppFooter from './components/shell/AppFooter.vue'
+import AppHeader from './components/shell/AppHeader.vue'
+import Banner from './components/shell/Banner.vue'
+import StatsRow from './components/shell/StatsRow.vue'
 import TrackCard from './components/TrackCard.vue'
 import { useExplorer } from './composables/useExplorer'
-import type { SortKey, TabId } from './types'
-import { formatBytes } from './utils/format'
-import { UI } from './ui'
+import {
+  applyUrlStateOnce,
+  watchUrlState,
+} from './composables/useUrlState'
+import type { SortKey, TabId, ViewMode } from './types'
+import { GRID_INITIAL_LIMIT, UI } from './ui'
 
 const ex = useExplorer()
 
-const tabs: { id: TabId; label: string }[] = [
-  { id: 'searches', label: 'búsquedas' },
-  { id: 'library', label: 'biblioteca' },
-  { id: 'likes', label: 'likes' },
-  { id: 'fm', label: 'sesiones FM' },
-]
+applyUrlStateOnce({
+  activeTab: ex.activeTab,
+  viewMode: ex.viewMode,
+  filterText: ex.filterText,
+  setTab: ex.setTab,
+  setViewMode: ex.setViewMode,
+  onFilterInput: ex.onFilterInput,
+})
+watchUrlState({
+  activeTab: ex.activeTab,
+  viewMode: ex.viewMode,
+  filterText: ex.filterText,
+  setTab: ex.setTab,
+  setViewMode: ex.setViewMode,
+  onFilterInput: ex.onFilterInput,
+})
 
 const hasFilter = computed(() => !!ex.filterText.value.trim())
+
+const tabItems = computed(() => [
+  {
+    id: 'searches' as TabId,
+    label: 'búsquedas',
+    count: hasFilter.value
+      ? ex.filteredSearches.value.length
+      : ex.searches.value.length,
+  },
+  {
+    id: 'library' as TabId,
+    label: 'biblioteca',
+    count: hasFilter.value || ex.showOutliersOnly.value
+      ? ex.filteredLibrary.value.length
+      : ex.library.value.length,
+  },
+  {
+    id: 'likes' as TabId,
+    label: 'likes',
+    count: !ex.secondaryDataLoaded.value
+      ? null
+      : hasFilter.value
+        ? ex.filteredLikes.value.length
+        : ex.likes.value.length,
+  },
+  {
+    id: 'fm' as TabId,
+    label: 'sesiones FM',
+    count: !ex.secondaryDataLoaded.value
+      ? null
+      : hasFilter.value
+        ? ex.filteredFm.value.length
+        : ex.fmSessions.value.length,
+  },
+])
 
 const currentItems = computed(() => {
   if (ex.activeTab.value === 'searches') return ex.filteredSearches.value
@@ -31,274 +89,245 @@ const visibleGridItems = computed(() => {
   if (tab === 'fm') return []
   const items = currentItems.value
   const limit =
-    ex.gridLimit.value[tab as 'searches' | 'library' | 'likes'] || 36
+    ex.gridLimit.value[tab as 'searches' | 'library' | 'likes'] ||
+    GRID_INITIAL_LIMIT
   return items.slice(0, limit)
 })
+
+const remainingGrid = computed(
+  () => currentItems.value.length - visibleGridItems.value.length,
+)
 
 const countLabel = computed(() => {
   const tab = ex.activeTab.value
   if (tab === 'fm') return ''
   const total = currentItems.value.length
   if (!total) return ''
-  return hasFilter.value ? `${total} / filtro` : `${total}`
+  const parts: string[] = []
+  if (hasFilter.value) parts.push(`${total} / filtro`)
+  else parts.push(String(total))
+  if (tab === 'library' && ex.showOutliersOnly.value) parts.push('outliers')
+  return parts.join(' · ')
 })
 
-const showDedupe = computed(
-  () =>
-    !!ex.dedupePreview.value &&
-    (ex.dedupePreview.value.wasted_bytes || 0) > 0,
-)
+const emptyHint = computed(() => {
+  if (ex.showOutliersOnly.value && ex.activeTab.value === 'library') {
+    return 'sin outliers con el filtro actual'
+  }
+  if (hasFilter.value) return 'probá otro filtro o limpiá la búsqueda'
+  if (ex.activeTab.value === 'fm') return 'en discord: !fm'
+  if (ex.activeTab.value === 'likes') return 'en discord: !like'
+  if (ex.activeTab.value === 'library') return 'en discord: !play'
+  return 'en discord: !play para cachear búsquedas'
+})
 
 const showGroupToggle = computed(
   () =>
     ex.activeTab.value === 'library' && ex.viewMode.value === 'table',
 )
 
-function onSortChange(e: Event) {
-  ex.sortKey.value = (e.target as HTMLSelectElement).value as SortKey
+function onFilterUpdate(value: string) {
+  ex.onFilterInput(value)
+}
+
+function onSortUpdate(value: SortKey) {
+  ex.sortKey.value = value
+}
+
+function onViewUpdate(value: ViewMode) {
+  ex.setViewMode(value)
+}
+
+function showAllGrid() {
+  const tab = ex.activeTab.value as 'searches' | 'library' | 'likes'
+  ex.gridLimit.value = {
+    ...ex.gridLimit.value,
+    [tab]: currentItems.value.length,
+  }
+}
+
+function onGlobalKeydown(e: KeyboardEvent) {
+  const target = e.target as HTMLElement | null
+  const tag = target?.tagName
+  const typing =
+    tag === 'INPUT' ||
+    tag === 'TEXTAREA' ||
+    tag === 'SELECT' ||
+    target?.isContentEditable
+  if (e.key === '/' && !typing) {
+    e.preventDefault()
+    document.getElementById('explorer-filter')?.focus()
+    return
+  }
+  if (typing || e.metaKey || e.ctrlKey || e.altKey) return
+  const tabKeys: Record<string, TabId> = {
+    '1': 'searches',
+    '2': 'library',
+    '3': 'likes',
+    '4': 'fm',
+  }
+  const tab = tabKeys[e.key]
+  if (tab) {
+    e.preventDefault()
+    ex.setTab(tab)
+  }
 }
 
 onMounted(() => {
+  window.addEventListener('keydown', onGlobalKeydown)
   void ex.init()
+})
+
+onBeforeUnmount(() => {
+  window.removeEventListener('keydown', onGlobalKeydown)
 })
 </script>
 
 <template>
-  <header class="bg-ink text-canvas py-5 mb-8">
-    <div
-      class="max-w-content mx-auto px-5 flex items-baseline justify-between gap-4 flex-wrap"
-    >
-      <h1 class="text-lg font-bold text-canvas tracking-tight m-0">sona</h1>
-      <span class="text-[11px] text-ash">
-        {{ ex.cacheDir.value ? `/${ex.cacheDir.value}/` : 'cargando…' }}
-      </span>
-    </div>
-  </header>
+  <div class="min-h-full bg-canvas text-body font-mono">
+    <AppHeader
+      :cache-dir="ex.cacheDir.value"
+      :loading="ex.loading.value"
+    />
 
-  <div class="max-w-content mx-auto px-5 pb-12">
-    <div
-      v-if="ex.banner.value"
-      :class="[
-        UI.banner,
-        ex.banner.value.type === 'error' ? UI.bannerError : UI.bannerInfo,
-      ]"
-    >
-      {{ ex.banner.value.msg }}
-    </div>
+    <div :class="[UI.content, 'pb-12']">
+      <Banner
+        v-if="ex.banner.value"
+        :message="ex.banner.value.msg"
+        :type="ex.banner.value.type"
+        @dismiss="ex.clearBanner()"
+      />
 
-    <p class="text-xs text-mute border-b border-black/10 pb-4 mb-5">
-      <template v-if="ex.loading.value">cargando…</template>
-      <template v-else>
-        <template v-for="(part, i) in ex.statsParts.value" :key="i">
-          <span v-if="i > 0"> · </span>
-          <strong
-            class="font-medium"
-            :class="part.warn ? 'text-warn' : 'text-ink'"
-            >{{ part.text.split(' ')[0] }}</strong
-          >
-          <span :class="part.warn ? 'text-warn' : ''">
-            {{ ' ' + part.text.split(' ').slice(1).join(' ') }}
-          </span>
-        </template>
-      </template>
-    </p>
+      <StatsRow
+        :tiles="ex.statsTiles.value"
+        :loading="ex.loading.value"
+      />
 
-    <div class="flex flex-wrap items-center gap-3 mb-6">
-      <div class="flex-1 min-w-[200px]">
-        <input
-          type="search"
-          class="h-10 w-full rounded border border-black/10 bg-soft px-3 text-sm text-ink focus:outline-none focus:border-mute"
-          placeholder="filtrar…"
-          autocomplete="off"
-          :value="ex.filterText.value"
-          @input="
-            ex.onFilterInput(($event.target as HTMLInputElement).value)
-          "
+      <Toolbar
+        :filter-text="ex.filterText.value"
+        :sort-key="ex.sortKey.value"
+        :view-mode="ex.viewMode.value"
+        :active-tab="ex.activeTab.value"
+        @update:filter-text="onFilterUpdate"
+        @update:sort-key="onSortUpdate"
+        @update:view-mode="onViewUpdate"
+      />
+
+      <TabNav
+        :tabs="tabItems"
+        :active="ex.activeTab.value"
+        @select="ex.setTab"
+      />
+
+      <main>
+        <LoadingBlock v-if="ex.loading.value" label="cargando" />
+
+        <LoadingBlock
+          v-else-if="ex.tabBusy.value"
+          label="cargando datos…"
         />
-      </div>
-      <select
-        v-show="ex.activeTab.value !== 'fm' && ex.viewMode.value === 'grid'"
-        class="h-10 rounded border border-black/10 bg-soft px-3 text-sm text-ink focus:outline-none cursor-pointer"
-        :value="ex.sortKey.value"
-        @change="onSortChange"
-      >
-        <option value="recent">más reciente</option>
-        <option value="alpha">alfabético</option>
-        <option
-          v-show="
-            ex.activeTab.value === 'searches' ||
-            ex.activeTab.value === 'library'
-          "
-          value="duration"
-        >
-          duración
-        </option>
-        <option v-show="ex.activeTab.value === 'library'" value="plays">
-          más reproducidas
-        </option>
-        <option v-show="ex.activeTab.value === 'library'" value="size">
-          mayor tamaño
-        </option>
-      </select>
-      <div
-        v-show="ex.activeTab.value !== 'fm'"
-        class="flex overflow-hidden rounded border border-black/10"
-      >
-        <button
-          type="button"
-          :class="ex.viewMode.value === 'grid' ? UI.btnActive : UI.btn"
-          @click="ex.setViewMode('grid')"
-        >
-          tarjetas
-        </button>
-        <button
-          type="button"
-          :class="ex.viewMode.value === 'table' ? UI.btnActive : UI.btn"
-          @click="ex.setViewMode('table')"
-        >
-          tabla
-        </button>
-      </div>
-    </div>
 
-    <nav class="flex border-b border-black/10 mb-6 overflow-x-auto">
-      <button
-        v-for="t in tabs"
-        :key="t.id"
-        type="button"
-        :class="ex.activeTab.value === t.id ? UI.tabActive : UI.tab"
-        @click="ex.setTab(t.id)"
-      >
-        {{ t.label }}
-      </button>
-    </nav>
+        <section v-else-if="ex.activeTab.value === 'fm'">
+          <FmSessionPanel
+            :sessions="ex.filteredFm.value"
+            :selected-id="ex.selectedFmSessionId.value"
+            :empty-message="ex.emptyMessage('fm', hasFilter)"
+            :station-transitions="ex.transitionsForStation"
+            @select="ex.selectedFmSessionId.value = $event"
+          />
+        </section>
 
-    <main>
-      <!-- Loading -->
-      <div v-if="ex.loading.value" :class="UI.empty">
-        <span
-          class="inline-block h-3.5 w-3.5 animate-spin rounded-full border-2 border-black/10 border-t-ink align-middle mr-2"
-        />
-        cargando
-      </div>
+        <section v-else>
+          <LibraryToolbar
+            v-if="ex.activeTab.value === 'library'"
+            :dedupe="ex.dedupePreview.value"
+            :show-group-toggle="showGroupToggle"
+            :library-grouped="ex.libraryGrouped.value"
+            :busy-dedupe="ex.busyDedupe.value"
+            :busy-enrich="ex.busyEnrich.value"
+            :enrich-suggest="ex.enrichSuggest.value"
+            :show-outliers-only="ex.showOutliersOnly.value"
+            :outlier-count="ex.outlierCount.value"
+            @dedupe="ex.doDedupe()"
+            @enrich="ex.doEnrich()"
+            @update:library-grouped="ex.setLibraryGrouped"
+            @update:show-outliers-only="ex.showOutliersOnly.value = $event"
+          />
 
-      <!-- FM -->
-      <section v-else-if="ex.activeTab.value === 'fm'">
-        <FmSessionPanel
-          :sessions="ex.filteredFm.value"
-          :selected-id="ex.selectedFmSessionId.value"
-          :empty-message="ex.emptyMessage('fm', hasFilter)"
-          :station-transitions="ex.transitionsForStation"
-          @select="ex.selectedFmSessionId.value = $event"
-        />
-      </section>
+          <p v-if="countLabel" class="text-[11px] text-ash mb-3">
+            {{ countLabel }}
+          </p>
 
-      <!-- Other tabs -->
-      <section v-else>
-        <!-- Library toolbar -->
-        <div
-          v-if="ex.activeTab.value === 'library'"
-          class="flex flex-wrap items-center gap-3 mb-4"
-        >
+          <EmptyState
+            v-if="!currentItems.length"
+            :message="ex.emptyMessage(ex.activeTab.value, hasFilter)"
+            :hint="emptyHint"
+          />
+
           <div
-            v-if="showDedupe"
-            class="flex-1 min-w-[200px] border border-warn/40 px-3.5 py-2.5 text-sm text-warn"
+            v-else-if="ex.viewMode.value === 'grid'"
+            class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4"
           >
-            {{ ex.dedupePreview.value!.duplicate_groups }} duplicados ·
-            {{ formatBytes(ex.dedupePreview.value!.wasted_bytes) }}
-            recuperables
-          </div>
-          <div
-            v-if="showGroupToggle"
-            class="flex overflow-hidden rounded border border-black/10"
-          >
-            <button
-              type="button"
-              :class="ex.libraryGrouped.value ? UI.btnActive : UI.btn"
-              @click="ex.setLibraryGrouped(true)"
+            <TrackCard
+              v-for="(item, idx) in visibleGridItems"
+              :key="idx"
+              :tab="ex.activeTab.value"
+              :item="item"
+              @delete="ex.deleteTrack"
+            />
+            <div
+              v-if="remainingGrid > 0"
+              class="col-span-full flex flex-wrap gap-2"
             >
-              agrupado
-            </button>
-            <button
-              type="button"
-              :class="!ex.libraryGrouped.value ? UI.btnActive : UI.btn"
-              @click="ex.setLibraryGrouped(false)"
-            >
-              detallado
-            </button>
+              <button
+                type="button"
+                class="flex-1 min-w-[140px] py-3 text-sm font-medium text-ink border border-black/10 hover:bg-soft"
+                @click="
+                  ex.showMore(
+                    ex.activeTab.value as 'searches' | 'library' | 'likes',
+                  )
+                "
+              >
+                mostrar más ({{ remainingGrid }} restantes)
+              </button>
+              <button
+                v-if="remainingGrid < GRID_INITIAL_LIMIT * 2"
+                type="button"
+                class="py-3 px-4 text-sm font-medium text-mute border border-black/10 hover:bg-soft hover:text-ink"
+                @click="showAllGrid"
+              >
+                mostrar todo
+              </button>
+            </div>
           </div>
-          <button
-            v-if="showDedupe"
-            type="button"
-            :class="UI.btnDanger"
-            :disabled="ex.busyDedupe.value"
-            @click="ex.doDedupe()"
-          >
-            {{ ex.busyDedupe.value ? 'limpiando…' : 'dedupe' }}
-          </button>
-          <button
-            type="button"
-            class="px-4 py-2 text-sm font-medium text-ink border border-black/10 bg-soft rounded hover:bg-white disabled:opacity-50"
-            :disabled="ex.busyEnrich.value"
-            @click="ex.doEnrich()"
-          >
-            {{ ex.busyEnrich.value ? 'enriqueciendo…' : 'enriquecer' }}
-          </button>
-        </div>
 
-        <p class="text-[11px] text-ash mb-3">{{ countLabel }}</p>
-
-        <!-- Empty -->
-        <div
-          v-if="!currentItems.length"
-          :class="UI.empty"
-        >
-          {{ ex.emptyMessage(ex.activeTab.value, hasFilter) }}
-        </div>
-
-        <!-- Grid -->
-        <div
-          v-else-if="ex.viewMode.value === 'grid'"
-          class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4"
-        >
-          <TrackCard
-            v-for="(item, idx) in visibleGridItems"
-            :key="idx"
+          <DataTable
+            v-else
             :tab="ex.activeTab.value"
-            :item="item"
+            :items="currentItems"
+            :library-grouped="ex.libraryGrouped.value"
+            :table-sort="ex.tableSort.value"
+            :total-bytes="ex.diskUsage.value.total_bytes"
+            @sort="ex.toggleTableSort"
             @delete="ex.deleteTrack"
           />
-          <button
-            v-if="currentItems.length > visibleGridItems.length"
-            type="button"
-            class="col-span-full py-3 text-sm font-medium text-ink border border-black/10 hover:bg-soft"
-            @click="
-              ex.showMore(
-                ex.activeTab.value as 'searches' | 'library' | 'likes',
-              )
-            "
-          >
-            mostrar más ({{
-              currentItems.length - visibleGridItems.length
-            }}
-            restantes)
-          </button>
-        </div>
+        </section>
+      </main>
 
-        <!-- Table -->
-        <DataTable
-          v-else
-          :tab="ex.activeTab.value"
-          :items="currentItems"
-          :library-grouped="ex.libraryGrouped.value"
-          :table-sort="ex.tableSort.value"
-          :total-bytes="ex.diskUsage.value.total_bytes"
-          @sort="ex.toggleTableSort"
-          @delete="ex.deleteTrack"
-        />
-      </section>
-    </main>
+      <AppFooter hint="/ filtro · 1–4 pestañas" />
+    </div>
 
-    <footer class="mt-8 text-[11px] text-ash">explorer</footer>
+    <ConfirmModal
+      v-if="ex.confirmDialog.value"
+      :open="!!ex.confirmDialog.value"
+      :title="ex.confirmDialog.value.title"
+      :body="ex.confirmDialog.value.body"
+      :confirm-label="ex.confirmDialog.value.confirmLabel"
+      :cancel-label="ex.confirmDialog.value.cancelLabel"
+      :danger="ex.confirmDialog.value.danger"
+      :busy="ex.confirmDialog.value.busy"
+      @confirm="ex.resolveConfirm(true)"
+      @cancel="ex.resolveConfirm(false)"
+    />
   </div>
 </template>

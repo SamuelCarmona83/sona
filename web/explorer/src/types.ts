@@ -1,7 +1,13 @@
 export type TabId = 'searches' | 'library' | 'likes' | 'fm'
 export type ViewMode = 'grid' | 'table'
 export type SortKey = 'recent' | 'alpha' | 'duration' | 'plays' | 'size'
-export type BannerType = 'info' | 'error'
+export type BannerType = 'info' | 'error' | 'success' | 'warn'
+
+export interface StatTile {
+  value: string
+  label: string
+  warn?: boolean
+}
 
 export interface DiskUsage {
   total_bytes: number

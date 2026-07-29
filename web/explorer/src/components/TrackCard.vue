@@ -43,6 +43,7 @@ function isLike(item: SearchItem | LibraryItem | LikeItem): item is LikeItem {
   <article
     :class="[
       UI.card,
+      'focus-within:border-mute',
       isLib(item) && isLibraryOutlier(item) ? 'border-warn/50' : '',
     ]"
   >
@@ -54,14 +55,14 @@ function isLike(item: SearchItem | LibraryItem | LikeItem): item is LikeItem {
         loading="lazy"
         :class="UI.cardThumbImg"
       />
-      <span v-else class="text-3xl text-ash">♪</span>
+      <span v-else class="text-3xl text-ash" aria-hidden="true">♪</span>
     </div>
     <div :class="UI.cardBody">
       <div :class="UI.cardTitle">
         {{ item.title }}
         <span
           v-if="isLib(item) && isLibraryOutlier(item)"
-          class="text-[10px] text-warn ml-1"
+          class="inline-block text-[10px] font-medium text-warn border border-warn/40 px-1 ml-1 align-middle"
           >outlier</span
         >
       </div>

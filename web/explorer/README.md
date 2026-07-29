@@ -37,3 +37,10 @@ python3 web/server.py
 - Vite 8
 - Tailwind CSS 4 (`@tailwindcss/vite`)
 - TypeScript
+
+## UX notes
+
+- Design system: [`../DESIGN.md`](../DESIGN.md) (manpage / mono / cream)
+- Deep links: `?tab=library&view=table&q=radio`
+- Shortcuts: `/` focuses filter; `1`–`4` switch tabs (when not typing)
+- Destructive actions use an in-app confirm modal (delete, dedupe, enrich)

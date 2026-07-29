@@ -116,16 +116,17 @@ const shownBytes = () =>
 
 <template>
   <div :class="UI.tableWrap">
-    <table class="w-full table-fixed border-collapse">
+    <table class="w-full table-fixed border-collapse min-w-[640px]">
       <colgroup>
         <col v-for="col in columns()" :key="col.key" :style="{ width: colWidth(col) }" />
       </colgroup>
-      <thead class="bg-soft">
+      <thead class="bg-soft sticky top-0 z-10">
         <tr>
           <th
             v-for="col in columns()"
             :key="col.key"
             :class="thClass(col)"
+            scope="col"
             @click="emit('sort', col.key)"
           >
             {{ col.label }}
