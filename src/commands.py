@@ -312,10 +312,14 @@ async def _switch_to_fm_station(
 
 
 def _first_radio_track_index(tracks: list[dict]) -> int:
-    return next(
+    """Return the index of the first radio track, or 1 (right after now-playing)
+    when no radio tracks exist, so user !play requests don't get buried at the
+    end of a long playlist queue."""
+    idx = next(
         (i for i, track in enumerate(tracks) if track.get("requester") == RADIO_REQUESTER_LABEL),
-        len(tracks),
+        -1,
     )
+    return idx if idx >= 0 else 1
 
 
 def _enqueue_user_tracks_before_radio(
