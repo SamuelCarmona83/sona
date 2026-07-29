@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import random as _random
 import asyncio
+import json
 import logging
 import pathlib
 import re
@@ -10,6 +11,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
 
 import discord
+import requests
 from discord.ext import commands
 from spotipy.oauth2 import SpotifyOauthError
 
@@ -30,6 +32,20 @@ _oauth_received = threading.Event()
 
 # In-memory cache: artist_id -> list of genre strings (avoids repeated API calls per artist)
 _artist_genres_cache: dict[str, list[str]] = {}
+
+# Spotify Web API often returns 403 on playlist track listing for apps without
+# extended access. The public embed page still exposes the track list.
+_EMBED_NEXT_DATA_RE = re.compile(
+    r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
+    re.DOTALL,
+)
+_EMBED_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en",
+}
 
 
 def clear_spotify_token_cache() -> bool:
@@ -191,6 +207,102 @@ def _track_to_info(track: dict) -> dict:
     }
 
 
+def _embed_track_to_info(item: dict) -> dict | None:
+    """Convert an embed-page trackList entry into queue track info."""
+    if not isinstance(item, dict):
+        return None
+    uri = item.get("uri") or ""
+    if not uri.startswith("spotify:track:"):
+        return None
+    track_id = uri.rsplit(":", 1)[-1]
+    title = (item.get("title") or "").strip()
+    if not title:
+        return None
+    # Embed joins multi-artist names with NBSP after commas.
+    artists = (item.get("subtitle") or "").replace("\xa0", " ").strip()
+    query = f"{artists} - {title}" if artists else title
+    return {
+        "query": query,
+        "spotify_id": track_id,
+        "artist_id": None,
+        "spotify_refined": True,
+    }
+
+
+def _fetch_playlist_tracks_from_embed(playlist_id: str) -> list[dict]:
+    """Load playlist tracks from Spotify's public embed page.
+
+    Used when the Web API forbids GET /playlists/{id}/items (HTTP 403) for apps
+    without extended access. The embed payload includes title, artists, and id.
+    """
+    url = f"https://open.spotify.com/embed/playlist/{playlist_id}"
+    response = requests.get(url, headers=_EMBED_HEADERS, timeout=20)
+    response.raise_for_status()
+    match = _EMBED_NEXT_DATA_RE.search(response.text)
+    if not match:
+        raise ValueError("embed page missing __NEXT_DATA__ payload")
+
+    payload = json.loads(match.group(1))
+    entity = (
+        payload.get("props", {})
+        .get("pageProps", {})
+        .get("state", {})
+        .get("data", {})
+        .get("entity")
+        or {}
+    )
+    playlist_name = entity.get("name") or entity.get("title") or "Playlist"
+    track_list = entity.get("trackList") or []
+    infos: list[dict] = []
+    for item in track_list:
+        info = _embed_track_to_info(item)
+        if info:
+            infos.append(info)
+    logger.info(
+        "spotify_url: embed fallback extraidas %s canciones de la playlist '%s'",
+        len(infos),
+        playlist_name,
+    )
+    return infos
+
+
+async def _fetch_playlist_tracks_via_api(playlist_id: str) -> list[dict]:
+    """Fetch playlist tracks via Spotipy. Raises on API/auth failure."""
+    if sp is None:
+        raise RuntimeError("Spotify client unavailable")
+
+    all_tracks: list[dict] = []
+    offset = 0
+    limit = 50
+    playlist_name = "Playlist"
+    while True:
+        result = await asyncio.to_thread(
+            lambda off=offset: sp.playlist_items(
+                playlist_id, offset=off, limit=limit, market="from_token"
+            )
+        )
+        # playlist_items is a paging object; name is not always present.
+        playlist_name = result.get("name") or playlist_name
+        items = result.get("items") or []
+        if not items:
+            break
+        for item in items:
+            track = item.get("track") if item else None
+            if track and track.get("id"):
+                all_tracks.append(track)
+        if len(items) < limit:
+            break
+        offset += limit
+
+    infos = [_track_to_info(t) for t in all_tracks]
+    logger.info(
+        "spotify_url: extraidas %s canciones de la playlist '%s' (api)",
+        len(infos),
+        playlist_name,
+    )
+    return infos
+
+
 async def _get_tracks_from_spotify_url(url: str) -> list[dict] | None:
     """Extract track info from a Spotify URL.
 
@@ -205,12 +317,16 @@ async def _get_tracks_from_spotify_url(url: str) -> list[dict] | None:
         resource_id = parsed["id"]
 
         if resource_type == "track":
+            if sp is None:
+                return None
             track = await asyncio.to_thread(lambda: sp.track(resource_id))
             info = _track_to_info(track)
             logger.info(f"spotify_url: extraida cancion '{info['query']}' de URL de track")
             return [info]
 
         elif resource_type == "album":
+            if sp is None:
+                return None
             album = await asyncio.to_thread(lambda: sp.album(resource_id))
             album_name = album.get("name", "Album")
             tracks = album.get("tracks", {}).get("items", [])
@@ -219,23 +335,33 @@ async def _get_tracks_from_spotify_url(url: str) -> list[dict] | None:
             return infos
 
         elif resource_type == "playlist":
-            all_tracks = []
-            playlist_name = ""
-            offset = 0
-            limit = 50
-            while True:
-                result = await asyncio.to_thread(lambda: sp.playlist_items(resource_id, offset=offset, limit=limit, market="from_token"))
-                playlist_name = result.get("name", "Playlist")
-                items = result.get("items", [])
-                if not items:
-                    break
-                for item in items:
-                    if item.get("track"):
-                        all_tracks.append(item["track"])
-                offset += limit
-            infos = [_track_to_info(t) for t in all_tracks]
-            logger.info(f"spotify_url: extraidas {len(infos)} canciones de la playlist '{playlist_name}'")
-            return infos
+            api_error: Exception | None = None
+            infos: list[dict] | None = None
+            try:
+                infos = await _fetch_playlist_tracks_via_api(resource_id)
+            except Exception as exc:
+                api_error = exc
+                logger.warning(
+                    "spotify_url: API playlist_items fallo (%s); intentando embed publico",
+                    exc,
+                )
+
+            if not infos:
+                try:
+                    infos = await asyncio.to_thread(
+                        _fetch_playlist_tracks_from_embed, resource_id
+                    )
+                except Exception as embed_exc:
+                    logger.warning(
+                        "spotify_url: embed fallback fallo para playlist %s: %s",
+                        resource_id,
+                        embed_exc,
+                    )
+                    if api_error is not None:
+                        raise api_error from embed_exc
+                    raise
+
+            return infos or None
 
     except Exception as exc:
         logger.warning(f"spotify_url: fallo extrayendo canciones de URL: {exc}")

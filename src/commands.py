@@ -1704,7 +1704,17 @@ async def playlist_cmd(ctx: commands.Context, *, url: str):
         return
 
     if not track_infos:
-        embed = error_embed("Error cargando la playlist", details="URL de Spotify no válida o sin canciones.")
+        from src.spotify import _parse_spotify_url
+
+        parsed = _parse_spotify_url(url)
+        if not parsed or parsed.get("type") != "playlist":
+            details = "URL de Spotify no válida. Usa un enlace de playlist o álbum."
+        else:
+            details = (
+                "No se pudieron leer las canciones de esa playlist "
+                "(API de Spotify restringida o playlist vacía)."
+            )
+        embed = error_embed("Error cargando la playlist", details=details)
         await msg.edit(embed=embed)
         return
 

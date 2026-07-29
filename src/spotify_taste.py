@@ -133,6 +133,7 @@ async def fetch_playlist_tracks(client: spotipy.Spotify, playlist_id: str, limit
     tracks: list[dict] = []
     offset = 0
     page_size = 50
+    api_failed = False
     try:
         while len(tracks) < limit:
             result = await asyncio.to_thread(
@@ -153,8 +154,49 @@ async def fetch_playlist_tracks(client: spotipy.Spotify, playlist_id: str, limit
                 break
             offset += page_size
     except Exception as exc:
-        logger.warning("spotify_taste: playlist %s failed: %s", playlist_id, exc)
-    return tracks
+        api_failed = True
+        logger.warning("spotify_taste: playlist %s API failed: %s", playlist_id, exc)
+
+    if tracks:
+        return tracks[:limit]
+
+    # Web API often 403s playlist items; public embed still lists tracks.
+    try:
+        from src.spotify import _fetch_playlist_tracks_from_embed
+
+        embed_tracks = await asyncio.to_thread(_fetch_playlist_tracks_from_embed, playlist_id)
+        for info in embed_tracks:
+            artists = ""
+            title = info.get("query") or ""
+            if " - " in title:
+                artists, title = title.split(" - ", 1)
+            tracks.append(
+                {
+                    "query": info.get("query"),
+                    "spotify_id": info.get("spotify_id"),
+                    "artist_id": info.get("artist_id"),
+                    "title": title or "?",
+                    "artist": artists or "Unknown",
+                    "source": "playlist",
+                }
+            )
+            if len(tracks) >= limit:
+                break
+        if tracks:
+            logger.info(
+                "spotify_taste: playlist %s loaded %s tracks via embed fallback",
+                playlist_id,
+                len(tracks),
+            )
+    except Exception as exc:
+        logger.warning(
+            "spotify_taste: playlist %s embed fallback failed: %s",
+            playlist_id,
+            exc,
+        )
+        if not api_failed:
+            logger.warning("spotify_taste: playlist %s failed: %s", playlist_id, exc)
+    return tracks[:limit]
 
 
 def _dedupe_tracks(tracks: list[dict]) -> list[dict]:
