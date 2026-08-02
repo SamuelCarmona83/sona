@@ -5,6 +5,70 @@ export type BannerType = 'info' | 'error' | 'success' | 'warn'
 /** Library list grouping in the explorer UI. */
 export type LibraryGroupMode = 'flat' | 'video' | 'artist' | 'album'
 
+/** Server catalog track (from /api/catalog). */
+export interface CatalogTrack {
+  id: string
+  trackId: string
+  title: string
+  artist: string
+  album: string
+  album_display: string
+  artist_key: string
+  album_key: string
+  match_key: string
+  sources: string[]
+  origin: string
+  cover_url: string
+  thumbnail?: string
+  best_artwork?: string | null
+  duration: number
+  play_count: number
+  request_count: number
+  last_played: number
+  last_requested: number
+  cached_at: number
+  spotify_id?: string | null
+  video_id?: string | null
+  webpage_url?: string
+  yt_query?: string
+  file_size_bytes: number
+  on_disk: boolean
+  source: string
+  liked: boolean
+  detect_count?: number
+  station_name?: string
+}
+
+export interface CatalogArtist {
+  key: string
+  name: string
+  track_count: number
+  album_count: number
+  play_count: number
+  request_count: number
+  cover_url: string
+}
+
+export interface CatalogAlbum {
+  key: string
+  artist_key: string
+  artist: string
+  name: string
+  track_count: number
+  play_count: number
+  cover_url: string
+}
+
+export interface CatalogSummary {
+  tracks: number
+  artists: number
+  albums: number
+  on_disk: number
+  fm: number
+  requests: number
+  liked: number
+}
+
 export interface StatTile {
   value: string
   label: string

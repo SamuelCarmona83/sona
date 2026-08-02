@@ -59,7 +59,9 @@ docker compose up -d
 | `explorer` | 8080 | Data explorer UI |
 
 Open the explorer at [http://localhost:8080/](http://localhost:8080/) (Vue SPA, built into the Docker image).  
-Check `GET /api/health` → `"ui":"vue"`. Prefer `/`, not `/web/explorer.html` (that path is legacy; redirects to `/` when Vue is present).
+Music library shell (Inicio / Biblioteca / Artistas / Álbumes / Pedidos / FM / Admin).  
+Catalog API: `GET /api/catalog/full`, `/api/catalog/artists`, `/api/catalog/tracks?source=request`.  
+Check `GET /api/health` → `"ui":"vue"`. Prefer `/`, not `/web/explorer.html`.
 
 ### Local development
 

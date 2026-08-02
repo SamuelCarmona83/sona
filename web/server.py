@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT / "web"))
 sys.path.insert(0, str(ROOT))  # for src.*
 
 from dedupe_library import analyze, apply, resolve_cache_dir  # noqa: E402
+from src.catalog import handle_catalog_request, invalidate_catalog_cache  # noqa: E402
 
 # Built Vue SPA (npm run build in web/explorer); falls back to legacy explorer.html
 EXPLORER_DIST = ROOT / "web" / "explorer" / "dist"
@@ -205,7 +206,8 @@ class ExplorerHandler(SimpleHTTPRequestHandler):
         return False
 
     def do_GET(self):
-        path = urlparse(self.path).path
+        parsed = urlparse(self.path)
+        path = parsed.path
         if path == "/api/disk-usage":
             self._send_json(build_disk_usage())
             return
@@ -215,6 +217,14 @@ class ExplorerHandler(SimpleHTTPRequestHandler):
                 "ui": "vue" if self._vue_ready() else "legacy",
                 "dist": str(EXPLORER_DIST),
             })
+            return
+        if path.startswith("/api/catalog"):
+            cache_dir = resolve_cache_dir(ROOT)
+            if not cache_dir:
+                self._send_json({"error": "No cache directory found"}, status=404)
+                return
+            status, body = handle_catalog_request(cache_dir, path, parsed.query or "")
+            self._send_json(body, status=status)
             return
         if path == "/api/library/dedupe-preview":
             cache_dir = resolve_cache_dir(ROOT)
@@ -293,6 +303,7 @@ class ExplorerHandler(SimpleHTTPRequestHandler):
                 return
             # Force disk-usage refresh after delete
             build_disk_usage(force=True)
+            invalidate_catalog_cache()
             self._send_json(result)
             return
         self.send_error(404)

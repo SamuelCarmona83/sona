@@ -1,418 +1,793 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted } from 'vue'
-import ConfirmModal from './components/chrome/ConfirmModal.vue'
-import EmptyState from './components/chrome/EmptyState.vue'
-import LoadingBlock from './components/chrome/LoadingBlock.vue'
-import TabNav from './components/chrome/TabNav.vue'
-import Toolbar from './components/chrome/Toolbar.vue'
-import DataTable from './components/DataTable.vue'
-import FmSessionPanel from './components/FmSessionPanel.vue'
-import LibraryToolbar from './components/library/LibraryToolbar.vue'
-import AppFooter from './components/shell/AppFooter.vue'
-import AppHeader from './components/shell/AppHeader.vue'
+import { computed, onMounted, watch } from 'vue'
 import Banner from './components/shell/Banner.vue'
-import StatsRow from './components/shell/StatsRow.vue'
-import TrackCard from './components/TrackCard.vue'
-import { useExplorer } from './composables/useExplorer'
+import LoadingBlock from './components/chrome/LoadingBlock.vue'
+import EmptyState from './components/chrome/EmptyState.vue'
+import FmSessionPanel from './components/FmSessionPanel.vue'
+import CoverCard from './components/music/CoverCard.vue'
+import TrackRow from './components/music/TrackRow.vue'
 import {
-  applyUrlStateOnce,
-  watchUrlState,
-} from './composables/useUrlState'
-import type { SortKey, TabId, ViewMode } from './types'
-import { GRID_INITIAL_LIMIT, UI } from './ui'
+  type AppView,
+  type LibrarySection,
+  useCatalog,
+} from './composables/useCatalog'
+import { formatBytes } from './utils/format'
+import { UI } from './ui'
+import { buildTransitions } from './utils/transform'
 
-const ex = useExplorer()
+const cat = useCatalog()
 
-applyUrlStateOnce({
-  activeTab: ex.activeTab,
-  viewMode: ex.viewMode,
-  filterText: ex.filterText,
-  setTab: ex.setTab,
-  setViewMode: ex.setViewMode,
-  onFilterInput: ex.onFilterInput,
-})
-watchUrlState({
-  activeTab: ex.activeTab,
-  viewMode: ex.viewMode,
-  filterText: ex.filterText,
-  setTab: ex.setTab,
-  setViewMode: ex.setViewMode,
-  onFilterInput: ex.onFilterInput,
-})
+const navMain: { id: AppView; label: string }[] = [
+  { id: 'home', label: 'Inicio' },
+  { id: 'search', label: 'Buscar' },
+  { id: 'library', label: 'Biblioteca' },
+  { id: 'likes', label: 'Me gusta' },
+  { id: 'fm', label: 'Radio FM' },
+]
 
-const hasFilter = computed(() => !!ex.filterText.value.trim())
+const libSections: { id: LibrarySection; label: string }[] = [
+  { id: 'artists', label: 'Artistas' },
+  { id: 'albums', label: 'Álbumes' },
+  { id: 'tracks', label: 'Canciones' },
+  { id: 'requests', label: 'Pedidos' },
+  { id: 'all', label: 'Todo' },
+]
 
-const tabItems = computed(() => [
-  {
-    id: 'searches' as TabId,
-    label: 'búsquedas',
-    count: hasFilter.value
-      ? ex.filteredSearches.value.length
-      : ex.searches.value.length,
-  },
-  {
-    id: 'library' as TabId,
-    label: 'biblioteca',
-    count: hasFilter.value || ex.showOutliersOnly.value
-      ? ex.filteredLibrary.value.length
-      : ex.library.value.length,
-  },
-  {
-    id: 'likes' as TabId,
-    label: 'likes',
-    count: !ex.secondaryDataLoaded.value
-      ? null
-      : hasFilter.value
-        ? ex.filteredLikes.value.length
-        : ex.likes.value.length,
-  },
-  {
-    id: 'fm' as TabId,
-    label: 'sesiones FM',
-    count: !ex.secondaryDataLoaded.value
-      ? null
-      : hasFilter.value
-        ? ex.filteredFm.value.length
-        : ex.fmSessions.value.length,
-  },
-])
-
-const currentItems = computed(() => {
-  if (ex.activeTab.value === 'searches') return ex.filteredSearches.value
-  if (ex.activeTab.value === 'library') return ex.filteredLibrary.value
-  if (ex.activeTab.value === 'likes') return ex.filteredLikes.value
-  return []
-})
-
-const visibleGridItems = computed(() => {
-  const tab = ex.activeTab.value
-  if (tab === 'fm') return []
-  const items = currentItems.value
-  const limit =
-    ex.gridLimit.value[tab as 'searches' | 'library' | 'likes'] ||
-    GRID_INITIAL_LIMIT
-  return items.slice(0, limit)
-})
-
-const remainingGrid = computed(
-  () => currentItems.value.length - visibleGridItems.value.length,
-)
-
-const countLabel = computed(() => {
-  const tab = ex.activeTab.value
-  if (tab === 'fm') return ''
-  const total = currentItems.value.length
-  if (!total) return ''
-  const parts: string[] = []
-  if (hasFilter.value) parts.push(`${total} / filtro`)
-  else parts.push(String(total))
-  if (tab === 'library' && ex.showOutliersOnly.value) parts.push('outliers')
-  return parts.join(' · ')
-})
-
-const emptyHint = computed(() => {
-  if (ex.showOutliersOnly.value && ex.activeTab.value === 'library') {
-    return 'sin outliers con el filtro actual'
+const pageTitle = computed(() => {
+  if (cat.view.value === 'artist' && cat.currentArtist.value)
+    return cat.currentArtist.value.name
+  if (cat.view.value === 'album' && cat.currentAlbum.value)
+    return cat.currentAlbum.value.name
+  if (cat.view.value === 'library') {
+    const m: Record<LibrarySection, string> = {
+      artists: 'Artistas',
+      albums: 'Álbumes',
+      tracks: 'Canciones',
+      requests: 'Pedidos',
+      all: 'Biblioteca',
+    }
+    return m[cat.librarySection.value]
   }
-  if (hasFilter.value) return 'probá otro filtro o limpiá la búsqueda'
-  if (ex.activeTab.value === 'fm') return 'en discord: !fm'
-  if (ex.activeTab.value === 'likes') return 'en discord: !like'
-  if (ex.activeTab.value === 'library')
-    return 'disco + capturas FM (shazam) · !play / !fm'
-  return 'en discord: !play (pedidos de usuario)'
+  const titles: Partial<Record<AppView, string>> = {
+    home: 'Inicio',
+    search: 'Buscar',
+    likes: 'Me gusta',
+    fm: 'Radio FM',
+    admin: 'Admin',
+  }
+  return titles[cat.view.value] || 'sona'
 })
 
-const showGroupToggle = computed(() => ex.activeTab.value === 'library')
-
-const hierarchicalLibrary = computed(
-  () =>
-    ex.activeTab.value === 'library' &&
-    (ex.libraryGroupMode.value === 'artist' ||
-      ex.libraryGroupMode.value === 'album'),
+const likedTracks = computed(() =>
+  cat.tracks.value.filter((t) => t.liked),
 )
 
-function onFilterUpdate(value: string) {
-  ex.onFilterInput(value)
-}
-
-function onSortUpdate(value: SortKey) {
-  ex.sortKey.value = value
-}
-
-function onViewUpdate(value: ViewMode) {
-  ex.setViewMode(value)
-}
-
-function showAllGrid() {
-  const tab = ex.activeTab.value as 'searches' | 'library' | 'likes'
-  ex.gridLimit.value = {
-    ...ex.gridLimit.value,
-    [tab]: currentItems.value.length,
+function onNav(id: AppView) {
+  if (id === 'library') cat.goLibrary(cat.librarySection.value || 'artists')
+  else if (id === 'home') cat.goHome()
+  else {
+    cat.artistKey.value = null
+    cat.albumKey.value = null
+    cat.setView(id)
   }
 }
 
-function onGlobalKeydown(e: KeyboardEvent) {
-  const target = e.target as HTMLElement | null
-  const tag = target?.tagName
-  const typing =
-    tag === 'INPUT' ||
-    tag === 'TEXTAREA' ||
-    tag === 'SELECT' ||
-    target?.isContentEditable
-  if (e.key === '/' && !typing) {
-    e.preventDefault()
-    document.getElementById('explorer-filter')?.focus()
+function applyUrlOnce() {
+  const p = new URLSearchParams(window.location.search)
+  const view = p.get('view') as AppView | null
+  const section = p.get('section') as LibrarySection | null
+  const artist = p.get('artist')
+  const album = p.get('album')
+  const q = p.get('q')
+  if (q) cat.filterText.value = q
+  if (view === 'artist' && artist) {
+    cat.openArtist(artist)
     return
   }
-  if (typing || e.metaKey || e.ctrlKey || e.altKey) return
-  const tabKeys: Record<string, TabId> = {
-    '1': 'searches',
-    '2': 'library',
-    '3': 'likes',
-    '4': 'fm',
+  if (view === 'album' && artist && album) {
+    cat.openAlbum(artist, album)
+    return
   }
-  const tab = tabKeys[e.key]
-  if (tab) {
-    e.preventDefault()
-    ex.setTab(tab)
+  if (view === 'library') {
+    cat.goLibrary(section || 'artists')
+    return
+  }
+  if (
+    view &&
+    ['home', 'search', 'likes', 'fm', 'admin'].includes(view)
+  ) {
+    cat.setView(view)
   }
 }
 
+function syncUrl() {
+  const params = new URLSearchParams()
+  const v = cat.view.value
+  if (v !== 'home') params.set('view', v)
+  if (v === 'library' && cat.librarySection.value !== 'artists') {
+    params.set('section', cat.librarySection.value)
+  }
+  if (cat.artistKey.value) params.set('artist', cat.artistKey.value)
+  if (cat.albumKey.value && v === 'album')
+    params.set('album', cat.albumKey.value)
+  if (cat.filterText.value.trim())
+    params.set('q', cat.filterText.value.trim())
+  const qs = params.toString()
+  const next = qs
+    ? `${window.location.pathname}?${qs}`
+    : window.location.pathname
+  if (next !== `${window.location.pathname}${window.location.search}`) {
+    window.history.replaceState(null, '', next)
+  }
+}
+
+watch(
+  [
+    cat.view,
+    cat.librarySection,
+    cat.artistKey,
+    cat.albumKey,
+    cat.filterText,
+  ],
+  () => syncUrl(),
+)
+
 onMounted(() => {
-  window.addEventListener('keydown', onGlobalKeydown)
-  void ex.init()
+  applyUrlOnce()
+  void cat.init()
 })
 
-onBeforeUnmount(() => {
-  window.removeEventListener('keydown', onGlobalKeydown)
-})
+function transitionsForStation(stationuuid: string) {
+  const tracks = []
+  for (const s of cat.fmSessions.value) {
+    if (stationuuid && s.stationuuid !== stationuuid) continue
+    for (const t of s.tracks || []) tracks.push(t)
+  }
+  return buildTransitions(tracks)
+}
 </script>
 
 <template>
-  <div class="min-h-full bg-canvas text-body font-mono">
-    <AppHeader
-      :cache-dir="ex.cacheDir.value"
-      :loading="ex.loading.value"
-    />
+  <div class="min-h-full bg-canvas text-body font-mono flex">
+    <!-- Sidebar -->
+    <aside
+      class="hidden md:flex w-56 shrink-0 flex-col border-r border-black/10 bg-soft min-h-screen sticky top-0 h-screen"
+    >
+      <div class="px-5 py-6 border-b border-black/10">
+        <p class="text-[10px] text-ash tracking-wide mb-1">sona</p>
+        <h1 class="text-lg font-bold text-ink m-0 tracking-tight">explorer</h1>
+      </div>
+      <nav class="flex-1 p-3 space-y-0.5" aria-label="Principal">
+        <button
+          v-for="item in navMain"
+          :key="item.id"
+          type="button"
+          class="w-full text-left px-3 py-2 text-sm rounded-sm transition-colors"
+          :class="
+            (item.id === 'library'
+              ? cat.view.value === 'library' ||
+                cat.view.value === 'artist' ||
+                cat.view.value === 'album'
+              : cat.view.value === item.id)
+              ? 'bg-ink text-canvas font-medium'
+              : 'text-mute hover:text-ink hover:bg-canvas'
+          "
+          @click="onNav(item.id)"
+        >
+          {{ item.label }}
+        </button>
+        <div
+          v-if="
+            cat.view.value === 'library' ||
+            cat.view.value === 'artist' ||
+            cat.view.value === 'album'
+          "
+          class="pl-2 mt-1 space-y-0.5 border-l border-black/10 ml-3"
+        >
+          <button
+            v-for="sec in libSections"
+            :key="sec.id"
+            type="button"
+            class="w-full text-left px-3 py-1.5 text-[12px] rounded-sm"
+            :class="
+              cat.view.value === 'library' &&
+              cat.librarySection.value === sec.id
+                ? 'text-ink font-medium'
+                : 'text-ash hover:text-ink'
+            "
+            @click="cat.goLibrary(sec.id)"
+          >
+            {{ sec.label }}
+          </button>
+        </div>
+      </nav>
+      <div class="p-3 border-t border-black/10">
+        <button
+          type="button"
+          class="w-full text-left px-3 py-2 text-[12px] text-ash hover:text-ink"
+          :class="cat.view.value === 'admin' ? 'text-ink font-medium' : ''"
+          @click="cat.setView('admin')"
+        >
+          Admin
+        </button>
+        <p
+          v-if="cat.summary.value"
+          class="px-3 pt-2 text-[10px] text-ash leading-relaxed"
+        >
+          {{ cat.summary.value.tracks }} temas ·
+          {{ cat.summary.value.artists }} artistas
+        </p>
+      </div>
+    </aside>
 
-    <div :class="[UI.content, 'pb-12']">
-      <Banner
-        v-if="ex.banner.value"
-        :message="ex.banner.value.msg"
-        :type="ex.banner.value.type"
-        @dismiss="ex.clearBanner()"
-      />
+    <!-- Main -->
+    <div class="flex-1 min-w-0 flex flex-col min-h-screen">
+      <header
+        class="sticky top-0 z-20 border-b border-black/10 bg-canvas/95 backdrop-blur-sm"
+      >
+        <div class="px-4 sm:px-6 py-3 flex flex-wrap items-center gap-3">
+          <button
+            type="button"
+            class="md:hidden text-sm text-mute border border-black/10 px-2 py-1"
+            @click="cat.mobileNavOpen.value = !cat.mobileNavOpen.value"
+          >
+            menú
+          </button>
+          <nav
+            class="flex flex-wrap items-center gap-1 text-[12px] text-ash min-w-0 flex-1"
+            aria-label="Miga de pan"
+          >
+            <template
+              v-for="(c, i) in cat.breadcrumb()"
+              :key="i"
+            >
+              <span v-if="i > 0" class="text-ash/60">/</span>
+              <button
+                v-if="c.action"
+                type="button"
+                class="hover:text-ink truncate max-w-[140px]"
+                @click="c.action()"
+              >
+                {{ c.label }}
+              </button>
+              <span v-else class="text-ink font-medium truncate max-w-[200px]">{{
+                c.label
+              }}</span>
+            </template>
+          </nav>
+          <div class="w-full sm:w-64 sm:ml-auto">
+            <input
+              id="explorer-filter"
+              type="search"
+              :class="UI.input"
+              placeholder="Buscar en la biblioteca…"
+              :value="cat.filterText.value"
+              @input="
+                cat.filterText.value = ($event.target as HTMLInputElement).value
+              "
+              @focus="cat.view.value !== 'search' && cat.filterText.value && cat.setView('search')"
+            />
+          </div>
+        </div>
+        <!-- mobile nav -->
+        <div
+          v-if="cat.mobileNavOpen.value"
+          class="md:hidden border-t border-black/10 px-3 py-2 flex flex-wrap gap-1 bg-soft"
+        >
+          <button
+            v-for="item in navMain"
+            :key="item.id"
+            type="button"
+            class="px-3 py-1.5 text-[12px] border border-black/10"
+            @click="onNav(item.id)"
+          >
+            {{ item.label }}
+          </button>
+          <button
+            type="button"
+            class="px-3 py-1.5 text-[12px] border border-black/10"
+            @click="cat.setView('admin')"
+          >
+            Admin
+          </button>
+        </div>
+      </header>
 
-      <StatsRow
-        :tiles="ex.statsTiles.value"
-        :loading="ex.loading.value"
-      />
-
-      <Toolbar
-        :filter-text="ex.filterText.value"
-        :sort-key="ex.sortKey.value"
-        :view-mode="ex.viewMode.value"
-        :active-tab="ex.activeTab.value"
-        @update:filter-text="onFilterUpdate"
-        @update:sort-key="onSortUpdate"
-        @update:view-mode="onViewUpdate"
-      />
-
-      <TabNav
-        :tabs="tabItems"
-        :active="ex.activeTab.value"
-        @select="ex.setTab"
-      />
-
-      <main>
-        <LoadingBlock v-if="ex.loading.value" label="cargando" />
-
-        <LoadingBlock
-          v-else-if="ex.tabBusy.value"
-          label="cargando datos…"
+      <main class="flex-1 px-4 sm:px-6 py-6 max-w-5xl w-full mx-auto">
+        <Banner
+          v-if="cat.banner.value"
+          :message="cat.banner.value.msg"
+          :type="cat.banner.value.type"
+          @dismiss="cat.clearBanner()"
         />
 
-        <section v-else-if="ex.activeTab.value === 'fm'">
-          <FmSessionPanel
-            :sessions="ex.filteredFm.value"
-            :selected-id="ex.selectedFmSessionId.value"
-            :empty-message="ex.emptyMessage('fm', hasFilter)"
-            :station-transitions="ex.transitionsForStation"
-            @select="ex.selectedFmSessionId.value = $event"
-          />
-        </section>
+        <LoadingBlock v-if="cat.loading.value" label="cargando catálogo…" />
 
-        <section v-else>
-          <LibraryToolbar
-            v-if="ex.activeTab.value === 'library'"
-            :dedupe="ex.dedupePreview.value"
-            :show-group-toggle="showGroupToggle"
-            :library-group-mode="ex.libraryGroupMode.value"
-            :busy-dedupe="ex.busyDedupe.value"
-            :busy-enrich="ex.busyEnrich.value"
-            :enrich-suggest="ex.enrichSuggest.value"
-            :show-outliers-only="ex.showOutliersOnly.value"
-            :outlier-count="ex.outlierCount.value"
-            @dedupe="ex.doDedupe()"
-            @enrich="ex.doEnrich()"
-            @update:library-group-mode="ex.setLibraryGroupMode"
-            @update:show-outliers-only="ex.showOutliersOnly.value = $event"
-          />
+        <template v-else>
+          <!-- HOME -->
+          <section v-if="cat.view.value === 'home'" class="space-y-10">
+            <div>
+              <h2 class="text-xl font-bold text-ink m-0 mb-1">{{ pageTitle }}</h2>
+              <p class="text-[12px] text-mute m-0">
+                Pedidos, radio y capturas FM en un solo lugar.
+              </p>
+            </div>
 
-          <p v-if="countLabel" class="text-[11px] text-ash mb-3">
-            {{ countLabel }}
-            <template v-if="ex.activeTab.value === 'searches'">
-              · solo pedidos (!play)
+            <div v-if="cat.recentRequests.value.length">
+              <h3 class="text-sm font-bold text-ink mb-3">Pedidos recientes</h3>
+              <div
+                class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3"
+              >
+                <CoverCard
+                  v-for="t in cat.recentRequests.value"
+                  :key="t.id"
+                  :title="t.title"
+                  :subtitle="t.artist"
+                  :cover-url="t.cover_url || t.thumbnail"
+                  :meta="`×${t.request_count} pedidos`"
+                  @click="cat.openArtist(t.artist_key)"
+                />
+              </div>
+            </div>
+
+            <div v-if="cat.recentFm.value.length">
+              <h3 class="text-sm font-bold text-ink mb-3">Detectado en FM</h3>
+              <div
+                class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3"
+              >
+                <CoverCard
+                  v-for="t in cat.recentFm.value"
+                  :key="t.id"
+                  :title="t.title"
+                  :subtitle="t.artist"
+                  :cover-url="t.cover_url || t.thumbnail"
+                  :meta="t.station_name || 'fm'"
+                  @click="cat.openArtist(t.artist_key)"
+                />
+              </div>
+            </div>
+
+            <div v-if="cat.topPlayed.value.length">
+              <h3 class="text-sm font-bold text-ink mb-3">Más reproducido</h3>
+              <div class="border border-black/10">
+                <TrackRow
+                  v-for="(t, i) in cat.topPlayed.value"
+                  :key="t.id"
+                  :track="t"
+                  :index="i + 1"
+                  show-album
+                  @artist="cat.openArtist"
+                  @album="cat.openAlbum"
+                  @delete="cat.deleteTrack"
+                />
+              </div>
+            </div>
+
+            <EmptyState
+              v-if="
+                !cat.recentRequests.value.length &&
+                !cat.recentFm.value.length &&
+                !cat.topPlayed.value.length
+              "
+              message="biblioteca vacía"
+              hint="en discord: !play · !fm · !like"
+            />
+          </section>
+
+          <!-- SEARCH -->
+          <section v-else-if="cat.view.value === 'search'" class="space-y-6">
+            <h2 class="text-xl font-bold text-ink m-0">Buscar</h2>
+            <EmptyState
+              v-if="!cat.filterText.value.trim()"
+              message="escribí en el buscador"
+              hint="artistas, álbumes o canciones"
+            />
+            <template v-else>
+              <div v-if="cat.filteredArtists.value.length">
+                <h3 class="text-sm font-bold text-ink mb-2">Artistas</h3>
+                <div
+                  class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3 mb-6"
+                >
+                  <CoverCard
+                    v-for="a in cat.filteredArtists.value.slice(0, 8)"
+                    :key="a.key"
+                    :title="a.name"
+                    :subtitle="`${a.track_count} temas`"
+                    :cover-url="a.cover_url"
+                    @click="cat.openArtist(a.key)"
+                  />
+                </div>
+              </div>
+              <div class="border border-black/10">
+                <TrackRow
+                  v-for="(t, i) in cat.filteredTracks.value.slice(0, 40)"
+                  :key="t.id"
+                  :track="t"
+                  :index="i + 1"
+                  show-album
+                  @artist="cat.openArtist"
+                  @album="cat.openAlbum"
+                  @delete="cat.deleteTrack"
+                />
+              </div>
+              <EmptyState
+                v-if="
+                  !cat.filteredTracks.value.length &&
+                  !cat.filteredArtists.value.length
+                "
+                message="sin resultados"
+                hint="probá otro término"
+              />
             </template>
-            <template
-              v-else-if="
-                ex.activeTab.value === 'library' && hierarchicalLibrary
+          </section>
+
+          <!-- LIBRARY -->
+          <section v-else-if="cat.view.value === 'library'" class="space-y-5">
+            <div class="flex flex-wrap items-end justify-between gap-3">
+              <h2 class="text-xl font-bold text-ink m-0">{{ pageTitle }}</h2>
+              <div class="flex flex-wrap gap-1">
+                <button
+                  v-for="sec in libSections"
+                  :key="sec.id"
+                  type="button"
+                  class="px-3 py-1 text-[12px] border border-black/10"
+                  :class="
+                    cat.librarySection.value === sec.id
+                      ? 'bg-ink text-canvas'
+                      : 'text-mute hover:text-ink'
+                  "
+                  @click="cat.goLibrary(sec.id)"
+                >
+                  {{ sec.label }}
+                </button>
+              </div>
+            </div>
+
+            <!-- artists grid -->
+            <div
+              v-if="
+                cat.librarySection.value === 'artists' ||
+                cat.librarySection.value === 'all'
               "
             >
-              · {{ ex.libraryArtistGroups.value.length }} artistas
-            </template>
-          </p>
-
-          <EmptyState
-            v-if="!currentItems.length"
-            :message="ex.emptyMessage(ex.activeTab.value, hasFilter)"
-            :hint="emptyHint"
-          />
-
-          <!-- Hierarchical library: artist → album -->
-          <div
-            v-else-if="
-              ex.viewMode.value === 'grid' && hierarchicalLibrary
-            "
-            class="space-y-8"
-          >
-            <section
-              v-for="artist in ex.libraryArtistGroups.value"
-              :key="artist.key"
-              class="border border-black/10"
-            >
-              <header
-                class="px-4 py-3 bg-soft border-b border-black/10 flex items-baseline justify-between gap-3"
+              <h3
+                v-if="cat.librarySection.value === 'all'"
+                class="text-sm font-bold text-ink mb-3"
               >
-                <h3 class="text-sm font-bold text-ink m-0">
-                  {{ artist.label }}
-                </h3>
-                <span class="text-[11px] text-ash shrink-0">
-                  {{ artist.trackCount }}
-                  {{ artist.trackCount === 1 ? 'tema' : 'temas' }}
-                </span>
-              </header>
-
+                Artistas
+              </h3>
               <div
-                v-if="ex.libraryGroupMode.value === 'album'"
-                class="divide-y divide-black/10"
+                v-if="cat.filteredArtists.value.length"
+                class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3"
+              >
+                <CoverCard
+                  v-for="a in cat.filteredArtists.value"
+                  :key="a.key"
+                  :title="a.name"
+                  :subtitle="`${a.album_count} álb. · ${a.track_count} temas`"
+                  :cover-url="a.cover_url"
+                  @click="cat.openArtist(a.key)"
+                />
+              </div>
+              <EmptyState
+                v-else-if="cat.librarySection.value === 'artists'"
+                message="sin artistas"
+                hint="!play o !fm"
+              />
+            </div>
+
+            <div
+              v-if="
+                cat.librarySection.value === 'albums' ||
+                cat.librarySection.value === 'all'
+              "
+              class="mt-6"
+            >
+              <h3
+                v-if="cat.librarySection.value === 'all'"
+                class="text-sm font-bold text-ink mb-3"
+              >
+                Álbumes
+              </h3>
+              <div
+                v-if="cat.filteredAlbums.value.length"
+                class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3"
+              >
+                <CoverCard
+                  v-for="a in cat.filteredAlbums.value"
+                  :key="a.key"
+                  :title="a.name"
+                  :subtitle="a.artist"
+                  :cover-url="a.cover_url"
+                  :meta="`${a.track_count} temas`"
+                  @click="cat.openAlbum(a.artist_key, a.key)"
+                />
+              </div>
+              <EmptyState
+                v-else-if="cat.librarySection.value === 'albums'"
+                message="sin álbumes"
+                hint="enrich o metadata de Spotify"
+              />
+            </div>
+
+            <div
+              v-if="
+                cat.librarySection.value === 'tracks' ||
+                cat.librarySection.value === 'requests' ||
+                cat.librarySection.value === 'all'
+              "
+              class="mt-6"
+            >
+              <h3
+                v-if="cat.librarySection.value === 'all'"
+                class="text-sm font-bold text-ink mb-3"
+              >
+                Canciones
+              </h3>
+              <div
+                v-if="cat.filteredTracks.value.length"
+                class="border border-black/10"
+              >
+                <TrackRow
+                  v-for="(t, i) in cat.filteredTracks.value.slice(0, 200)"
+                  :key="t.id"
+                  :track="t"
+                  :index="i + 1"
+                  show-album
+                  @artist="cat.openArtist"
+                  @album="cat.openAlbum"
+                  @delete="cat.deleteTrack"
+                />
+              </div>
+              <EmptyState
+                v-else
+                :message="
+                  cat.librarySection.value === 'requests'
+                    ? 'sin pedidos'
+                    : 'sin canciones'
+                "
+                :hint="
+                  cat.librarySection.value === 'requests'
+                    ? 'en discord: !play'
+                    : '!play · !fm'
+                "
+              />
+            </div>
+          </section>
+
+          <!-- ARTIST DETAIL -->
+          <section v-else-if="cat.view.value === 'artist'" class="space-y-6">
+            <template v-if="cat.currentArtist.value">
+              <div
+                class="flex flex-col sm:flex-row gap-5 items-start border border-black/10 p-5 bg-soft"
               >
                 <div
-                  v-for="album in artist.albums"
-                  :key="album.key"
-                  class="p-4"
+                  class="w-28 h-28 sm:w-36 sm:h-36 bg-canvas border border-black/10 overflow-hidden shrink-0"
                 >
-                  <h4
-                    class="text-[12px] font-medium text-mute mb-3 m-0 tracking-wide"
-                  >
-                    {{ album.label }}
-                    <span class="text-ash font-normal">
-                      · {{ album.tracks.length }}
-                    </span>
-                  </h4>
+                  <img
+                    v-if="cat.currentArtist.value.cover_url"
+                    :src="cat.currentArtist.value.cover_url"
+                    alt=""
+                    class="w-full h-full object-cover"
+                  />
                   <div
-                    class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4"
+                    v-else
+                    class="w-full h-full flex items-center justify-center text-3xl text-ash font-bold"
                   >
-                    <TrackCard
-                      v-for="item in album.tracks"
-                      :key="item.trackId"
-                      tab="library"
-                      :item="item"
-                      @delete="ex.deleteTrack"
-                    />
+                    {{ cat.currentArtist.value.name.slice(0, 1) }}
                   </div>
+                </div>
+                <div class="min-w-0">
+                  <p class="text-[11px] text-ash uppercase tracking-wide m-0">
+                    Artista
+                  </p>
+                  <h2 class="text-2xl font-bold text-ink m-0 mt-1">
+                    {{ cat.currentArtist.value.name }}
+                  </h2>
+                  <p class="text-[12px] text-mute mt-2 m-0">
+                    {{ cat.currentArtist.value.albums.length }} álbumes ·
+                    {{ cat.currentArtist.value.tracks.length }} temas ·
+                    {{ cat.currentArtist.value.play_count }} plays
+                  </p>
                 </div>
               </div>
 
+              <div v-if="cat.currentArtist.value.albums.length">
+                <h3 class="text-sm font-bold text-ink mb-3">Álbumes</h3>
+                <div
+                  class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3"
+                >
+                  <CoverCard
+                    v-for="a in cat.currentArtist.value.albums"
+                    :key="a.key"
+                    :title="a.name"
+                    :subtitle="`${a.track_count} temas`"
+                    :cover-url="a.cover_url"
+                    @click="cat.openAlbum(a.artist_key, a.key)"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <h3 class="text-sm font-bold text-ink mb-3">Canciones</h3>
+                <div class="border border-black/10">
+                  <TrackRow
+                    v-for="(t, i) in cat.currentArtist.value.tracks"
+                    :key="t.id"
+                    :track="t"
+                    :index="i + 1"
+                    show-album
+                    @artist="cat.openArtist"
+                    @album="cat.openAlbum"
+                    @delete="cat.deleteTrack"
+                  />
+                </div>
+              </div>
+            </template>
+            <EmptyState v-else message="artista no encontrado" hint="" />
+          </section>
+
+          <!-- ALBUM DETAIL -->
+          <section v-else-if="cat.view.value === 'album'" class="space-y-6">
+            <template v-if="cat.currentAlbum.value">
               <div
-                v-else
-                class="p-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4"
+                class="flex flex-col sm:flex-row gap-5 items-start border border-black/10 p-5 bg-soft"
               >
-                <TrackCard
-                  v-for="item in artist.albums.flatMap((a) => a.tracks)"
-                  :key="item.trackId"
-                  tab="library"
-                  :item="item"
-                  @delete="ex.deleteTrack"
+                <div
+                  class="w-28 h-28 sm:w-40 sm:h-40 bg-canvas border border-black/10 overflow-hidden shrink-0"
+                >
+                  <img
+                    v-if="cat.currentAlbum.value.cover_url"
+                    :src="cat.currentAlbum.value.cover_url"
+                    alt=""
+                    class="w-full h-full object-cover"
+                  />
+                </div>
+                <div class="min-w-0">
+                  <p class="text-[11px] text-ash uppercase tracking-wide m-0">
+                    Álbum
+                  </p>
+                  <h2 class="text-2xl font-bold text-ink m-0 mt-1">
+                    {{ cat.currentAlbum.value.name }}
+                  </h2>
+                  <button
+                    type="button"
+                    class="text-[13px] text-mute hover:text-ink hover:underline mt-2"
+                    @click="
+                      cat.openArtist(cat.currentAlbum.value!.artist_key)
+                    "
+                  >
+                    {{ cat.currentAlbum.value.artist }}
+                  </button>
+                  <p class="text-[12px] text-ash mt-1 m-0">
+                    {{ cat.currentAlbum.value.tracks.length }} temas
+                  </p>
+                </div>
+              </div>
+              <div class="border border-black/10">
+                <TrackRow
+                  v-for="(t, i) in cat.currentAlbum.value.tracks"
+                  :key="t.id"
+                  :track="t"
+                  :index="i + 1"
+                  @artist="cat.openArtist"
+                  @album="cat.openAlbum"
+                  @delete="cat.deleteTrack"
                 />
               </div>
-            </section>
-          </div>
+            </template>
+            <EmptyState v-else message="álbum no encontrado" hint="" />
+          </section>
 
-          <div
-            v-else-if="ex.viewMode.value === 'grid'"
-            class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4"
-          >
-            <TrackCard
-              v-for="(item, idx) in visibleGridItems"
-              :key="idx"
-              :tab="ex.activeTab.value"
-              :item="item"
-              @delete="ex.deleteTrack"
+          <!-- LIKES -->
+          <section v-else-if="cat.view.value === 'likes'" class="space-y-5">
+            <h2 class="text-xl font-bold text-ink m-0">Me gusta</h2>
+            <div v-if="likedTracks.length" class="border border-black/10">
+              <TrackRow
+                v-for="(t, i) in likedTracks"
+                :key="t.id"
+                :track="t"
+                :index="i + 1"
+                show-album
+                @artist="cat.openArtist"
+                @album="cat.openAlbum"
+                @delete="cat.deleteTrack"
+              />
+            </div>
+            <EmptyState
+              v-else
+              message="sin likes"
+              hint="en discord: !like"
             />
-            <div
-              v-if="remainingGrid > 0"
-              class="col-span-full flex flex-wrap gap-2"
-            >
+          </section>
+
+          <!-- FM -->
+          <section v-else-if="cat.view.value === 'fm'">
+            <h2 class="text-xl font-bold text-ink m-0 mb-4">Radio FM</h2>
+            <FmSessionPanel
+              :sessions="cat.filteredFm.value"
+              :selected-id="cat.selectedFmSessionId.value"
+              empty-message="sin sesiones FM"
+              :station-transitions="transitionsForStation"
+              @select="cat.selectedFmSessionId.value = $event"
+            />
+          </section>
+
+          <!-- ADMIN -->
+          <section v-else-if="cat.view.value === 'admin'" class="space-y-6">
+            <h2 class="text-xl font-bold text-ink m-0">Admin</h2>
+            <p class="text-[12px] text-mute m-0">
+              Herramientas de disco y metadata. La experiencia musical está en
+              Inicio / Biblioteca.
+            </p>
+            <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
+              <div :class="UI.statTile">
+                <div class="text-lg font-bold text-ink">
+                  {{ cat.summary.value?.tracks ?? '—' }}
+                </div>
+                <div class="text-[11px] text-mute">temas</div>
+              </div>
+              <div :class="UI.statTile">
+                <div class="text-lg font-bold text-ink">
+                  {{ cat.summary.value?.on_disk ?? '—' }}
+                </div>
+                <div class="text-[11px] text-mute">en disco</div>
+              </div>
+              <div :class="UI.statTile">
+                <div class="text-lg font-bold text-ink">
+                  {{ formatBytes(cat.diskUsage.value.total_bytes) }}
+                </div>
+                <div class="text-[11px] text-mute">uso</div>
+              </div>
+              <div :class="UI.statTile">
+                <div class="text-lg font-bold text-ink">
+                  {{ cat.summary.value?.fm ?? '—' }}
+                </div>
+                <div class="text-[11px] text-mute">capturas fm</div>
+              </div>
+            </div>
+            <p class="text-[11px] text-ash">
+              cache: {{ cat.cacheDir.value || '—' }}
+            </p>
+            <div class="flex flex-wrap gap-2">
               <button
                 type="button"
-                class="flex-1 min-w-[140px] py-3 text-sm font-medium text-ink border border-black/10 hover:bg-soft"
-                @click="
-                  ex.showMore(
-                    ex.activeTab.value as 'searches' | 'library' | 'likes',
-                  )
-                "
+                :class="UI.btnSecondary"
+                :disabled="cat.busyEnrich.value"
+                @click="cat.doEnrich()"
               >
-                mostrar más ({{ remainingGrid }} restantes)
+                {{
+                  cat.busyEnrich.value
+                    ? 'enriqueciendo…'
+                    : cat.enrichSuggest.value
+                      ? `enriquecer · ${cat.enrichSuggest.value}`
+                      : 'enriquecer'
+                }}
               </button>
               <button
-                v-if="remainingGrid < GRID_INITIAL_LIMIT * 2"
+                v-if="(cat.dedupePreview.value?.wasted_bytes || 0) > 0"
                 type="button"
-                class="py-3 px-4 text-sm font-medium text-mute border border-black/10 hover:bg-soft hover:text-ink"
-                @click="showAllGrid"
+                :class="UI.btnDanger"
+                :disabled="cat.busyDedupe.value"
+                @click="cat.doDedupe()"
               >
-                mostrar todo
+                {{
+                  cat.busyDedupe.value
+                    ? 'limpiando…'
+                    : `dedupe · ${formatBytes(cat.dedupePreview.value!.wasted_bytes)}`
+                }}
+              </button>
+              <button
+                type="button"
+                :class="UI.btnGhost"
+                @click="cat.reload()"
+              >
+                recargar catálogo
               </button>
             </div>
-          </div>
-
-          <DataTable
-            v-else
-            :tab="ex.activeTab.value"
-            :items="currentItems"
-            :library-grouped="ex.libraryGrouped.value"
-            :table-sort="ex.tableSort.value"
-            :total-bytes="ex.diskUsage.value.total_bytes"
-            @sort="ex.toggleTableSort"
-            @delete="ex.deleteTrack"
-          />
-        </section>
+          </section>
+        </template>
       </main>
-
-      <AppFooter hint="/ filtro · 1–4 pestañas" />
     </div>
-
-    <ConfirmModal
-      v-if="ex.confirmDialog.value"
-      :open="!!ex.confirmDialog.value"
-      :title="ex.confirmDialog.value.title"
-      :body="ex.confirmDialog.value.body"
-      :confirm-label="ex.confirmDialog.value.confirmLabel"
-      :cancel-label="ex.confirmDialog.value.cancelLabel"
-      :danger="ex.confirmDialog.value.danger"
-      :busy="ex.confirmDialog.value.busy"
-      @confirm="ex.resolveConfirm(true)"
-      @cancel="ex.resolveConfirm(false)"
-    />
   </div>
 </template>

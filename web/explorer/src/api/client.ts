@@ -1,4 +1,19 @@
-import type { DedupePreview, DiskUsage } from '../types'
+import type {
+  CatalogAlbum,
+  CatalogArtist,
+  CatalogSummary,
+  CatalogTrack,
+  DedupePreview,
+  DiskUsage,
+} from '../types'
+
+export interface CatalogPayload {
+  generated_at?: number
+  summary?: CatalogSummary
+  tracks?: CatalogTrack[]
+  artists?: CatalogArtist[]
+  albums?: CatalogAlbum[]
+}
 
 const CACHE_DIRS = ['.cache', 'spotify_cache'] as const
 
@@ -80,4 +95,15 @@ export async function runEnrich(): Promise<Record<string, unknown>> {
   const data = (await res.json()) as Record<string, unknown>
   if (!res.ok) throw new Error(String(data.error || 'error al enriquecer'))
   return data
+}
+
+/** Aggregated catalog (library + FM + likes). Preferred over raw JSON merge. */
+export async function loadCatalog(): Promise<CatalogPayload | null> {
+  try {
+    const res = await fetch('/api/catalog/full')
+    if (res.ok) return (await res.json()) as CatalogPayload
+  } catch {
+    /* API down */
+  }
+  return null
 }

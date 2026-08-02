@@ -53,6 +53,42 @@ _INDEX_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 _COVERS_DIR = get_covers_dir()  # delegated to metadata for single source of truth
 
+
+def _add_source(entry: dict, source: str) -> None:
+    """Append a provenance tag to entry['sources'] (unique, ordered)."""
+    if not source:
+        return
+    sources = entry.get("sources")
+    if not isinstance(sources, list):
+        sources = []
+    if source not in sources:
+        sources.append(source)
+    entry["sources"] = sources
+    # Primary origin for simple UIs
+    if source == "request" or not entry.get("origin"):
+        entry["origin"] = source
+
+
+def _normalize_track_identity(track: dict, entry: dict | None = None) -> tuple[str, str]:
+    """Parse Artist - Title when artist is unknown; returns (artist, title)."""
+    from src.catalog import parse_artist_title
+
+    base_artist = (track.get("artist") if track else None) or (entry or {}).get("artist")
+    base_title = (track.get("title") if track else None) or (entry or {}).get("title")
+    return parse_artist_title(base_artist, base_title)
+
+
+def _apply_identity_to_entry(entry: dict, track: dict | None = None) -> None:
+    artist, title = _normalize_track_identity(track or {}, entry)
+    # Only fill Unknown / empty artist
+    cur = (entry.get("artist") or "").strip()
+    if not cur or cur.lower() in {"unknown", "—", "?", "desconocido"}:
+        entry["artist"] = artist
+    if title and (not entry.get("title") or entry.get("title") == "?"):
+        entry["title"] = title
+    entry["display_artist"] = entry.get("artist") or artist
+    entry["display_title"] = entry.get("title") or title
+
 _index: dict[str, dict] = {}
 _index_mtime: float | None = None
 _download_sem = asyncio.Semaphore(1)
@@ -949,6 +985,7 @@ def record_play(track: dict) -> None:
         "lyrics_state": track.get("lyrics_state", ""),
         "play_count": 0,
         "request_count": 0,
+        "sources": [],
     })
     entry["play_count"] = entry.get("play_count", 0) + 1
     entry["last_played"] = time.time()
@@ -964,7 +1001,20 @@ def record_play(track: dict) -> None:
         entry["album"] = track["album"]
     if track.get("cover_url") and not entry.get("cover_url"):
         entry["cover_url"] = track["cover_url"]
+    _apply_identity_to_entry(entry, track)
+    # Provenance: radio/seed fills vs generic play
+    if track.get("from_fm_seed") or track.get("is_radio_stream") or (
+        str(track.get("requester") or "").startswith("📻")
+    ):
+        _add_source(entry, "radio")
+    else:
+        _add_source(entry, "play")
     _save_index()
+    try:
+        from src.catalog import invalidate_catalog_cache
+        invalidate_catalog_cache()
+    except Exception:
+        pass
 
     if LIBRARY_ENABLED:
         # First-time play (no enriched_at) always triggers enrichment for artwork + rich metadata
@@ -999,10 +1049,26 @@ def record_request(track: dict) -> None:
         "lyrics_state": track.get("lyrics_state", ""),
         "play_count": 0,
         "request_count": 0,
+        "sources": [],
     })
     entry["request_count"] = entry.get("request_count", 0) + 1
     entry["last_requested"] = time.time()
+    if track.get("title"):
+        entry["title"] = track["title"]
+    if track.get("artist"):
+        entry["artist"] = track["artist"]
+    if track.get("album") and not entry.get("album"):
+        entry["album"] = track["album"]
+    if track.get("cover_url") and not entry.get("cover_url"):
+        entry["cover_url"] = track["cover_url"]
+    _apply_identity_to_entry(entry, track)
+    _add_source(entry, "request")
     _save_index()
+    try:
+        from src.catalog import invalidate_catalog_cache
+        invalidate_catalog_cache()
+    except Exception:
+        pass
 
 
 def _extract_video_id(url_or_id: str | None) -> str | None:
@@ -1105,6 +1171,9 @@ def _upsert_entry_from_track(
         "play_count": entry.get("play_count", 0),
         "request_count": entry.get("request_count", 0),
     }
+    _apply_identity_to_entry(entry, track)
+    if track.get("from_fm_seed") or str(track.get("requester") or "").startswith("📻"):
+        _add_source(entry, "radio")
     file_size = _file_size_bytes(file_path)
     if file_size is not None:
         update["file_size_bytes"] = file_size
