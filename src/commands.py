@@ -614,11 +614,9 @@ def _first_radio_track_index(tracks: list[dict]) -> int:
     """Return the index of the first radio track, or 1 (right after now-playing)
     when no radio tracks exist, so user !play requests don't get buried at the
     end of a long playlist queue."""
-    idx = next(
-        (i for i, track in enumerate(tracks) if track.get("requester") == RADIO_REQUESTER_LABEL),
-        -1,
-    )
-    return idx if idx >= 0 else 1
+    from src.playback import first_radio_track_index
+
+    return first_radio_track_index(tracks)
 
 
 def _enqueue_user_tracks_before_radio(
@@ -626,18 +624,16 @@ def _enqueue_user_tracks_before_radio(
     tracks: list[dict],
     *,
     playback_active: bool,
+    position: str = "end",
 ) -> None:
-    from src import radio as _radio
+    from src.playback import enqueue_user_tracks
 
-    if _radio.is_radio_active(guild_id) and playback_active:
-        items = list(queues[guild_id])
-        insert_at = _first_radio_track_index(items)
-        for offset, track in enumerate(tracks):
-            items.insert(insert_at + offset, track)
-        queues[guild_id] = collections.deque(items)
-        return
-    for track in tracks:
-        queues[guild_id].append(track)
+    enqueue_user_tracks(
+        guild_id,
+        tracks,
+        playback_active=playback_active,
+        position=position,
+    )
 
 
 async def _resolve_non_youtube_play_queries(query: str) -> tuple[list[dict] | None, str | None]:
@@ -821,11 +817,30 @@ async def _seed_radio_from_library_entry(
 async def only_allowed_channel(ctx: commands.Context) -> bool:
     return ctx.channel.id == BOT_TEXT_CHANNEL_ID
 
+
+@bot.event
+async def on_message(message: discord.Message):
+    """Prefix commands + free-text request agent on the request channel."""
+    if message.author.bot:
+        return
+    content = (message.content or "").strip()
+    if content.startswith("!"):
+        await bot.process_commands(message)
+        return
+    from src.request_channel import handle_request_message
+
+    handled = await handle_request_message(message)
+    if not handled:
+        await bot.process_commands(message)
+
+
 @bot.event
 async def on_ready():
     from src.playback import PlayerView
     from src.cookie_health import start_cookie_watchdog
     from src.disk_reaper import start_disk_reaper
+    from src.config import effective_request_channel_id, REQUEST_AGENT_ENABLED
+
     bot.add_view(PlayerView(0))
     start_cookie_watchdog()
     start_disk_reaper()
@@ -835,9 +850,19 @@ async def on_ready():
     if not _startup_announced:
         try:
             channel = await bot.fetch_channel(BOT_TEXT_CHANNEL_ID)
+            desc = "Usa `!play <canción>` para reproducir."
+            if REQUEST_AGENT_ENABLED:
+                req_id = effective_request_channel_id()
+                if req_id == BOT_TEXT_CHANNEL_ID:
+                    desc += (
+                        "\n\nTambién podés **escribir el nombre de una canción** "
+                        "(sin `!`): el agente arma un plan con botones Aplicar/Cancelar."
+                    )
+                else:
+                    desc += f"\n\nPedidos en lenguaje natural: <#{req_id}>"
             embed = discord.Embed(
                 title="🎵 Bot de música listo",
-                description="Usa `!play <canción>` para reproducir.",
+                description=desc,
                 color=0x1DB954
             )
             await channel.send(embed=embed)

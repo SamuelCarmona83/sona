@@ -451,6 +451,50 @@ FM_SEED_COLD_FILL_COUNT = max(0, min(8, int(get_config_value("FM_SEED_COLD_FILL_
 FM_SEED_CONTINGENCY_FILL_COUNT = max(0, min(8, int(get_config_value("FM_SEED_CONTINGENCY_FILL_COUNT", dotenv_values, "2"))))
 FM_SEED_CONTINGENCY_COOLDOWN_SEC = max(15.0, _env_float("FM_SEED_CONTINGENCY_COOLDOWN_SEC", 60.0))
 
+# ---------------------------------------------------------------------------
+# Request-channel agent (NL plans in Discord)
+# ---------------------------------------------------------------------------
+def _env_int(key: str, default: int) -> int:
+    raw = get_config_value(key, dotenv_values, str(default)).strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+# Empty / 0 → same as BOT_TEXT_CHANNEL_ID (unified channel for MVP testing)
+_REQUEST_CHANNEL_RAW = get_config_value("REQUEST_CHANNEL_ID", dotenv_values, "").strip()
+try:
+    REQUEST_CHANNEL_ID = int(_REQUEST_CHANNEL_RAW) if _REQUEST_CHANNEL_RAW else 0
+except ValueError:
+    REQUEST_CHANNEL_ID = 0
+
+REQUEST_AGENT_ENABLED = _env_bool("REQUEST_AGENT_ENABLED", "true")
+REQUEST_AUTO_APPLY = _env_bool("REQUEST_AUTO_APPLY", "false")
+REQUEST_CONFIRM_TIMEOUT_SEC = max(5, _env_int("REQUEST_CONFIRM_TIMEOUT_SEC", 30))
+REQUEST_COOLDOWN_SEC = max(0.0, _env_float("REQUEST_COOLDOWN_SEC", 5.0))
+REQUEST_MAX_TRACKS_PER_PLAN = max(1, min(10, _env_int("REQUEST_MAX_TRACKS_PER_PLAN", 10)))
+REQUEST_MAX_QUEUE_USER_TRACKS = max(1, _env_int("REQUEST_MAX_QUEUE_USER_TRACKS", 15))
+REQUEST_MAX_QUERY_LEN = max(40, _env_int("REQUEST_MAX_QUERY_LEN", 200))
+REQUEST_AGENT_TIMEOUT_SEC = max(5.0, _env_float("REQUEST_AGENT_TIMEOUT_SEC", 20.0))
+_REQUEST_MODELS_RAW = get_config_value(
+    "REQUEST_AGENT_MODELS",
+    dotenv_values,
+    "xai/grok-4.5,anthropic/claude-sonnet-4-20250514",
+)
+REQUEST_AGENT_MODELS = [
+    m.strip() for m in _REQUEST_MODELS_RAW.split(",") if m.strip()
+]
+XAI_API_KEY = get_config_value("XAI_API_KEY", dotenv_values, "").strip()
+
+
+def effective_request_channel_id() -> int:
+    """Request channel; defaults to control channel when unset."""
+    return REQUEST_CHANNEL_ID or BOT_TEXT_CHANNEL_ID
+
+
 LIBRARY_ENABLED = _env_bool("LIBRARY_ENABLED")
 LIBRARY_PATH = get_config_value("LIBRARY_PATH", dotenv_values, ".cache/library")
 # Tight defaults for small VMs (e2-micro). Override in .env if you have more disk.

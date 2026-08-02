@@ -20,6 +20,7 @@ A Discord music bot that plays tracks from Spotify URLs, YouTube links, and plai
 ## Features
 
 - **Multi-source playback** — Spotify tracks, albums, and playlists; YouTube and YouTube Music URLs; free-text search.
+- **Request agent** — Free-text NL plans in the request channel (default: same as control), cancel-window apply, Auto mode, LiteLLM cascade, bounded queue (≤10 per plan).
 - **Resilient YouTube access** — Deno + EJS challenge solving, cookie hot-reload, cookieless client fallback, and rate-limit detection with user notification.
 - **Smart matching** — Heuristic scoring with optional Claude tie-breaking when top candidates are close; search result caching to reduce API spend.
 - **Local library** — Auto-caches played audio to disk; stable track IDs (`spotify_id` → `yt_{video_id}` → SHA-256 fallback); offline radio when YouTube is blocked.
@@ -157,6 +158,25 @@ LLM calls are limited by design:
 
 Commands are prefixed with `!` and must be sent in the configured text channel.
 
+### Song request agent (free text)
+
+In the **request channel** (by default the **same** as the control text channel), any message that does **not** start with `!` is treated as a natural-language music request while you are in a voice channel.
+
+| Behavior | Detail |
+|----------|--------|
+| Plan embed | Shows actions + up to **10** proposed tracks with **Aplicar**, **Cancelar**, and **Auto** |
+| Timeout | **Applies** the plan (does not cancel). Only **Cancelar** aborts |
+| Auto off (default) | Cancel window of `REQUEST_CONFIRM_TIMEOUT_SEC` (default 30s) |
+| Auto on | Applies immediately after the embed posts |
+| Auto toggle | Admin button on the embed, or NL (`activa el modo auto` / `desactiva el auto`) |
+| Radio | Stays on; user tracks are inserted **before** radio fill |
+| Caps | ≤10 tracks per plan; ≤`REQUEST_MAX_QUEUE_USER_TRACKS` user tracks in queue |
+| LLM | [LiteLLM](https://github.com/BerriAI/litellm) model cascade (`REQUEST_AGENT_MODELS`); falls back to heuristics without keys |
+
+Examples: `blinding lights`, `dame 5 de synthwave`, `mueve la 3 a 1`, `salta y pon bohemian rhapsody`.
+
+Optional env: set `REQUEST_CHANNEL_ID` to a dedicated channel when you want free-text away from admin traffic. Disable with `REQUEST_AGENT_ENABLED=false`.
+
 ### Playback
 
 | Command | Description |
@@ -285,6 +305,8 @@ src/
 ├── likes.py          # Per-user likes and radio priority
 ├── spotify_taste.py  # Taste profile builder
 ├── dj_announcer.py   # Edge-TTS announcements
+├── request_agent.py  # NL plan (LiteLLM + heuristic) for song requests
+├── request_channel.py# Request-channel embed, cancel window, plan executor
 ├── cookie_health.py  # Cookie watchdog and admin alerts
 └── config.py         # Environment, yt-dlp, FFmpeg options
 

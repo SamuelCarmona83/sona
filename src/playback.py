@@ -151,6 +151,153 @@ def _is_user_requested_track(track: dict) -> bool:
     return not _is_automated_radio_requester(track.get("requester", ""))
 
 
+def is_user_requested_track(track: dict) -> bool:
+    """Public: track was requested by a human (not radio auto-fill)."""
+    return _is_user_requested_track(track)
+
+
+def count_user_tracks_in_queue(guild_id: int) -> int:
+    q = queues.get(guild_id, collections.deque())
+    return sum(1 for t in q if _is_user_requested_track(t))
+
+
+def count_radio_tracks_in_queue(guild_id: int) -> int:
+    q = queues.get(guild_id, collections.deque())
+    return sum(1 for t in q if _is_automated_radio_requester(t.get("requester", "")))
+
+
+def build_queue_snapshot(guild_id: int, *, max_lines: int = 15) -> dict:
+    """Compact session state for the request agent prompt."""
+    from src import radio as _radio
+
+    session = guild_session(guild_id)
+    track = session.now_playing
+    q = list(session.queue)
+    user_count = sum(1 for t in q if _is_user_requested_track(t))
+    radio_count = len(q) - user_count
+    np = None
+    if track:
+        np = {
+            "title": track.get("title", "?"),
+            "requester": track.get("requester", "?"),
+            "is_radio": _is_automated_radio_requester(track.get("requester", "")),
+        }
+    lines = []
+    for i, t in enumerate(q[:max_lines], 1):
+        req = t.get("requester", "?")
+        mark = " [radio]" if _is_automated_radio_requester(req) else ""
+        lines.append(f"{i}. {t.get('title', '?')} — {req}{mark}")
+    if len(q) > max_lines:
+        lines.append(f"... +{len(q) - max_lines} more")
+    return {
+        "radio_active": _radio.is_radio_active(guild_id),
+        "now_playing": np,
+        "queue_lines": lines,
+        "queue_len": len(q),
+        "queue_user_count": user_count,
+        "queue_radio_count": radio_count,
+        "paused": session.paused,
+    }
+
+
+def first_radio_track_index(tracks: list[dict]) -> int:
+    """Index of first radio track, or 1 so user inserts stay near the front."""
+    idx = next(
+        (i for i, t in enumerate(tracks) if _is_automated_radio_requester(t.get("requester", ""))),
+        -1,
+    )
+    return idx if idx >= 0 else 1
+
+
+def enqueue_user_tracks(
+    guild_id: int,
+    tracks: list[dict],
+    *,
+    playback_active: bool,
+    position: str = "end",
+) -> None:
+    """Insert user tracks; when radio is on and playing, keep them before radio fill."""
+    from src import radio as _radio
+
+    if not tracks:
+        return
+    session = guild_session(guild_id)
+    items = list(session.queue)
+    position = (position or "end").lower()
+    if position == "front":
+        if _radio.is_radio_active(guild_id) and playback_active:
+            insert_at = 0
+            for offset, track in enumerate(tracks):
+                items.insert(insert_at + offset, track)
+            session.queue = collections.deque(items)
+        else:
+            for track in reversed(tracks):
+                items.insert(0, track)
+            session.queue = collections.deque(items)
+        return
+    if _radio.is_radio_active(guild_id) and playback_active:
+        insert_at = first_radio_track_index(items)
+        for offset, track in enumerate(tracks):
+            items.insert(insert_at + offset, track)
+        session.queue = collections.deque(items)
+        return
+    for track in tracks:
+        items.append(track)
+    session.queue = collections.deque(items)
+
+
+def move_queue_track(guild_id: int, from_pos: int, to_pos: int) -> dict | None:
+    """1-based positions. Returns moved track or None if invalid."""
+    session = guild_session(guild_id)
+    items = list(session.queue)
+    if from_pos < 1 or from_pos > len(items) or to_pos < 1 or to_pos > len(items):
+        return None
+    track = items.pop(from_pos - 1)
+    items.insert(to_pos - 1, track)
+    session.queue = collections.deque(items)
+    return track
+
+
+def remove_queue_track_at(guild_id: int, pos: int) -> dict | None:
+    session = guild_session(guild_id)
+    items = list(session.queue)
+    if pos < 1 or pos > len(items):
+        return None
+    track = items.pop(pos - 1)
+    session.queue = collections.deque(items)
+    return track
+
+
+def remove_queue_track_match(guild_id: int, query: str) -> dict | None:
+    """Remove first queue item whose title matches query (case-insensitive substring)."""
+    needle = (query or "").strip().lower()
+    if not needle:
+        return None
+    session = guild_session(guild_id)
+    items = list(session.queue)
+    for i, track in enumerate(items):
+        title = (track.get("title") or "").lower()
+        if needle in title:
+            removed = items.pop(i)
+            session.queue = collections.deque(items)
+            return removed
+    return None
+
+
+def priority_queue_track(guild_id: int, pos: int) -> dict | None:
+    return move_queue_track(guild_id, pos, 1)
+
+
+def clear_user_tracks_from_queue(guild_id: int) -> int:
+    """Remove human-requested tracks; keep radio fill. Returns count removed."""
+    session = guild_session(guild_id)
+    items = list(session.queue)
+    kept = [t for t in items if not _is_user_requested_track(t)]
+    removed = len(items) - len(kept)
+    session.queue = collections.deque(kept)
+    return removed
+
+
 def _resolve_display_artist(title: str, artist: str) -> str:
     if artist != "Unknown":
         return artist
