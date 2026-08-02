@@ -33,21 +33,22 @@ ALLOWED_ACTION_TYPES = frozenset({
     "set_auto",
 })
 
+# Double braces {{ }} are literal JSON for str.format; {max_tracks} is the only placeholder.
 _SYSTEM_PROMPT = """Eres el planificador de cola de un bot de música en Discord (español).
 Respondes SOLO con un JSON válido (sin markdown) con esta forma:
-{"reply":"texto corto al usuario","actions":[...]}
+{{"reply":"texto corto al usuario","actions":[...]}}
 
 Acciones permitidas:
-- {"type":"enqueue","queries":["artista - título",...],"position":"end"|"front"}
-- {"type":"genre_playlist","genre":"synthwave","count":5,"hints":"opcional"}
-- {"type":"move","from_pos":3,"to_pos":1}  (1-based, cola mostrada)
-- {"type":"remove","pos":2}
-- {"type":"remove_match","query":"despacito"}
-- {"type":"priority","pos":4}
-- {"type":"skip"}
-- {"type":"clear_user_tracks"}  (solo pedidos humanos; NO borra radio)
-- {"type":"show_queue"}
-- {"type":"set_auto","enabled":true|false}
+- {{"type":"enqueue","queries":["artista - título",...],"position":"end"|"front"}}
+- {{"type":"genre_playlist","genre":"synthwave","count":5,"hints":"opcional"}}
+- {{"type":"move","from_pos":3,"to_pos":1}}  (1-based, cola mostrada)
+- {{"type":"remove","pos":2}}
+- {{"type":"remove_match","query":"despacito"}}
+- {{"type":"priority","pos":4}}
+- {{"type":"skip"}}
+- {{"type":"clear_user_tracks"}}  (solo pedidos humanos; NO borra radio)
+- {{"type":"show_queue"}}
+- {{"type":"set_auto","enabled":true|false}}
 
 Reglas:
 - Máximo {max_tracks} canciones nuevas en total (suma de queries + genre count).
