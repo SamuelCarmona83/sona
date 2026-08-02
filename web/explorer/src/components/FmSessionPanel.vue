@@ -1,10 +1,12 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import type { FmSession, TransitionEdge } from '../types'
+import type { FmSession, FmTrack, TransitionEdge } from '../types'
 import { UI } from '../ui'
 import {
+  formatClock,
   formatDateTime,
   formatDurationSec,
+  formatGapSince,
 } from '../utils/format'
 import { buildTransitions } from '../utils/transform'
 import EmptyState from './chrome/EmptyState.vue'
@@ -46,15 +48,63 @@ const stationEdges = computed(() =>
   stationEdgesAll.value.slice(0, TRANSITION_CAP),
 )
 
-const visibleTracks = computed(() => {
-  const tracks = selected.value?.tracks || []
-  return tracks.slice(0, timelineLimit.value)
+/** Station panel only when it adds history beyond this single session. */
+const showStationTransitions = computed(() => {
+  if (!selected.value?.stationuuid) return false
+  const forStation = props.sessions.filter(
+    (s) => s.stationuuid === selected.value!.stationuuid,
+  )
+  if (forStation.length <= 1) return false
+  const sessKeys = new Set(
+    sessionEdgesAll.value.map((e) => `${e.from}→${e.to}:${e.count}`),
+  )
+  const stationKeys = stationEdgesAll.value.map(
+    (e) => `${e.from}→${e.to}:${e.count}`,
+  )
+  if (
+    stationKeys.length === sessKeys.size &&
+    stationKeys.every((k) => sessKeys.has(k))
+  ) {
+    return false
+  }
+  return stationEdgesAll.value.length > 0
 })
 
-const remainingTracks = computed(() => {
-  const total = selected.value?.tracks?.length || 0
-  return Math.max(0, total - timelineLimit.value)
+interface TimelineRow {
+  track: FmTrack
+  seq: number
+  gapSec: number | null
+  isStart: boolean
+}
+
+const timelineRows = computed((): TimelineRow[] => {
+  const tracks = selected.value?.tracks || []
+  return tracks.map((t, i) => {
+    const prev = i > 0 ? tracks[i - 1] : null
+    const gapSec =
+      prev && t.detected_at && prev.detected_at
+        ? Math.max(0, Number(t.detected_at) - Number(prev.detected_at))
+        : null
+    const seq =
+      t.seq != null && Number.isFinite(Number(t.seq))
+        ? Number(t.seq) + 1
+        : i + 1
+    return {
+      track: t,
+      seq,
+      gapSec,
+      isStart: i === 0,
+    }
+  })
 })
+
+const visibleRows = computed(() =>
+  timelineRows.value.slice(0, timelineLimit.value),
+)
+
+const remainingTracks = computed(() =>
+  Math.max(0, timelineRows.value.length - timelineLimit.value),
+)
 
 const countLabel = computed(() => {
   if (!props.sessions.length) return ''
@@ -163,44 +213,101 @@ function onListKeydown(e: KeyboardEvent, index: number) {
           </p>
         </div>
 
+        <!-- Timeline -->
         <div class="mb-6">
-          <h3 class="text-sm font-bold text-ink mb-2">timeline</h3>
-          <div v-if="visibleTracks.length">
+          <div class="flex items-baseline justify-between gap-2 mb-3">
+            <h3 class="text-sm font-bold text-ink m-0">timeline</h3>
+            <span class="text-[11px] text-ash">
+              orden de detección · gap = tiempo desde el tema anterior
+            </span>
+          </div>
+
+          <div v-if="visibleRows.length" class="relative">
+            <!-- vertical rail -->
             <div
-              v-for="(t, i) in visibleTracks"
-              :key="i"
-              class="flex gap-3 py-2 border-t border-black/10 first:border-t-0"
-            >
-              <img
-                v-if="t.cover_url"
-                :src="t.cover_url"
-                alt=""
-                class="w-9 h-9 object-cover bg-soft shrink-0"
-                loading="lazy"
-              />
-              <div v-else class="w-9 h-9 bg-soft shrink-0" aria-hidden="true" />
-              <div class="min-w-0 flex-1">
-                <div class="text-sm text-ink truncate">
-                  {{ t.artist || '?' }} — {{ t.title || '?' }}
+              class="absolute left-[15px] top-3 bottom-3 w-px bg-black/15"
+              aria-hidden="true"
+            />
+
+            <ol class="m-0 p-0 list-none space-y-0">
+              <li
+                v-for="row in visibleRows"
+                :key="`${row.seq}-${row.track.detected_at}-${row.track.match_key}`"
+                class="relative flex gap-3 py-2.5"
+              >
+                <!-- node + seq -->
+                <div
+                  class="relative z-10 w-8 shrink-0 flex flex-col items-center pt-1"
+                >
+                  <span
+                    class="flex h-4 w-4 items-center justify-center rounded-full border-2 text-[9px] font-bold leading-none"
+                    :class="
+                      row.isStart
+                        ? 'border-ink bg-ink text-canvas'
+                        : 'border-ink/40 bg-canvas text-ink'
+                    "
+                    :title="`#${row.seq}`"
+                  >
+                    {{ row.seq }}
+                  </span>
                 </div>
-                <div class="text-[11px] text-mute">
-                  {{ formatDateTime(t.detected_at) }} · #{{ i + 1 }}
-                  <template v-if="t.shazam_url">
-                    ·
-                    <a
-                      :href="t.shazam_url"
-                      target="_blank"
-                      rel="noopener"
-                      :class="UI.link"
-                      >shazam</a
+
+                <img
+                  v-if="row.track.cover_url"
+                  :src="row.track.cover_url"
+                  alt=""
+                  class="w-10 h-10 object-cover bg-soft shrink-0 border border-black/10"
+                  loading="lazy"
+                />
+                <div
+                  v-else
+                  class="w-10 h-10 bg-soft shrink-0 border border-black/10"
+                  aria-hidden="true"
+                />
+
+                <div class="min-w-0 flex-1">
+                  <div class="text-sm text-ink leading-snug">
+                    <span class="font-medium">{{
+                      row.track.artist || '?'
+                    }}</span>
+                    <span class="text-ash"> — </span>
+                    <span>{{ row.track.title || '?' }}</span>
+                  </div>
+                  <div
+                    class="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-mute"
+                  >
+                    <span class="tabular-nums text-ink/80">{{
+                      formatClock(row.track.detected_at)
+                    }}</span>
+                    <span class="text-ash">·</span>
+                    <span
+                      v-if="row.isStart"
+                      class="text-[10px] uppercase tracking-wide text-ash"
                     >
-                  </template>
+                      inicio
+                    </span>
+                    <span
+                      v-else-if="row.gapSec != null"
+                      class="tabular-nums font-medium text-body"
+                      :title="`${row.gapSec}s desde la detección anterior`"
+                    >
+                      {{ formatGapSince(row.gapSec) }}
+                    </span>
+                    <template v-if="row.track.shazam_url">
+                      <span class="text-ash">·</span>
+                      <a
+                        :href="row.track.shazam_url"
+                        target="_blank"
+                        rel="noopener"
+                        :class="UI.link"
+                        >shazam</a
+                      >
+                    </template>
+                  </div>
                 </div>
-                <div class="text-[10px] text-ash">
-                  {{ t.prev_match_key ? '← prev en sesión' : 'inicio' }}
-                </div>
-              </div>
-            </div>
+              </li>
+            </ol>
+
             <button
               v-if="remainingTracks > 0"
               type="button"
@@ -215,21 +322,33 @@ function onListKeydown(e: KeyboardEvent, index: number) {
           </p>
         </div>
 
-        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <!-- Transitions -->
+        <div
+          class="grid gap-4"
+          :class="
+            showStationTransitions
+              ? 'grid-cols-1 md:grid-cols-2'
+              : 'grid-cols-1'
+          "
+        >
           <div :class="UI.section">
-            <h3 class="text-sm font-bold text-ink mb-2 m-0">
-              transiciones en sesión
+            <h3 class="text-sm font-bold text-ink mb-1 m-0">
+              secuencia A → B
             </h3>
+            <p class="text-[10px] text-ash mb-2 m-0">
+              pares consecutivos en esta sesión (no es un grafo de “prev”
+              genérico)
+            </p>
             <div v-if="sessionEdges.length">
               <div
                 v-for="(e, i) in sessionEdges"
                 :key="i"
-                class="text-[12px] text-body py-1 border-t border-black/10 first:border-t-0"
+                class="text-[12px] text-body py-1.5 border-t border-black/10 first:border-t-0 flex flex-wrap items-baseline gap-x-1"
               >
                 <span class="text-ink">{{ e.fromLabel }}</span>
-                <span class="text-ash"> → </span>
+                <span class="text-ash shrink-0">→</span>
                 <span class="text-ink">{{ e.toLabel }}</span>
-                <span class="text-mute font-medium"> ×{{ e.count }}</span>
+                <span class="text-mute font-medium ml-auto">×{{ e.count }}</span>
               </div>
               <p
                 v-if="sessionEdgesAll.length > TRANSITION_CAP"
@@ -242,20 +361,23 @@ function onListKeydown(e: KeyboardEvent, index: number) {
               hace falta al menos 2 temas seguidos
             </p>
           </div>
-          <div :class="UI.section">
-            <h3 class="text-sm font-bold text-ink mb-2 m-0">
-              transiciones en esta estación
+          <div v-if="showStationTransitions" :class="UI.section">
+            <h3 class="text-sm font-bold text-ink mb-1 m-0">
+              misma estación · todas las sesiones
             </h3>
+            <p class="text-[10px] text-ash mb-2 m-0">
+              agregado histórico de esta emisora
+            </p>
             <div v-if="stationEdges.length">
               <div
                 v-for="(e, i) in stationEdges"
                 :key="i"
-                class="text-[12px] text-body py-1 border-t border-black/10 first:border-t-0"
+                class="text-[12px] text-body py-1.5 border-t border-black/10 first:border-t-0 flex flex-wrap items-baseline gap-x-1"
               >
                 <span class="text-ink">{{ e.fromLabel }}</span>
-                <span class="text-ash"> → </span>
+                <span class="text-ash shrink-0">→</span>
                 <span class="text-ink">{{ e.toLabel }}</span>
-                <span class="text-mute font-medium"> ×{{ e.count }}</span>
+                <span class="text-mute font-medium ml-auto">×{{ e.count }}</span>
               </div>
               <p
                 v-if="stationEdgesAll.length > TRANSITION_CAP"
@@ -264,9 +386,6 @@ function onListKeydown(e: KeyboardEvent, index: number) {
                 +{{ stationEdgesAll.length - TRANSITION_CAP }} más
               </p>
             </div>
-            <p v-else class="text-[12px] text-mute m-0">
-              sin historial agregado aún
-            </p>
           </div>
         </div>
       </div>

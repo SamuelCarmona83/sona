@@ -46,6 +46,27 @@ export function formatDurationSec(sec: number | undefined | null): string {
   return `${h}h ${m % 60}m`
 }
 
+/** Clock time only (timeline rail). */
+export function formatClock(unix: number | undefined | null): string {
+  if (!unix) return '—'
+  return new Date(unix * 1000).toLocaleTimeString('es', {
+    hour: '2-digit',
+    minute: '2-digit',
+  })
+}
+
+/** Gap since previous detection, e.g. "+3m" / "+45s". */
+export function formatGapSince(sec: number | undefined | null): string {
+  const s = Math.floor(Number(sec) || 0)
+  if (s <= 0) return ''
+  if (s < 60) return `+${s}s`
+  const m = Math.floor(s / 60)
+  const r = s % 60
+  if (m < 60) return r ? `+${m}m ${r}s` : `+${m}m`
+  const h = Math.floor(m / 60)
+  return `+${h}h ${m % 60}m`
+}
+
 export function spotifyUrl(id?: string | null): string | null {
   return id ? `https://open.spotify.com/track/${id}` : null
 }

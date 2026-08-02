@@ -89,6 +89,8 @@ export interface FmTrack {
   cover_url?: string
   shazam_url?: string
   detected_at?: number
+  /** 0-based sequence index from fm_history */
+  seq?: number
   [key: string]: unknown
 }
 

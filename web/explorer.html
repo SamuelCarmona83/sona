@@ -487,6 +487,25 @@
         .sort((a, b) => b.started_at - a.started_at);
     }
 
+    function formatClock(unix) {
+      if (!unix) return "—";
+      return new Date(unix * 1000).toLocaleTimeString("es", {
+        hour: "2-digit",
+        minute: "2-digit",
+      });
+    }
+
+    function formatGapSince(sec) {
+      const s = Math.floor(Number(sec) || 0);
+      if (s <= 0) return "";
+      if (s < 60) return `+${s}s`;
+      const m = Math.floor(s / 60);
+      const r = s % 60;
+      if (m < 60) return r ? `+${m}m ${r}s` : `+${m}m`;
+      const h = Math.floor(m / 60);
+      return `+${h}h ${m % 60}m`;
+    }
+
     function formatDurationSec(sec) {
       const s = Math.floor(Number(sec) || 0);
       if (s < 60) return `${s}s`;
@@ -822,35 +841,64 @@
       const stationEdges = transitionsForStation(session.stationuuid).slice(0, 12);
 
       const timeline = tracks.length
-        ? tracks.map((t, i) => {
-            const cover = t.cover_url
-              ? `<img src="${escapeHtml(t.cover_url)}" alt="" class="w-9 h-9 object-cover bg-soft shrink-0" loading="lazy" />`
-              : `<div class="w-9 h-9 bg-soft shrink-0"></div>`;
-            const shazam = t.shazam_url ? linkHtml(t.shazam_url, "shazam") : "";
-            const prev = t.prev_match_key
-              ? `<div class="text-[10px] text-ash">← prev en sesión</div>`
-              : `<div class="text-[10px] text-ash">inicio</div>`;
-            return `
-              <div class="flex gap-3 py-2 border-t border-black/10 first:border-t-0">
-                ${cover}
-                <div class="min-w-0 flex-1">
-                  <div class="text-sm text-ink truncate">${escapeHtml(t.artist || "?")} — ${escapeHtml(t.title || "?")}</div>
-                  <div class="text-[11px] text-mute">${formatDateTime(t.detected_at)} · #${i + 1} ${shazam ? "· " + shazam : ""}</div>
-                  ${prev}
-                </div>
-              </div>`;
-          }).join("")
+        ? `<div class="relative">
+            <div class="absolute left-[15px] top-3 bottom-3 w-px bg-black/15" aria-hidden="true"></div>
+            <ol class="m-0 p-0 list-none">
+            ${tracks.map((t, i) => {
+              const cover = t.cover_url
+                ? `<img src="${escapeHtml(t.cover_url)}" alt="" class="w-10 h-10 object-cover bg-soft shrink-0 border border-black/10" loading="lazy" />`
+                : `<div class="w-10 h-10 bg-soft shrink-0 border border-black/10"></div>`;
+              const shazam = t.shazam_url ? linkHtml(t.shazam_url, "shazam") : "";
+              const seq = t.seq != null && Number.isFinite(Number(t.seq)) ? Number(t.seq) + 1 : i + 1;
+              const prev = i > 0 ? tracks[i - 1] : null;
+              const gapSec = prev && t.detected_at && prev.detected_at
+                ? Math.max(0, Number(t.detected_at) - Number(prev.detected_at))
+                : null;
+              const gapLabel = i === 0
+                ? `<span class="text-[10px] uppercase tracking-wide text-ash">inicio</span>`
+                : gapSec != null
+                  ? `<span class="tabular-nums font-medium text-body" title="${gapSec}s desde la detección anterior">${escapeHtml(formatGapSince(gapSec))}</span>`
+                  : "";
+              const nodeClass = i === 0
+                ? "border-ink bg-ink text-canvas"
+                : "border-ink/40 bg-canvas text-ink";
+              return `
+                <li class="relative flex gap-3 py-2.5">
+                  <div class="relative z-10 w-8 shrink-0 flex flex-col items-center pt-1">
+                    <span class="flex h-4 w-4 items-center justify-center rounded-full border-2 text-[9px] font-bold leading-none ${nodeClass}" title="#${seq}">${seq}</span>
+                  </div>
+                  ${cover}
+                  <div class="min-w-0 flex-1">
+                    <div class="text-sm text-ink leading-snug">
+                      <span class="font-medium">${escapeHtml(t.artist || "?")}</span>
+                      <span class="text-ash"> — </span>
+                      <span>${escapeHtml(t.title || "?")}</span>
+                    </div>
+                    <div class="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-mute">
+                      <span class="tabular-nums text-ink/80">${escapeHtml(formatClock(t.detected_at))}</span>
+                      <span class="text-ash">·</span>
+                      ${gapLabel}
+                      ${shazam ? `<span class="text-ash">·</span> ${shazam}` : ""}
+                    </div>
+                  </div>
+                </li>`;
+            }).join("")}
+            </ol>
+          </div>`
         : `<p class="text-sm text-mute py-4">sin detecciones en esta sesión (shazam aún no matcheó).</p>`;
 
       const edgeList = (edges, empty) => edges.length
         ? edges.map((e) => `
-            <div class="text-[12px] text-body py-1 border-t border-black/10 first:border-t-0">
+            <div class="text-[12px] text-body py-1.5 border-t border-black/10 first:border-t-0 flex flex-wrap items-baseline gap-x-1">
               <span class="text-ink">${escapeHtml(e.fromLabel)}</span>
-              <span class="text-ash"> → </span>
+              <span class="text-ash shrink-0">→</span>
               <span class="text-ink">${escapeHtml(e.toLabel)}</span>
-              <span class="text-mute"> ×${e.count}</span>
+              <span class="text-mute font-medium ml-auto">×${e.count}</span>
             </div>`).join("")
         : `<p class="text-[12px] text-mute">${escapeHtml(empty)}</p>`;
+
+      const stationSessionCount = items.filter((s) => s.stationuuid && s.stationuuid === session.stationuuid).length;
+      const showStationEdges = stationSessionCount > 1 && stationEdges.length > 0;
 
       detailEl.innerHTML = `
         <div class="mb-4">
@@ -865,18 +913,24 @@
           <p class="text-[11px] text-ash mt-0.5">${formatDateTime(session.started_at)}${session.ended_at ? " → " + formatDateTime(session.ended_at) : ""}</p>
         </div>
         <div class="mb-5">
-          <h3 class="text-sm font-bold text-ink mb-2">timeline</h3>
+          <div class="flex items-baseline justify-between gap-2 mb-3">
+            <h3 class="text-sm font-bold text-ink m-0">timeline</h3>
+            <span class="text-[11px] text-ash">orden de detección · gap = desde el tema anterior</span>
+          </div>
           <div>${timeline}</div>
         </div>
-        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div class="grid gap-4 ${showStationEdges ? "grid-cols-1 md:grid-cols-2" : "grid-cols-1"}">
           <div>
-            <h3 class="text-sm font-bold text-ink mb-2">transiciones en sesión</h3>
+            <h3 class="text-sm font-bold text-ink mb-1">secuencia A → B</h3>
+            <p class="text-[10px] text-ash mb-2">pares consecutivos en esta sesión</p>
             ${edgeList(sessionEdges, "hace falta al menos 2 temas seguidos")}
           </div>
+          ${showStationEdges ? `
           <div>
-            <h3 class="text-sm font-bold text-ink mb-2">transiciones en esta estación (todas las sesiones)</h3>
+            <h3 class="text-sm font-bold text-ink mb-1">misma estación · todas las sesiones</h3>
+            <p class="text-[10px] text-ash mb-2">agregado histórico de esta emisora</p>
             ${edgeList(stationEdges, "sin historial agregado aún")}
-          </div>
+          </div>` : ""}
         </div>`;
     }
 

@@ -171,35 +171,50 @@ class ExplorerHandler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _redirect(self, location: str, *, status: int = 302) -> None:
+        self.send_response(status)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _vue_ready(self) -> bool:
+        return EXPLORER_DIST.is_dir() and (EXPLORER_DIST / "index.html").is_file()
+
     def _serve_spa(self, path: str) -> bool:
         """Serve Vue dist if built; return True if handled."""
-        if not EXPLORER_DIST.is_dir():
+        if not self._vue_ready():
             return False
-        # Root and SPA deep-links → index.html
-        if path in ("/", "/index.html", "/web/", "/web/explorer", "/web/explorer/", "/web/explorer.html"):
-            index = EXPLORER_DIST / "index.html"
-            if index.is_file():
-                self._send_file(index)
-                return True
-            return False
+        # Old bookmarks → SPA root (avoid serving legacy path by accident)
+        if path in ("/web/explorer.html", "/web/explorer", "/web/explorer/", "/web/", "/web"):
+            self._redirect("/")
+            return True
+        # Root and SPA shell
+        if path in ("/", "/index.html"):
+            self._send_file(EXPLORER_DIST / "index.html")
+            return True
         # Asset files from dist (e.g. /assets/index-xxx.js)
         rel = path.lstrip("/")
-        candidate = EXPLORER_DIST / rel
-        if candidate.is_file() and EXPLORER_DIST in candidate.resolve().parents:
+        candidate = (EXPLORER_DIST / rel).resolve()
+        try:
+            candidate.relative_to(EXPLORER_DIST.resolve())
+        except ValueError:
+            return False
+        if candidate.is_file():
             self._send_file(candidate)
             return True
-        # Vite assets under /assets/
-        if path.startswith("/assets/"):
-            asset = EXPLORER_DIST / path.lstrip("/")
-            if asset.is_file():
-                self._send_file(asset)
-                return True
         return False
 
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/api/disk-usage":
             self._send_json(build_disk_usage())
+            return
+        if path == "/api/health":
+            self._send_json({
+                "ok": True,
+                "ui": "vue" if self._vue_ready() else "legacy",
+                "dist": str(EXPLORER_DIST),
+            })
             return
         if path == "/api/library/dedupe-preview":
             cache_dir = resolve_cache_dir(ROOT)
@@ -213,7 +228,6 @@ class ExplorerHandler(SimpleHTTPRequestHandler):
                 scan, getst = _get_enrich_fns()
                 # Preview is cheap: report current state + how many could benefit
                 st = getst()
-                idx = {}  # we don't want to import full index here; use stats
                 # Suggest based on missing artwork (primary goal of the enrichment system)
                 missing_artwork = max(0, st.get("total_indexed", 0) - st.get("with_cover", 0))
                 self._send_json({

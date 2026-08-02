@@ -1,3 +1,12 @@
+# --- Vue explorer SPA (dist is gitignored; must be built into the image) ---
+FROM node:22-alpine AS explorer-ui
+WORKDIR /ui
+COPY web/explorer/package.json web/explorer/package-lock.json ./
+RUN npm ci
+COPY web/explorer/ ./
+RUN npm run build
+
+# --- App runtime ---
 FROM python:3.12-slim
 
 WORKDIR /app
@@ -22,6 +31,8 @@ RUN yt-dlp --skip-download --remote-components ejs:github "https://www.youtube.c
 
 COPY bot.py poc_setlistfm.py ./
 COPY src/ ./src/
+COPY web/ ./web/
+COPY --from=explorer-ui /ui/dist ./web/explorer/dist
 
 # .env and .cache are mounted at runtime via docker-compose volumes
 CMD ["python3", "bot.py"]

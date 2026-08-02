@@ -34,7 +34,8 @@ services:
     ports:
       - "8080:8080"
     volumes:
-      - ./web:/app/web:ro
+      # Cache only — do NOT mount ./web over /app/web or the Vue dist from the
+      # image is hidden (dist/ is gitignored on the host → legacy HTML only).
       - ./spotify_cache:/app/.cache
       - ./.env:/app/.env:ro
     command: python3 web/server.py

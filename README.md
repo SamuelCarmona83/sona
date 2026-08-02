@@ -58,7 +58,8 @@ docker compose up -d
 | `bot` | 8888 | Discord bot + Spotify OAuth callback |
 | `explorer` | 8080 | Data explorer UI |
 
-Open the explorer at [http://localhost:8080/](http://localhost:8080/) (Vue build) or [http://localhost:8080/web/explorer.html](http://localhost:8080/web/explorer.html) (legacy HTML fallback).
+Open the explorer at [http://localhost:8080/](http://localhost:8080/) (Vue SPA, built into the Docker image).  
+Check `GET /api/health` → `"ui":"vue"`. Prefer `/`, not `/web/explorer.html` (that path is legacy; redirects to `/` when Vue is present).
 
 ### Local development
 
@@ -302,7 +303,7 @@ Entry point: [`bot.py`](bot.py) → [`src/main.py`](src/main.py).
 
 A read/write UI for cache data on disk. Useful for debugging searches, monitoring disk usage, and cleaning duplicate library entries.
 
-The primary UI is a **Vue 3 SPA** under [`web/explorer/`](web/explorer/). Build with `cd web/explorer && npm install && npm run build`; `web/server.py` serves `dist/` at `/`. Without a build, the legacy [`web/explorer.html`](web/explorer.html) is used.
+The primary UI is a **Vue 3 SPA** under [`web/explorer/`](web/explorer/). Docker builds `dist/` in a multi-stage image (`dist/` is gitignored). Locally: `cd web/explorer && npm install && npm run build`. `web/server.py` serves `dist/` at `/`. Without a build, the legacy [`web/explorer.html`](web/explorer.html) is used. **Do not bind-mount `./web` over `/app/web` in production** — it hides the image’s Vue build.
 
 **Local frontend dev** (HMR via Vite, API on :8080):
 

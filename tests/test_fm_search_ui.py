@@ -54,19 +54,20 @@ class FmSearchUiTests(unittest.TestCase):
             filter_suffix=" (countrycode:VE)",
             page=0,
         )
-        self.assertEqual(embed.title, "📻 Resultados FM")
+        self.assertEqual(embed.title, "📻 Resultados FM · pág. 1/2")
         desc = embed.description or ""
-        self.assertIn("Página **1/2**", desc)
-        self.assertIn("**15** emisoras", desc)
         self.assertIn(_FM_INDEX_EMOJIS[0], desc)
         self.assertIn(_FM_INDEX_EMOJIS[9], desc)
         self.assertIn("**Station 0**", desc)
         self.assertIn("**Station 9**", desc)
         self.assertNotIn("**Station 10**", desc)
+        self.assertIsNotNone(embed.footer)
+        self.assertIn("15 emisoras", embed.footer.text or "")
+        self.assertIn("Anterior / Siguiente", embed.footer.text or "")
 
         page2 = build_fm_results_embed(stations, query_label="mega", page=1)
+        self.assertEqual(page2.title, "📻 Resultados FM · pág. 2/2")
         desc2 = page2.description or ""
-        self.assertIn("Página **2/2**", desc2)
         self.assertIn("**Station 10**", desc2)
         self.assertIn(_FM_INDEX_EMOJIS[0], desc2)  # page-local numbering
         self.assertEqual(FM_PAGE_SIZE, 10)

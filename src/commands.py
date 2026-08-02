@@ -115,26 +115,38 @@ def build_fm_results_embed(
     start = page * page_size
     page_stations = stations[start : start + page_size]
 
+    # Keep lines short so the action row (pagination) stays near the fold.
     lines: list[str] = []
     for i, station in enumerate(page_stations):
         emoji = _FM_INDEX_EMOJIS[i] if i < len(_FM_INDEX_EMOJIS) else f"{i + 1}."
-        name = _truncate_ui(station.get("name") or "FM Station", 80)
-        meta = _truncate_ui(_fm_station_meta_line(station), 90)
-        lines.append(f"{emoji} **{name}** — {meta}")
+        name = _truncate_ui(station.get("name") or "FM Station", 56)
+        cc = (station.get("countrycode") or "").strip().upper()
+        bitrate = station.get("bitrate") or 0
+        codec = (station.get("codec") or "").strip()
+        tail_bits = [p for p in (cc, f"{codec} {bitrate}k" if codec and bitrate else codec) if p]
+        tail = f" · {' · '.join(tail_bits)}" if tail_bits else ""
+        lines.append(f"{emoji} **{name}**{tail}")
 
     description = (
-        f"Buscaste: **{query_label}**{filter_suffix}\n"
-        f"Página **{page + 1}/{pages}** · **{total}** emisoras\n"
-        f"Elige en el menú (válido {timeout_sec}s)\n\n"
+        f"**{query_label}**{filter_suffix}\n"
+        f"Elige en el menú · {timeout_sec}s\n\n"
         + ("\n".join(lines) if lines else "_Sin resultados en esta página._")
     )
     if len(description) > 4096:
         description = description[:4095] + "…"
+
     embed = discord.Embed(
-        title="📻 Resultados FM",
+        title=f"📻 Resultados FM · pág. {page + 1}/{pages}",
         description=description,
         color=0x1DB954,
     )
+    if pages > 1:
+        embed.set_footer(
+            text=f"{total} emisoras · usa Anterior / Siguiente para ver más (pág. {page + 1}/{pages})"
+        )
+    else:
+        embed.set_footer(text=f"{total} emisoras · una sola página")
+
     favicon = (page_stations[0].get("favicon") or "").strip() if page_stations else ""
     if favicon.startswith(("http://", "https://")):
         embed.set_thumbnail(url=favicon)
@@ -175,6 +187,49 @@ class FmSearchView(View):
 
     def _rebuild_items(self) -> None:
         self.clear_items()
+        pages = self.total_pages()
+        multi_page = pages > 1
+
+        # Row 0: pagination first (right under the embed — easiest to see).
+        # Labels matter: emoji-only + disabled buttons are nearly invisible in Discord.
+        if multi_page:
+            prev_btn = Button(
+                label="Anterior",
+                emoji="◀️",
+                style=discord.ButtonStyle.primary,
+                disabled=self.page <= 0,
+                row=0,
+            )
+            prev_btn.callback = self._on_prev
+            self.add_item(prev_btn)
+
+            page_btn = Button(
+                label=f"{self.page + 1}/{pages}",
+                style=discord.ButtonStyle.secondary,
+                disabled=True,
+                row=0,
+            )
+            self.add_item(page_btn)
+
+            next_btn = Button(
+                label="Siguiente",
+                emoji="▶️",
+                style=discord.ButtonStyle.primary,
+                disabled=self.page >= pages - 1,
+                row=0,
+            )
+            next_btn.callback = self._on_next
+            self.add_item(next_btn)
+
+        cancel_btn = Button(
+            label="Cancelar",
+            style=discord.ButtonStyle.danger,
+            row=0,
+        )
+        cancel_btn.callback = self._on_cancel
+        self.add_item(cancel_btn)
+
+        # Row 1: station select
         start = self.page * FM_PAGE_SIZE
         page_stations = self.stations[start : start + FM_PAGE_SIZE]
         options: list[discord.SelectOption] = []
@@ -193,11 +248,11 @@ class FmSearchView(View):
             )
 
         select = discord.ui.Select(
-            placeholder="Elige una emisora…",
+            placeholder=f"Elige una emisora (pág. {self.page + 1}/{pages})…",
             min_values=1,
             max_values=1,
             options=options,
-            row=0,
+            row=1,
         )
 
         async def on_select(interaction: discord.Interaction) -> None:
@@ -205,40 +260,6 @@ class FmSearchView(View):
 
         select.callback = on_select
         self.add_item(select)
-
-        prev_btn = Button(
-            emoji="◀️",
-            style=discord.ButtonStyle.secondary,
-            disabled=self.page <= 0,
-            row=1,
-        )
-        prev_btn.callback = self._on_prev
-        self.add_item(prev_btn)
-
-        page_btn = Button(
-            label=f"Pág. {self.page + 1}/{self.total_pages()}",
-            style=discord.ButtonStyle.secondary,
-            disabled=True,
-            row=1,
-        )
-        self.add_item(page_btn)
-
-        next_btn = Button(
-            emoji="▶️",
-            style=discord.ButtonStyle.secondary,
-            disabled=self.page >= self.total_pages() - 1,
-            row=1,
-        )
-        next_btn.callback = self._on_next
-        self.add_item(next_btn)
-
-        cancel_btn = Button(
-            label="Cancelar",
-            style=discord.ButtonStyle.danger,
-            row=1,
-        )
-        cancel_btn.callback = self._on_cancel
-        self.add_item(cancel_btn)
 
     def _author_only(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id == self.ctx.author.id:
@@ -1227,7 +1248,8 @@ async def _radio_station_cmd(ctx: commands.Context, query: str) -> None:
 
     view = FmSearchView(ranked, search_label, filter_suffix, ctx)
     try:
-        await msg.edit(content=None, embed=view.build_embed(), view=view)
+        # content="" clears "Buscando…" — content=None leaves it unchanged in discord.py
+        await msg.edit(content="", embed=view.build_embed(), view=view)
         view.message = msg
     except Exception as exc:
         logger.warning("fm: could not attach selection view: %s", exc)

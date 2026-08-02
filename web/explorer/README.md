@@ -25,10 +25,24 @@ npm run build   # → dist/
 ```
 
 `web/server.py` serves `dist/` at `/` when present; otherwise falls back to legacy `web/explorer.html`.
+Paths like `/web/explorer.html` redirect to `/` when Vue is built.
 
 ```bash
 python3 web/server.py
 # → http://localhost:8080/
+# → http://localhost:8080/api/health  → {"ui":"vue"| "legacy", ...}
+```
+
+### Docker
+
+`dist/` is **gitignored**. The image builds the SPA in a multi-stage `Dockerfile`.
+
+**Do not** mount `./web` over `/app/web` in compose — that hides the image `dist/` and forces legacy HTML.
+
+```bash
+docker compose build explorer
+docker compose up -d explorer
+# open http://<host>:8080/   (not /web/explorer.html)
 ```
 
 ## Stack
