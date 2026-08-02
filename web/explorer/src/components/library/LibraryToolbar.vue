@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import type { DedupePreview } from '../../types'
+import type { DedupePreview, LibraryGroupMode } from '../../types'
 import { formatBytes } from '../../utils/format'
 import { UI } from '../../ui'
 import SegmentedControl from '../chrome/SegmentedControl.vue'
@@ -7,7 +7,7 @@ import SegmentedControl from '../chrome/SegmentedControl.vue'
 defineProps<{
   dedupe: DedupePreview | null
   showGroupToggle: boolean
-  libraryGrouped: boolean
+  libraryGroupMode: LibraryGroupMode
   busyDedupe: boolean
   busyEnrich: boolean
   enrichSuggest?: number | null
@@ -18,13 +18,15 @@ defineProps<{
 const emit = defineEmits<{
   dedupe: []
   enrich: []
-  'update:libraryGrouped': [value: boolean]
+  'update:libraryGroupMode': [value: LibraryGroupMode]
   'update:showOutliersOnly': [value: boolean]
 }>()
 
-const groupOptions = [
-  { value: 'grouped' as const, label: 'agrupado' },
-  { value: 'detail' as const, label: 'detallado' },
+const groupOptions: { value: LibraryGroupMode; label: string }[] = [
+  { value: 'flat', label: 'lista' },
+  { value: 'artist', label: 'artista' },
+  { value: 'album', label: 'álbum' },
+  { value: 'video', label: 'video' },
 ]
 </script>
 
@@ -48,12 +50,10 @@ const groupOptions = [
 
     <SegmentedControl
       v-if="showGroupToggle"
-      :model-value="libraryGrouped ? 'grouped' : 'detail'"
+      :model-value="libraryGroupMode"
       :options="groupOptions"
       aria-label="agrupación de biblioteca"
-      @update:model-value="
-        emit('update:libraryGrouped', $event === 'grouped')
-      "
+      @update:model-value="emit('update:libraryGroupMode', $event)"
     />
 
     <button

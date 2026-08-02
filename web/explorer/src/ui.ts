@@ -63,12 +63,15 @@ export const UI = {
 export const TABLE_COLUMNS = {
   searches: [
     { key: 'title', label: 'título', wide: true },
+    { key: 'uploader', label: 'artista' },
+    { key: 'request_count', label: 'pedidos', numeric: true, narrow: true },
     { key: 'duration', label: 'dur', numeric: true, narrow: true },
     { key: 'cached_at', label: 'fecha', numeric: true },
   ],
   library: [
     { key: 'title', label: 'título', wide: true },
     { key: 'artist', label: 'artista' },
+    { key: 'album', label: 'álbum' },
     { key: 'play_count', label: 'plays', numeric: true, narrow: true },
     { key: 'file_size_bytes', label: 'tamaño', numeric: true, narrow: true },
     { key: 'actions', label: '', narrow: true },
@@ -76,6 +79,7 @@ export const TABLE_COLUMNS = {
   libraryGrouped: [
     { key: 'title', label: 'título', wide: true },
     { key: 'artist', label: 'artista' },
+    { key: 'album', label: 'álbum' },
     { key: 'play_count', label: 'plays', numeric: true, narrow: true },
     { key: 'file_size_bytes', label: 'tamaño', numeric: true, narrow: true },
     { key: 'copies', label: 'dup', numeric: true, narrow: true },

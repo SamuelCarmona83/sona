@@ -2,6 +2,8 @@ export type TabId = 'searches' | 'library' | 'likes' | 'fm'
 export type ViewMode = 'grid' | 'table'
 export type SortKey = 'recent' | 'alpha' | 'duration' | 'plays' | 'size'
 export type BannerType = 'info' | 'error' | 'success' | 'warn'
+/** Library list grouping in the explorer UI. */
+export type LibraryGroupMode = 'flat' | 'video' | 'artist' | 'album'
 
 export interface StatTile {
   value: string
@@ -34,6 +36,9 @@ export interface SearchItem {
   cached_at: number
   best_artwork?: string
   cover_url?: string
+  /** Times the user requested play (!play / search enqueue). */
+  request_count?: number
+  trackId?: string
 }
 
 export interface LibraryItem {
@@ -59,12 +64,37 @@ export interface LibraryItem {
   play_count: number
   request_count: number
   last_played: number
+  last_requested?: number
   cached_at: number
   file_path?: string
   file_size_bytes: number
   on_disk: boolean
   copies?: number
   wasted_bytes?: number
+  /**
+   * Origin for display:
+   * - disk / undefined = local library file or index
+   * - fm = shazam capture from !fm / seed radio (may have no file)
+   */
+  source?: 'disk' | 'fm' | string
+  station_name?: string
+  /** FM detection count when source=fm */
+  detect_count?: number
+  match_key?: string
+}
+
+/** Hierarchical library sections for artist/album grid views. */
+export interface LibraryAlbumGroup {
+  key: string
+  label: string
+  tracks: LibraryItem[]
+}
+
+export interface LibraryArtistGroup {
+  key: string
+  label: string
+  albums: LibraryAlbumGroup[]
+  trackCount: number
 }
 
 export interface LikeItem {

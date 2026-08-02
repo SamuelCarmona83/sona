@@ -99,10 +99,24 @@ function cellRaw(
     return `${lib.copies}${extra}`
   }
   if (key === 'play_count') {
+    const lib = asLib(item)
+    if (lib?.source === 'fm') {
+      return String(lib.detect_count || lib.play_count || 0)
+    }
     return String((item as LibraryItem).play_count ?? '—')
+  }
+  if (key === 'request_count') {
+    return String((item as SearchItem).request_count ?? '—')
   }
   if (key === 'artist') {
     return String((item as LibraryItem | LikeItem).artist ?? '—')
+  }
+  if (key === 'album') {
+    const lib = asLib(item)
+    return lib?.album?.trim() ? lib.album : '—'
+  }
+  if (key === 'uploader') {
+    return String((item as SearchItem).uploader ?? '—')
   }
   return String((item as unknown as Record<string, unknown>)[key] ?? '—')
 }
@@ -152,6 +166,11 @@ const shownBytes = () =>
           <td v-for="col in columns()" :key="col.key" :class="tdClass(col)">
             <template v-if="col.key === 'title'">
               <span class="font-medium text-ink">{{ item.title || '—' }}</span>
+              <span
+                v-if="asLib(item)?.source === 'fm'"
+                class="inline-block text-[10px] font-medium text-accent border border-accent/40 px-1 ml-1 align-middle"
+                >fm</span
+              >
               <span
                 v-if="
                   asSearch(item) &&

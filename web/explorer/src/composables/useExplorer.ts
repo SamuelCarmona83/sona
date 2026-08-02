@@ -5,9 +5,10 @@ import type {
   DedupePreview,
   DiskUsage,
   FmSession,
+  LibraryArtistGroup,
+  LibraryGroupMode,
   LibraryItem,
   LikeItem,
-  SearchItem,
   SortKey,
   StatTile,
   TabId,
@@ -19,11 +20,13 @@ import { isLibraryOutlier } from '../utils/outliers'
 import {
   buildTransitions,
   countPlayedIds,
+  groupLibraryByArtistAlbum,
   groupLibraryItems,
+  libraryToRequestedSearches,
+  mergeFmCapturesIntoLibrary,
   transformFmSessions,
   transformLibrary,
   transformLikes,
-  transformSearches,
 } from '../utils/transform'
 import { DEFAULT_TABLE_SORT, GRID_INITIAL_LIMIT } from '../ui'
 
@@ -43,10 +46,12 @@ export function useExplorer() {
   const sortKey = ref<SortKey>('recent')
   const filterText = ref('')
   const tableSort = ref<TableSort>({ ...DEFAULT_TABLE_SORT.searches })
-  const libraryGrouped = ref(true)
+  /** true only in video-dedupe mode (DataTable columns with "copies"). */
+  const libraryGrouped = ref(false)
+  const libraryGroupMode = ref<LibraryGroupMode>('artist')
 
-  const searches = ref<SearchItem[]>([])
-  const library = ref<LibraryItem[]>([])
+  /** Disk index only (no virtual FM rows). */
+  const libraryDisk = ref<LibraryItem[]>([])
   const likes = ref<LikeItem[]>([])
   const fmSessions = ref<FmSession[]>([])
   const selectedFmSessionId = ref<string | null>(null)
@@ -108,8 +113,18 @@ export function useExplorer() {
     if (tab === 'library') return 'biblioteca vacía'
     if (tab === 'likes') return 'sin likes'
     if (tab === 'fm') return 'sin sesiones FM — escuchá con !fm en discord'
-    return 'sin búsquedas'
+    return 'sin pedidos — usá !play en discord'
   }
+
+  /** Full library for UI: disk + FM/shazam captures not already on disk. */
+  const library = computed(() =>
+    mergeFmCapturesIntoLibrary(libraryDisk.value, fmSessions.value),
+  )
+
+  /** Pedidos con play (request_count > 0), not YT radio fill cache. */
+  const searches = computed(() =>
+    libraryToRequestedSearches(libraryDisk.value),
+  )
 
   const filteredSearches = computed(() => {
     const items = searches.value.filter((i) =>
@@ -124,15 +139,34 @@ export function useExplorer() {
 
   const filteredLibrary = computed(() => {
     let items = library.value.filter((i) =>
-      matchesFilter([i.title, i.artist, i.yt_query, i.trackId]),
+      matchesFilter([
+        i.title,
+        i.artist,
+        i.album,
+        i.yt_query,
+        i.trackId,
+        i.station_name,
+        i.source,
+      ]),
     )
     if (showOutliersOnly.value) {
       items = items.filter((i) => isLibraryOutlier(i))
     }
-    if (libraryGrouped.value && viewMode.value === 'table') {
+    if (libraryGroupMode.value === 'video') {
       items = groupLibraryItems(items)
     }
     return sortItems(items, 'library')
+  })
+
+  /** Artist → album sections for grid/table hierarchical views. */
+  const libraryArtistGroups = computed((): LibraryArtistGroup[] => {
+    if (
+      libraryGroupMode.value !== 'artist' &&
+      libraryGroupMode.value !== 'album'
+    ) {
+      return []
+    }
+    return groupLibraryByArtistAlbum(filteredLibrary.value)
   })
 
   const filteredLikes = computed(() => {
@@ -182,7 +216,25 @@ export function useExplorer() {
             Number(field(a, 'cached_at') || 0),
         )
     } else if (tab === 'library') {
-      if (key === 'alpha')
+      if (
+        libraryGroupMode.value === 'artist' ||
+        libraryGroupMode.value === 'album'
+      ) {
+        sorted.sort((a, b) => {
+          const aa = String(field(a, 'artist') || '')
+          const ba = String(field(b, 'artist') || '')
+          const byArtist = aa.localeCompare(ba, 'es')
+          if (byArtist !== 0) return byArtist
+          const al = String(field(a, 'album') || '')
+          const bl = String(field(b, 'album') || '')
+          const byAlbum = al.localeCompare(bl, 'es')
+          if (byAlbum !== 0) return byAlbum
+          return String(field(a, 'title') || '').localeCompare(
+            String(field(b, 'title') || ''),
+            'es',
+          )
+        })
+      } else if (key === 'alpha')
         sorted.sort((a, b) =>
           String(field(a, 'title') || '').localeCompare(
             String(field(b, 'title') || ''),
@@ -294,6 +346,15 @@ export function useExplorer() {
 
   function setLibraryGrouped(grouped: boolean) {
     libraryGrouped.value = grouped
+    libraryGroupMode.value = grouped ? 'video' : 'flat'
+    if (viewMode.value === 'table') {
+      tableSort.value = { ...DEFAULT_TABLE_SORT.library }
+    }
+  }
+
+  function setLibraryGroupMode(mode: LibraryGroupMode) {
+    libraryGroupMode.value = mode
+    libraryGrouped.value = mode === 'video'
     if (viewMode.value === 'table') {
       tableSort.value = { ...DEFAULT_TABLE_SORT.library }
     }
@@ -338,7 +399,14 @@ export function useExplorer() {
 
   async function deleteTrack(trackId: string) {
     if (!trackId) return
-    const item = library.value.find((i) => i.trackId === trackId)
+    if (trackId.startsWith('fm_')) {
+      showBanner(
+        'captura FM (shazam): solo lectura — no hay archivo en disco',
+        'info',
+      )
+      return
+    }
+    const item = libraryDisk.value.find((i) => i.trackId === trackId)
     const title = item?.title || trackId
     const size = item?.on_disk ? formatBytes(item.file_size_bytes) : '—'
     const ok = await askConfirm({
@@ -362,7 +430,7 @@ export function useExplorer() {
         )
         return
       }
-      library.value = library.value.filter((i) => i.trackId !== trackId)
+      libraryDisk.value = libraryDisk.value.filter((i) => i.trackId !== trackId)
       if (diskUsage.value.files && diskUsage.value.files[trackId] != null) {
         diskUsage.value = {
           ...diskUsage.value,
@@ -493,7 +561,7 @@ export function useExplorer() {
     ])
     diskUsage.value = disk
     dedupePreview.value = dedupe
-    library.value = transformLibrary(libIndex, disk)
+    libraryDisk.value = transformLibrary(libIndex, disk)
     fmSessions.value = transformFmSessions(fmRaw)
     secondaryDataLoaded.value = true
     secondaryLoading.value = false
@@ -507,14 +575,15 @@ export function useExplorer() {
         api.loadCacheJson('likes.json'),
         api.loadCacheJson('played_ids.json'),
         api.loadCacheJson('fm_sessions.json'),
-        library.value.length
+        libraryDisk.value.length
           ? Promise.resolve(null)
           : api.loadCacheJson('library_index.json'),
       ])
       likes.value = transformLikes(likesRaw)
       fmSessions.value = transformFmSessions(fmRaw)
       playedCount.value = countPlayedIds(playedRaw)
-      if (libIndex) library.value = transformLibrary(libIndex, diskUsage.value)
+      if (libIndex)
+        libraryDisk.value = transformLibrary(libIndex, diskUsage.value)
       secondaryDataLoaded.value = true
       void api.loadDedupePreview().then((d) => {
         dedupePreview.value = d
@@ -535,9 +604,9 @@ export function useExplorer() {
 
   async function init() {
     loading.value = true
-    const [ytMeta, libIndex, disk] = await Promise.all([
-      api.loadCacheJson('youtube_metadata.json'),
+    const [libIndex, fmRaw, disk] = await Promise.all([
       api.loadCacheJson('library_index.json'),
+      api.loadCacheJson('fm_sessions.json'),
       api.loadDiskUsage(),
     ])
 
@@ -549,8 +618,10 @@ export function useExplorer() {
     }
 
     diskUsage.value = disk
-    searches.value = transformSearches(ytMeta)
-    library.value = transformLibrary(libIndex, disk)
+    libraryDisk.value = transformLibrary(libIndex, disk)
+    fmSessions.value = transformFmSessions(fmRaw)
+    // FM already loaded — mark secondary partial so library merges immediately
+    secondaryDataLoaded.value = false
     loading.value = false
     void refreshEnrichSuggest()
 
@@ -577,8 +648,10 @@ export function useExplorer() {
     filterText,
     tableSort,
     libraryGrouped,
+    libraryGroupMode,
     searches,
     library,
+    libraryDisk,
     likes,
     fmSessions,
     selectedFmSessionId,
@@ -597,6 +670,7 @@ export function useExplorer() {
     tabBusy,
     filteredSearches,
     filteredLibrary,
+    libraryArtistGroups,
     filteredLikes,
     filteredFm,
     statsTiles,
@@ -607,6 +681,7 @@ export function useExplorer() {
     setTab,
     setViewMode,
     setLibraryGrouped,
+    setLibraryGroupMode,
     onFilterInput,
     showMore,
     toggleTableSort,

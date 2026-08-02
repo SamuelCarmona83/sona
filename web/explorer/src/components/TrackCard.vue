@@ -61,6 +61,11 @@ function isLike(item: SearchItem | LibraryItem | LikeItem): item is LikeItem {
       <div :class="UI.cardTitle">
         {{ item.title }}
         <span
+          v-if="isLib(item) && item.source === 'fm'"
+          class="inline-block text-[10px] font-medium text-accent border border-accent/40 px-1 ml-1 align-middle"
+          >fm</span
+        >
+        <span
           v-if="isLib(item) && isLibraryOutlier(item)"
           class="inline-block text-[10px] font-medium text-warn border border-warn/40 px-1 ml-1 align-middle"
           >outlier</span
@@ -68,12 +73,26 @@ function isLike(item: SearchItem | LibraryItem | LikeItem): item is LikeItem {
       </div>
 
       <div v-if="isSearch(item)" :class="UI.cardMeta">
-        {{ formatDuration(item.duration) }} ·
+        {{ item.uploader || '—' }}
+        <template v-if="item.request_count">
+          · ×{{ item.request_count }} pedidos
+        </template>
+        · {{ formatDuration(item.duration) }} ·
         {{ formatTimestamp(item.cached_at) }}
       </div>
       <div v-else-if="isLib(item)" :class="UI.cardMeta">
-        {{ item.artist }} · {{ item.play_count }} ·
-        {{ item.on_disk ? formatBytes(item.file_size_bytes) : '—' }}
+        {{ item.artist }}
+        ·
+        <template v-if="item.source === 'fm'">
+          {{ item.detect_count || item.play_count }} det.
+          <template v-if="item.station_name">
+            · {{ item.station_name }}
+          </template>
+        </template>
+        <template v-else>
+          {{ item.play_count }} plays ·
+          {{ item.on_disk ? formatBytes(item.file_size_bytes) : '—' }}
+        </template>
       </div>
       <div v-else-if="isLike(item)" :class="UI.cardMeta">
         {{ item.artist }} · {{ formatTimestamp(item.liked_at) }}

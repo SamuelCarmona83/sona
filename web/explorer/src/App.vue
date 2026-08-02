@@ -117,13 +117,18 @@ const emptyHint = computed(() => {
   if (hasFilter.value) return 'probá otro filtro o limpiá la búsqueda'
   if (ex.activeTab.value === 'fm') return 'en discord: !fm'
   if (ex.activeTab.value === 'likes') return 'en discord: !like'
-  if (ex.activeTab.value === 'library') return 'en discord: !play'
-  return 'en discord: !play para cachear búsquedas'
+  if (ex.activeTab.value === 'library')
+    return 'disco + capturas FM (shazam) · !play / !fm'
+  return 'en discord: !play (pedidos de usuario)'
 })
 
-const showGroupToggle = computed(
+const showGroupToggle = computed(() => ex.activeTab.value === 'library')
+
+const hierarchicalLibrary = computed(
   () =>
-    ex.activeTab.value === 'library' && ex.viewMode.value === 'table',
+    ex.activeTab.value === 'library' &&
+    (ex.libraryGroupMode.value === 'artist' ||
+      ex.libraryGroupMode.value === 'album'),
 )
 
 function onFilterUpdate(value: string) {
@@ -242,7 +247,7 @@ onBeforeUnmount(() => {
             v-if="ex.activeTab.value === 'library'"
             :dedupe="ex.dedupePreview.value"
             :show-group-toggle="showGroupToggle"
-            :library-grouped="ex.libraryGrouped.value"
+            :library-group-mode="ex.libraryGroupMode.value"
             :busy-dedupe="ex.busyDedupe.value"
             :busy-enrich="ex.busyEnrich.value"
             :enrich-suggest="ex.enrichSuggest.value"
@@ -250,12 +255,22 @@ onBeforeUnmount(() => {
             :outlier-count="ex.outlierCount.value"
             @dedupe="ex.doDedupe()"
             @enrich="ex.doEnrich()"
-            @update:library-grouped="ex.setLibraryGrouped"
+            @update:library-group-mode="ex.setLibraryGroupMode"
             @update:show-outliers-only="ex.showOutliersOnly.value = $event"
           />
 
           <p v-if="countLabel" class="text-[11px] text-ash mb-3">
             {{ countLabel }}
+            <template v-if="ex.activeTab.value === 'searches'">
+              · solo pedidos (!play)
+            </template>
+            <template
+              v-else-if="
+                ex.activeTab.value === 'library' && hierarchicalLibrary
+              "
+            >
+              · {{ ex.libraryArtistGroups.value.length }} artistas
+            </template>
           </p>
 
           <EmptyState
@@ -263,6 +278,76 @@ onBeforeUnmount(() => {
             :message="ex.emptyMessage(ex.activeTab.value, hasFilter)"
             :hint="emptyHint"
           />
+
+          <!-- Hierarchical library: artist → album -->
+          <div
+            v-else-if="
+              ex.viewMode.value === 'grid' && hierarchicalLibrary
+            "
+            class="space-y-8"
+          >
+            <section
+              v-for="artist in ex.libraryArtistGroups.value"
+              :key="artist.key"
+              class="border border-black/10"
+            >
+              <header
+                class="px-4 py-3 bg-soft border-b border-black/10 flex items-baseline justify-between gap-3"
+              >
+                <h3 class="text-sm font-bold text-ink m-0">
+                  {{ artist.label }}
+                </h3>
+                <span class="text-[11px] text-ash shrink-0">
+                  {{ artist.trackCount }}
+                  {{ artist.trackCount === 1 ? 'tema' : 'temas' }}
+                </span>
+              </header>
+
+              <div
+                v-if="ex.libraryGroupMode.value === 'album'"
+                class="divide-y divide-black/10"
+              >
+                <div
+                  v-for="album in artist.albums"
+                  :key="album.key"
+                  class="p-4"
+                >
+                  <h4
+                    class="text-[12px] font-medium text-mute mb-3 m-0 tracking-wide"
+                  >
+                    {{ album.label }}
+                    <span class="text-ash font-normal">
+                      · {{ album.tracks.length }}
+                    </span>
+                  </h4>
+                  <div
+                    class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4"
+                  >
+                    <TrackCard
+                      v-for="item in album.tracks"
+                      :key="item.trackId"
+                      tab="library"
+                      :item="item"
+                      @delete="ex.deleteTrack"
+                    />
+                  </div>
+                </div>
+              </div>
+
+              <div
+                v-else
+                class="p-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4"
+              >
+                <TrackCard
+                  v-for="item in artist.albums.flatMap((a) => a.tracks)"
+                  :key="item.trackId"
+                  tab="library"
+                  :item="item"
+                  @delete="ex.deleteTrack"
+                />
+              </div>
+            </section>
+          </div>
 
           <div
             v-else-if="ex.viewMode.value === 'grid'"

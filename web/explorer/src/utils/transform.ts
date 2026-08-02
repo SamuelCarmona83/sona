@@ -2,6 +2,8 @@ import type {
   DiskUsage,
   FmSession,
   FmTrack,
+  LibraryAlbumGroup,
+  LibraryArtistGroup,
   LibraryItem,
   LikeItem,
   SearchItem,
@@ -22,6 +24,217 @@ export function transformSearches(raw: unknown): SearchItem[] {
       cached_at: (meta.cached_at as number) || 0,
     }),
   )
+}
+
+/** Normalize artist/title for soft matching. */
+export function softMatchKey(artist: string, title: string): string {
+  const norm = (s: string) =>
+    s
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/[^a-z0-9]+/g, ' ')
+      .trim()
+  return `${norm(artist)}\0${norm(title)}`
+}
+
+/**
+ * Prefer explicit artist/album; if artist is missing/Unknown, parse
+ * "Artist - Title" from the title (common on YouTube / library index).
+ */
+export function resolveArtistAlbum(item: {
+  artist?: string
+  title?: string
+  album?: string
+}): { artist: string; title: string; album: string } {
+  let artist = (item.artist || '').trim()
+  let title = (item.title || '').trim()
+  let album = (item.album || '').trim()
+  const unknown =
+    !artist ||
+    /^unknown$/i.test(artist) ||
+    artist === '—' ||
+    artist === '?'
+
+  if (unknown && title) {
+    const m = title.match(/^(.+?)\s*[-–—]\s+(.+)$/)
+    if (m) {
+      artist = m[1].trim()
+      title = m[2].trim()
+    } else {
+      artist = 'Desconocido'
+    }
+  }
+  if (!album) album = 'Sin álbum'
+  return { artist: artist || 'Desconocido', title: title || '?', album }
+}
+
+/** User play requests only (request_count > 0) — not radio fills / YT cache noise. */
+export function libraryToRequestedSearches(items: LibraryItem[]): SearchItem[] {
+  return items
+    .filter(
+      (i) =>
+        (i.request_count || 0) > 0 &&
+        i.source !== 'fm' &&
+        !String(i.trackId || '').startsWith('fm_'),
+    )
+    .map((i) => {
+      const resolved = resolveArtistAlbum(i)
+      return {
+        query: i.yt_query || i.title,
+        title: i.title,
+        thumbnail: i.thumbnail,
+        cover_url: i.cover_url,
+        best_artwork: i.best_artwork || undefined,
+        duration: i.duration || 0,
+        uploader: resolved.artist,
+        webpage_url: i.webpage_url,
+        video_id: i.video_id,
+        cached_at: i.last_requested || i.last_played || i.cached_at || 0,
+        request_count: i.request_count || 0,
+        trackId: i.trackId,
+      }
+    })
+    .sort((a, b) => (b.cached_at || 0) - (a.cached_at || 0))
+}
+
+function fmTrackId(matchKey: string): string {
+  const safe = matchKey
+    .replace(/\0/g, '_')
+    .replace(/[^a-zA-Z0-9._-]+/g, '_')
+    .slice(0, 120)
+  return `fm_${safe || 'unknown'}`
+}
+
+/**
+ * Append unique FM/shazam captures that are not already in the disk library.
+ * Does not invent audio files — on_disk stays false.
+ */
+export function mergeFmCapturesIntoLibrary(
+  library: LibraryItem[],
+  sessions: FmSession[],
+): LibraryItem[] {
+  const existingKeys = new Set<string>()
+  for (const item of library) {
+    const r = resolveArtistAlbum(item)
+    existingKeys.add(softMatchKey(r.artist, r.title))
+    if (item.match_key) existingKeys.add(String(item.match_key))
+  }
+
+  const captures = new Map<string, LibraryItem>()
+  for (const session of sessions) {
+    for (const t of session.tracks || []) {
+      const artist = (t.artist || '').trim() || 'Desconocido'
+      const title = (t.title || '').trim()
+      if (!title) continue
+      const key = (t.match_key || softMatchKey(artist, title)).trim()
+      const soft = softMatchKey(artist, title)
+      if (existingKeys.has(soft) || existingKeys.has(key)) continue
+
+      const prev = captures.get(soft)
+      if (prev) {
+        prev.detect_count = (prev.detect_count || 1) + 1
+        prev.play_count = prev.detect_count
+        const det = Number(t.detected_at) || 0
+        if (det > (prev.last_played || 0)) {
+          prev.last_played = det
+          prev.cached_at = det
+          if (t.cover_url) {
+            prev.cover_url = t.cover_url
+            prev.best_artwork = t.cover_url
+          }
+        }
+        if (session.station_name && !prev.station_name) {
+          prev.station_name = session.station_name
+        }
+        continue
+      }
+
+      const det = Number(t.detected_at) || 0
+      captures.set(soft, {
+        trackId: fmTrackId(key || soft),
+        title,
+        artist,
+        album: '',
+        cover_url: t.cover_url || '',
+        best_artwork: t.cover_url || null,
+        thumbnail: t.cover_url || '',
+        duration: 0,
+        play_count: 1,
+        detect_count: 1,
+        request_count: 0,
+        last_played: det,
+        cached_at: det,
+        file_size_bytes: 0,
+        on_disk: false,
+        source: 'fm',
+        station_name: session.station_name || '',
+        yt_query: `${artist} ${title}`,
+      })
+    }
+  }
+
+  if (!captures.size) return library
+  return [...library, ...captures.values()]
+}
+
+/** Nest library items under artist → album for UI sections. */
+export function groupLibraryByArtistAlbum(
+  items: LibraryItem[],
+): LibraryArtistGroup[] {
+  type AlbumBucket = { label: string; tracks: LibraryItem[] }
+  const artists = new Map<
+    string,
+    { label: string; albums: Map<string, AlbumBucket> }
+  >()
+
+  for (const item of items) {
+    const r = resolveArtistAlbum(item)
+    const aKey = softMatchKey(r.artist, '')
+    let artist = artists.get(aKey)
+    if (!artist) {
+      artist = { label: r.artist, albums: new Map() }
+      artists.set(aKey, artist)
+    }
+    const alKey = r.album.toLowerCase()
+    let album = artist.albums.get(alKey)
+    if (!album) {
+      album = { label: r.album, tracks: [] }
+      artist.albums.set(alKey, album)
+    }
+    album.tracks.push({
+      ...item,
+      artist: r.artist,
+      title: item.title,
+      album: r.album === 'Sin álbum' ? item.album || '' : r.album,
+    })
+  }
+
+  const groups: LibraryArtistGroup[] = []
+  for (const [aKey, artist] of artists) {
+    const albums: LibraryAlbumGroup[] = [...artist.albums.entries()]
+      .map(([key, al]) => ({
+        key: `${aKey}::${key}`,
+        label: al.label,
+        tracks: al.tracks.sort((a, b) =>
+          a.title.localeCompare(b.title, 'es'),
+        ),
+      }))
+      .sort((a, b) => {
+        if (a.label === 'Sin álbum') return 1
+        if (b.label === 'Sin álbum') return -1
+        return a.label.localeCompare(b.label, 'es')
+      })
+    const trackCount = albums.reduce((n, al) => n + al.tracks.length, 0)
+    groups.push({
+      key: aKey,
+      label: artist.label,
+      albums,
+      trackCount,
+    })
+  }
+
+  return groups.sort((a, b) => a.label.localeCompare(b.label, 'es'))
 }
 
 export function transformLibrary(
@@ -60,10 +273,12 @@ export function transformLibrary(
         play_count: (entry.play_count as number) || 0,
         request_count: (entry.request_count as number) || 0,
         last_played: (entry.last_played as number) || 0,
+        last_requested: (entry.last_requested as number) || 0,
         cached_at: (entry.cached_at as number) || 0,
         file_path: entry.file_path as string | undefined,
         file_size_bytes: fileSize,
         on_disk: onDisk,
+        source: 'disk',
       }
     },
   )
