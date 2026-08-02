@@ -488,6 +488,25 @@ REQUEST_AGENT_MODELS = [
     m.strip() for m in _REQUEST_MODELS_RAW.split(",") if m.strip()
 ]
 XAI_API_KEY = get_config_value("XAI_API_KEY", dotenv_values, "").strip()
+DEEPSEEK_API_KEY = get_config_value("DEEPSEEK_API_KEY", dotenv_values, "").strip()
+
+
+def export_llm_keys_to_environ() -> None:
+    """LiteLLM (and SDKs) read API keys from os.environ, not our dotenv map.
+
+    Docker only mounts .env as a file the app parses — without this, keys in
+    .env never reach LiteLLM unless also set in compose `environment:`.
+    """
+    import os
+
+    for key, value in (
+        ("ANTHROPIC_API_KEY", ANTHROPIC_API_KEY),
+        ("XAI_API_KEY", XAI_API_KEY),
+        ("DEEPSEEK_API_KEY", DEEPSEEK_API_KEY),
+        ("OPENAI_API_KEY", get_config_value("OPENAI_API_KEY", dotenv_values, "").strip()),
+    ):
+        if value and not os.environ.get(key):
+            os.environ[key] = value
 
 
 def effective_request_channel_id() -> int:

@@ -14,7 +14,10 @@ services:
       - ./cookies.txt:/app/cookies.txt
     environment:
       SPOTIFY_CACHE_PATH: /app/.cache/spotify.cache
+      # Optional host-env overrides; app also loads keys from mounted .env for LiteLLM
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      XAI_API_KEY: ${XAI_API_KEY:-}
       NORMALIZE_AUDIO: true
       YTDL_COOKIES_FILE: /app/cookies.txt
       # file-only in containers: browser cookie extraction never works headless

@@ -16,6 +16,7 @@ from src.config import (
     REQUEST_AGENT_TIMEOUT_SEC,
     REQUEST_MAX_TRACKS_PER_PLAN,
     REQUEST_MAX_QUEUE_USER_TRACKS,
+    export_llm_keys_to_environ,
 )
 
 logger = logging.getLogger(__name__)
@@ -340,6 +341,9 @@ async def plan_from_llm(message: str, snapshot: dict, *, auto_enabled: bool, use
     except ImportError:
         logger.warning("request_agent: litellm not installed")
         return None
+
+    # Keys live in mounted .env; LiteLLM only checks process environment.
+    export_llm_keys_to_environ()
 
     system = _SYSTEM_PROMPT.format(max_tracks=REQUEST_MAX_TRACKS_PER_PLAN)
     user = _format_user_prompt(
