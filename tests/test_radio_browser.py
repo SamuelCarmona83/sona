@@ -153,6 +153,15 @@ class RadioBrowserTests(unittest.TestCase):
         self.assertEqual(filters["tag"], "news")
         self.assertEqual(filters["codec"], "AAC")
 
+    def test_parse_search_query_venezuela_country_hint(self) -> None:
+        query, filters = parse_search_query("La Mega country:venezuela")
+        self.assertEqual(query, "La Mega")
+        self.assertEqual(filters["countrycode"], "VE")
+
+        query2, filters2 = parse_search_query("mega country:VE")
+        self.assertEqual(query2, "mega")
+        self.assertEqual(filters2["countrycode"], "VE")
+
     def test_search_stations_applies_type_country_codec_filters(self) -> None:
         response = Mock()
         response.json.return_value = [

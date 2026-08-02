@@ -32,7 +32,6 @@ from src.playback import (
 from src.scoring import _split_query_parts
 from src.radio_browser import (
     parse_search_query,
-    pick_best_station,
     rank_stations,
     search_stations,
     station_to_track,
@@ -58,6 +57,10 @@ logger = logging.getLogger(__name__)
 
 YOUTUBE_PLAYLIST_TRACK_LIMIT = 50
 SELECTION_VIEW_TIMEOUT_SEC = 30
+FM_PAGE_SIZE = 10
+FM_SELECTION_TIMEOUT_SEC = 90
+FM_MAX_RESULTS = 50
+_FM_INDEX_EMOJIS = ("1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟")
 
 
 def error_embed(title: str, description: str = "", details: str = "") -> discord.Embed:
@@ -65,6 +68,281 @@ def error_embed(title: str, description: str = "", details: str = "") -> discord
     if details:
         embed.add_field(name="Detalles", value=f"`{details[:1024]}`", inline=False)
     return embed
+
+
+def _truncate_ui(text: str, max_len: int) -> str:
+    cleaned = re.sub(r"\s+", " ", (text or "").strip())
+    if len(cleaned) <= max_len:
+        return cleaned
+    if max_len <= 1:
+        return cleaned[:max_len]
+    return cleaned[: max_len - 1] + "…"
+
+
+def _fm_station_meta_line(station: dict) -> str:
+    parts: list[str] = []
+    country = (station.get("country") or station.get("countrycode") or "").strip()
+    state = (station.get("state") or "").strip()
+    codec = (station.get("codec") or "").strip()
+    bitrate = station.get("bitrate") or 0
+    if country:
+        parts.append(country)
+    if state:
+        parts.append(state)
+    if codec:
+        parts.append(f"{codec} {bitrate}kbps" if bitrate else codec)
+    return " · ".join(parts) if parts else "stream"
+
+
+def _fm_page_count(total: int, page_size: int = FM_PAGE_SIZE) -> int:
+    if total <= 0:
+        return 1
+    return max(1, (total + page_size - 1) // page_size)
+
+
+def build_fm_results_embed(
+    stations: list[dict],
+    *,
+    query_label: str,
+    filter_suffix: str = "",
+    page: int = 0,
+    page_size: int = FM_PAGE_SIZE,
+    timeout_sec: int = FM_SELECTION_TIMEOUT_SEC,
+) -> discord.Embed:
+    total = len(stations)
+    pages = _fm_page_count(total, page_size)
+    page = max(0, min(page, pages - 1))
+    start = page * page_size
+    page_stations = stations[start : start + page_size]
+
+    lines: list[str] = []
+    for i, station in enumerate(page_stations):
+        emoji = _FM_INDEX_EMOJIS[i] if i < len(_FM_INDEX_EMOJIS) else f"{i + 1}."
+        name = _truncate_ui(station.get("name") or "FM Station", 80)
+        meta = _truncate_ui(_fm_station_meta_line(station), 90)
+        lines.append(f"{emoji} **{name}** — {meta}")
+
+    description = (
+        f"Buscaste: **{query_label}**{filter_suffix}\n"
+        f"Página **{page + 1}/{pages}** · **{total}** emisoras\n"
+        f"Elige en el menú (válido {timeout_sec}s)\n\n"
+        + ("\n".join(lines) if lines else "_Sin resultados en esta página._")
+    )
+    if len(description) > 4096:
+        description = description[:4095] + "…"
+    embed = discord.Embed(
+        title="📻 Resultados FM",
+        description=description,
+        color=0x1DB954,
+    )
+    favicon = (page_stations[0].get("favicon") or "").strip() if page_stations else ""
+    if favicon.startswith(("http://", "https://")):
+        embed.set_thumbnail(url=favicon)
+    return embed
+
+
+class FmSearchView(View):
+    """Paginated FM search results: number emojis + select + prev/next."""
+
+    def __init__(
+        self,
+        stations: list[dict],
+        query_label: str,
+        filter_suffix: str,
+        ctx: commands.Context,
+    ):
+        super().__init__(timeout=FM_SELECTION_TIMEOUT_SEC)
+        self.stations = stations
+        self.query_label = query_label
+        self.filter_suffix = filter_suffix
+        self.ctx = ctx
+        self.page = 0
+        self.message: discord.Message | None = None
+        self._rebuild_items()
+
+    def total_pages(self) -> int:
+        return _fm_page_count(len(self.stations), FM_PAGE_SIZE)
+
+    def build_embed(self) -> discord.Embed:
+        return build_fm_results_embed(
+            self.stations,
+            query_label=self.query_label,
+            filter_suffix=self.filter_suffix,
+            page=self.page,
+            page_size=FM_PAGE_SIZE,
+            timeout_sec=FM_SELECTION_TIMEOUT_SEC,
+        )
+
+    def _rebuild_items(self) -> None:
+        self.clear_items()
+        start = self.page * FM_PAGE_SIZE
+        page_stations = self.stations[start : start + FM_PAGE_SIZE]
+        options: list[discord.SelectOption] = []
+        for i, station in enumerate(page_stations):
+            global_idx = start + i
+            label = _truncate_ui(station.get("name") or "FM Station", 100)
+            description = _truncate_ui(_fm_station_meta_line(station), 100) or None
+            emoji = _FM_INDEX_EMOJIS[i] if i < len(_FM_INDEX_EMOJIS) else None
+            options.append(
+                discord.SelectOption(
+                    label=label or f"Emisora {global_idx + 1}",
+                    value=str(global_idx),
+                    description=description,
+                    emoji=emoji,
+                )
+            )
+
+        select = discord.ui.Select(
+            placeholder="Elige una emisora…",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=0,
+        )
+
+        async def on_select(interaction: discord.Interaction) -> None:
+            await self._handle_select(interaction, select.values)
+
+        select.callback = on_select
+        self.add_item(select)
+
+        prev_btn = Button(
+            emoji="◀️",
+            style=discord.ButtonStyle.secondary,
+            disabled=self.page <= 0,
+            row=1,
+        )
+        prev_btn.callback = self._on_prev
+        self.add_item(prev_btn)
+
+        page_btn = Button(
+            label=f"Pág. {self.page + 1}/{self.total_pages()}",
+            style=discord.ButtonStyle.secondary,
+            disabled=True,
+            row=1,
+        )
+        self.add_item(page_btn)
+
+        next_btn = Button(
+            emoji="▶️",
+            style=discord.ButtonStyle.secondary,
+            disabled=self.page >= self.total_pages() - 1,
+            row=1,
+        )
+        next_btn.callback = self._on_next
+        self.add_item(next_btn)
+
+        cancel_btn = Button(
+            label="Cancelar",
+            style=discord.ButtonStyle.danger,
+            row=1,
+        )
+        cancel_btn.callback = self._on_cancel
+        self.add_item(cancel_btn)
+
+    def _author_only(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.ctx.author.id:
+            return True
+        return False
+
+    async def _deny_if_not_author(self, interaction: discord.Interaction) -> bool:
+        if self._author_only(interaction):
+            return False
+        await interaction.response.send_message(
+            "Solo quien hizo la búsqueda puede seleccionar.",
+            ephemeral=True,
+        )
+        return True
+
+    async def _handle_select(self, interaction: discord.Interaction, values: list[str]) -> None:
+        if await self._deny_if_not_author(interaction):
+            return
+        if not values:
+            await interaction.response.send_message("No se pudo leer la selección.", ephemeral=True)
+            return
+        try:
+            idx = int(values[0])
+        except (TypeError, ValueError):
+            await interaction.response.send_message("Selección inválida.", ephemeral=True)
+            return
+        if idx < 0 or idx >= len(self.stations):
+            await interaction.response.send_message("Esa emisora ya no está disponible.", ephemeral=True)
+            return
+
+        station = self.stations[idx]
+        await interaction.response.defer()
+        backup = _choose_fm_backup_station(self.stations, station)
+        try:
+            switching_now = await _switch_to_fm_station(
+                self.ctx.guild,
+                self.ctx.channel,
+                self.ctx.author,
+                station,
+                backup_station=backup,
+            )
+        except ValueError as exc:
+            await interaction.followup.send(str(exc), ephemeral=True)
+            return
+
+        self.stop()
+        country = station.get("country") or "?"
+        codec = station.get("codec") or "?"
+        bitrate = station.get("bitrate") or 0
+        switching_text = " | cambiando ahora" if switching_now else ""
+        confirm = (
+            f"📻 **{station.get('name', 'FM Station')}** | {country} | "
+            f"{codec} {bitrate}kbps{switching_text}"
+        )
+        try:
+            if self.message is not None:
+                await self.message.edit(content=confirm, embed=None, view=None)
+            else:
+                await interaction.edit_original_response(content=confirm, embed=None, view=None)
+        except Exception:
+            await interaction.followup.send(confirm)
+
+    async def _on_prev(self, interaction: discord.Interaction) -> None:
+        if await self._deny_if_not_author(interaction):
+            return
+        if self.page <= 0:
+            await interaction.response.defer()
+            return
+        self.page -= 1
+        self._rebuild_items()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def _on_next(self, interaction: discord.Interaction) -> None:
+        if await self._deny_if_not_author(interaction):
+            return
+        if self.page >= self.total_pages() - 1:
+            await interaction.response.defer()
+            return
+        self.page += 1
+        self._rebuild_items()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def _on_cancel(self, interaction: discord.Interaction) -> None:
+        if await self._deny_if_not_author(interaction):
+            return
+        self.stop()
+        await interaction.response.edit_message(
+            content="❌ Búsqueda FM cancelada.",
+            embed=None,
+            view=None,
+        )
+
+    async def on_timeout(self) -> None:
+        self.stop()
+        if self.message is None:
+            return
+        try:
+            await self.message.edit(
+                content="⏱️ Tiempo agotado. Búsqueda FM cancelada.",
+                embed=None,
+                view=None,
+            )
+        except Exception:
+            pass
 
 
 class SearchSelectionView(View):
@@ -805,12 +1083,17 @@ async def _radio_station_cmd(ctx: commands.Context, query: str) -> None:
                 "**Uso**\n"
                 "`!fm <consulta> [filtros]`\n"
                 "`!station <consulta> [filtros]`\n\n"
+                "**Resultados**\n"
+                "Si hay varias emisoras, verás un embed con **10 por página**, "
+                "números (1️⃣–🔟), menú para elegir y botones ◀ ▶ para paginar.\n"
+                "Con un solo resultado se reproduce al instante.\n\n"
                 "**Filtros**\n"
-                "`country:<codigo|pais>`  ej: `country:US`, `country:argentina`\n"
+                "`country:<codigo|pais>`  ej: `country:US`, `country:venezuela`\n"
                 "`language:<idioma>`      ej: `language:english`\n"
                 "`type:<tipo>`            ej: `type:news`, `type:rock`, `type:techno`\n"
                 "`codec:<codec>`          ej: `codec:mp3`, `codec:aac`\n\n"
                 "**Ejemplos**\n"
+                "`!fm La Mega country:VE`\n"
                 "`!fm cnn country:us`\n"
                 "`!fm techno type:techno country:de`\n"
                 "`!fm hits 1 language:french`\n"
@@ -883,7 +1166,8 @@ async def _radio_station_cmd(ctx: commands.Context, query: str) -> None:
     search_label = parsed_query or "radio"
     filter_parts = [f"{k}:{v}" for k, v in fm_filters.items()]
     filter_suffix = f" ({', '.join(filter_parts)})" if filter_parts else ""
-    msg = await ctx.send(f"📡 Buscando emisora: **{search_label}**{filter_suffix}...", delete_after=40)
+    # No delete_after: multi-result selector reuses this message.
+    msg = await ctx.send(f"📡 Buscando emisora: **{search_label}**{filter_suffix}...")
 
     try:
         stations = await asyncio.wait_for(
@@ -906,40 +1190,76 @@ async def _radio_station_cmd(ctx: commands.Context, query: str) -> None:
         await msg.edit(content=f"No encontre emisoras para: **{search_label}**{filter_suffix}")
         return
 
-    best_station = pick_best_station(stations, parsed_query or cleaned_query)
-    if not best_station:
+    ranked = rank_stations(stations, parsed_query or cleaned_query)[:FM_MAX_RESULTS]
+    if not ranked:
         await msg.edit(content=f"No encontre streams validos para: **{search_label}**{filter_suffix}")
         return
 
-    ranked = rank_stations(stations, parsed_query or cleaned_query)
-    ranked = ranked[:200]
-    backup_station = _choose_fm_backup_station(ranked, best_station)
+    # Single hit: play immediately (no selection UI).
+    if len(ranked) == 1:
+        best_station = ranked[0]
+        backup_station = None
+        try:
+            switching_now = await _switch_to_fm_station(
+                ctx.guild,
+                ctx.channel,
+                ctx.author,
+                best_station,
+                backup_station=backup_station,
+            )
+        except ValueError as exc:
+            await msg.edit(content=str(exc))
+            return
 
-    try:
-        switching_now = await _switch_to_fm_station(
-            ctx.guild,
-            ctx.channel,
-            ctx.author,
-            best_station,
-            backup_station=backup_station,
+        country = best_station.get("country") or "?"
+        codec = best_station.get("codec") or "?"
+        bitrate = best_station.get("bitrate") or 0
+        switching_text = " | cambiando ahora" if switching_now else ""
+        await msg.edit(
+            content=(
+                f"📻 **{best_station.get('name', 'FM Station')}** | {country} | "
+                f"{codec} {bitrate}kbps{switching_text}"
+            ),
+            embed=None,
+            view=None,
         )
-    except ValueError as exc:
-        await msg.edit(content=str(exc))
         return
 
+    view = FmSearchView(ranked, search_label, filter_suffix, ctx)
     try:
-        await msg.delete()
-    except Exception:
-        pass
-
-    country = best_station.get("country") or "?"
-    codec = best_station.get("codec") or "?"
-    bitrate = best_station.get("bitrate") or 0
-    switching_text = " | cambiando ahora" if switching_now else ""
-    await ctx.send(
-        f"📻 **{best_station.get('name', 'FM Station')}** | {country} | {codec} {bitrate}kbps{switching_text}",
-        delete_after=18,
-    )
+        await msg.edit(content=None, embed=view.build_embed(), view=view)
+        view.message = msg
+    except Exception as exc:
+        logger.warning("fm: could not attach selection view: %s", exc)
+        try:
+            selection_msg = await ctx.send(embed=view.build_embed(), view=view)
+            view.message = selection_msg
+            await msg.delete()
+        except Exception:
+            # Fallback: auto-play best ranked station.
+            best_station = ranked[0]
+            backup_station = _choose_fm_backup_station(ranked, best_station)
+            try:
+                switching_now = await _switch_to_fm_station(
+                    ctx.guild,
+                    ctx.channel,
+                    ctx.author,
+                    best_station,
+                    backup_station=backup_station,
+                )
+            except ValueError as play_exc:
+                await msg.edit(content=str(play_exc))
+                return
+            country = best_station.get("country") or "?"
+            codec = best_station.get("codec") or "?"
+            bitrate = best_station.get("bitrate") or 0
+            switching_text = " | cambiando ahora" if switching_now else ""
+            await msg.edit(
+                content=(
+                    f"📻 **{best_station.get('name', 'FM Station')}** | {country} | "
+                    f"{codec} {bitrate}kbps{switching_text}"
+                ),
+            )
 
 
 @bot.command(name="fm", help="Busca y reproduce una emisora AM/FM por internet. Uso: !fm <consulta> [country:.. language:.. type:.. codec:..]")
