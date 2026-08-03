@@ -1,18 +1,27 @@
 #!/usr/bin/env bash
+# Local cookie export. For GCE deploy use:
+#   ./refresh_cookies.sh --deploy
+#   ./scripts/deploy_youtube_cookies.sh
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BROWSER="chrome"
 RESTART_DOCKER=false
+DEPLOY=false
 PYTHON_BIN="${ROOT_DIR}/venv/bin/python"
 LOG_FILE="${ROOT_DIR}/.cache/cookie_refresh.log"
 
 for arg in "$@"; do
   case "$arg" in
     --restart) RESTART_DOCKER=true ;;
+    --deploy) DEPLOY=true ;;
     chrome|chromium|edge|firefox|opera) BROWSER="$arg" ;;
   esac
 done
+
+if [[ "${DEPLOY}" == "true" ]]; then
+  exec "${ROOT_DIR}/scripts/deploy_youtube_cookies.sh" "${BROWSER}"
+fi
 
 if [[ ! -x "${PYTHON_BIN}" ]]; then
   PYTHON_BIN="python3"
@@ -36,6 +45,7 @@ echo "${TIMESTAMP} refreshed ${COUNT} cookies from ${BROWSER}" >> "${LOG_FILE}"
 
 echo
 printf 'Cookies refreshed (%s entries). The bot will detect the change automatically.\n' "${COUNT}"
+printf 'To push to GCE: ./refresh_cookies.sh --deploy\n'
 
 if [[ "${RESTART_DOCKER}" == "true" ]]; then
   if command -v docker >/dev/null 2>&1; then

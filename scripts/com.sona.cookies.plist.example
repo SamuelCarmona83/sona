@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS LaunchAgent: refresh + deploy YouTube cookies every 12 hours.
+
+  Install:
+    1. Edit ProgramArguments path to your repo.
+    2. cp scripts/com.sona.cookies.plist.example ~/Library/LaunchAgents/com.sona.cookies.plist
+    3. launchctl load ~/Library/LaunchAgents/com.sona.cookies.plist
+
+  Logs: /tmp/sona-cookies.out /tmp/sona-cookies.err
+  Unload: launchctl unload ~/Library/LaunchAgents/com.sona.cookies.plist
+
+  Note: needs network + unlocked keychain for gcloud SSH key passphrase
+  (use ssh-agent / macOS keychain for google_compute_engine).
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.sona.cookies</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-lc</string>
+    <string>$HOME/Documents/Repositories/spoty-scanner/scripts/deploy_youtube_cookies.sh chrome</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>43200</integer>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>StandardOutPath</key>
+  <string>/tmp/sona-cookies.out</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/sona-cookies.err</string>
+</dict>
+</plist>

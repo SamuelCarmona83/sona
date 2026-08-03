@@ -98,14 +98,37 @@ Serve the explorer without Docker:
 
 ### YouTube cookies
 
-The bot watches `cookies.txt` and reloads it when the file changes — no cron job required.
+The bot watches `cookies.txt` and reloads it when the file changes.
+
+**Local only** (Docker on the same machine):
 
 ```bash
-# When cookies expire or the bot alerts you
 ./refresh_cookies.sh chrome
 ```
 
-The running container picks up the new file without a restart. Use `--restart` only if you want to force-recreate the container.
+**GCE deploy from your Mac** (export Chrome session → install as file for the deploy user → recreate bot):
+
+```bash
+# One command (recommended)
+./scripts/deploy_youtube_cookies.sh
+# or
+./refresh_cookies.sh --deploy
+
+# Alias (if configured in ~/.zshrc): sona-cookies
+```
+
+This avoids two common traps: OS Login user ≠ deploy user, and Docker creating `cookies.txt` as a **directory** when the file was missing at first `compose up`.
+
+**Cron on Mac** (07:00 local — quiet hour; less likely mid-listening):
+
+```bash
+# already installable via:
+#   scripts/cron_deploy_cookies.sh
+# crontab example:
+0 7 * * * /Users/YOU/Documents/Repositories/spoty-scanner/scripts/cron_deploy_cookies.sh
+```
+
+Logs: `.cache/cookie_deploy_cron.log`. One-time setup: unlock gcloud SSH key into the Keychain (`ssh-add --apple-use-keychain ~/.ssh/google_compute_engine`) and keep Chrome logged into YouTube on this Mac. On modern macOS, grant **Full Disk Access** to `cron` if browser cookie export fails from cron.
 
 ## Configuration
 
