@@ -368,6 +368,99 @@ def flush_radio_tracks(guild_id: int) -> int:
     return removed
 
 
+def _artist_title_key(track: dict) -> str | None:
+    """Stable key for the same song under different YouTube uploads."""
+    from src.scoring import _normalize_text, _clean_title_for_match
+
+    artist = (track.get("artist") or "").strip()
+    title = (track.get("title") or track.get("yt_query") or "").strip()
+    if (not artist or artist.lower() in {"unknown", "?", "—"}) and title:
+        # "Artist - Title" often lives only in title/yt_query
+        if " - " in title:
+            artist, title = title.split(" - ", 1)
+        elif " – " in title:
+            artist, title = title.split(" – ", 1)
+    artist_n = _normalize_text(artist)
+    title_n = _clean_title_for_match(title, set())
+    if not title_n:
+        return None
+    return f"at:{artist_n}|{title_n}"
+
+
+def played_keys_for_track(track: dict | None) -> list[str]:
+    """All identity keys used to avoid re-enqueueing the same song.
+
+    Historically ``record_played`` stored only library ``yt_…`` ids while fill
+    deduped on ``spotify_id`` — those never matched, so radio looped the same
+    recommendations forever.
+    """
+    if not track:
+        return []
+    keys: list[str] = []
+    try:
+        from src.library import track_id as library_track_id
+
+        tid = library_track_id(track)
+        if tid:
+            keys.append(str(tid))
+    except Exception:
+        pass
+    sid = track.get("spotify_id")
+    if sid:
+        keys.append(f"sp:{sid}")
+        keys.append(str(sid))  # bare id (likes / legacy dedup)
+    vid = track.get("video_id")
+    if vid:
+        v = str(vid)
+        keys.append(v if v.startswith("yt_") else f"yt_{v}")
+    at = _artist_title_key(track)
+    if at:
+        keys.append(at)
+    # Preserve order, drop empties/dupes
+    seen: set[str] = set()
+    out: list[str] = []
+    for k in keys:
+        if k and k not in seen:
+            seen.add(k)
+            out.append(k)
+    return out
+
+
+def _remember_played_keys(guild_id: int, track: dict, *, persist: bool = True) -> None:
+    """Append all identity keys for *track* into the guild played list."""
+    ids = _played_ids.setdefault(guild_id, [])
+    changed = False
+    for key in played_keys_for_track(track):
+        if key not in ids:
+            ids.append(key)
+            changed = True
+    if changed:
+        if len(ids) > _PLAYED_IDS_MAX:
+            _played_ids[guild_id] = ids[-_PLAYED_IDS_MAX:]
+        if persist:
+            _save_played_ids()
+
+
+def track_is_recently_played(track: dict, blocked: set[str]) -> bool:
+    return any(k in blocked for k in played_keys_for_track(track))
+
+
+def blocked_keys_for_guild(guild_id: int) -> set[str]:
+    """Played history + currently playing/queued tracks (all identity keys)."""
+    blocked = set(_played_ids.get(guild_id, []))
+    try:
+        from src.playback import guild_session
+
+        sess = guild_session(guild_id)
+        if sess.now_playing:
+            blocked.update(played_keys_for_track(sess.now_playing))
+        for t in list(getattr(sess, "queue", None) or []):
+            blocked.update(played_keys_for_track(t))
+    except Exception:
+        pass
+    return blocked
+
+
 async def record_played(guild_id: int, track: dict) -> None:
     """Record a track in the guild's play history for diversity seeding."""
     if guild_id not in _play_history:
@@ -388,25 +481,21 @@ async def record_played(guild_id: int, track: dict) -> None:
         "cluster":     cluster,
         "artist_name": track.get("artist"),
     })
-    
-    from src.library import track_id as library_track_id
 
     track_title = track.get("title", "")
-    tid = library_track_id(track)
-    ids = _played_ids.setdefault(guild_id, [])
-    if tid not in ids:
-        ids.append(tid)
-        if len(ids) > _PLAYED_IDS_MAX:
-            _played_ids[guild_id] = ids[-_PLAYED_IDS_MAX:]
-        _save_played_ids()
+    keys = played_keys_for_track(track)
+    before = len(_played_ids.get(guild_id, []))
+    _remember_played_keys(guild_id, track, persist=True)
+    after = len(_played_ids.get(guild_id, []))
+    if after > before:
         logger.debug(
-            "radio.record_played: saved track id=%s title='%s' (total: %d)",
-            tid, track_title, len(ids),
+            "radio.record_played: saved keys=%s title='%s' (total: %d)",
+            keys, track_title, after,
         )
     else:
         logger.debug(
-            "radio.record_played: track id=%s already in history",
-            tid,
+            "radio.record_played: track already in history title='%s' keys=%s",
+            track_title, keys,
         )
 
 
@@ -743,22 +832,25 @@ async def fill_radio_queue(
                     "webpage_url": yt_info.get("webpage_url"),
                 }
 
-            played_set_profile = set(_played_ids.get(gid, []))
+            blocked_profile = blocked_keys_for_guild(gid)
             seen_urls_profile: set[str] = set()
             profile_tracks = []
             for info in profile_candidates:
                 track = await _fetch_profile(info)
                 if track is None:
                     continue
-                sid = track.get("spotify_id")
                 url = track.get("url", "")
-                dedup_key = sid if sid else f"url_{url}"
-                if dedup_key in played_set_profile or url in seen_urls_profile:
+                if track_is_recently_played(track, blocked_profile) or (
+                    url and url in seen_urls_profile
+                ):
                     continue
-                seen_urls_profile.add(url)
+                if url:
+                    seen_urls_profile.add(url)
                 profile_tracks.append(track)
                 queues.setdefault(gid, collections.deque())
                 queues[gid].append(track)
+                _remember_played_keys(gid, track, persist=True)
+                blocked_profile.update(played_keys_for_track(track))
                 await _try_early_play(
                     gid, guild, vc, text_channel,
                     early_play=early_play, triggered=early_play_triggered,
@@ -783,7 +875,7 @@ async def fill_radio_queue(
         if vc_channel is not None:
             connected_ids = [m.id for m in vc_channel.members if not m.bot]
             if connected_ids:
-                played_set_for_likes = set(_played_ids.get(gid, []))
+                played_set_for_likes = blocked_keys_for_guild(gid)
                 liked_tracks = _likes_mod.get_prioritized_tracks(
                     gid, connected_ids, played_set_for_likes, limit=needed
                 )
@@ -834,22 +926,23 @@ async def fill_radio_queue(
                     "webpage_url": yt_info.get("webpage_url"),
                 }
 
-            played_set_lk = set(_played_ids.get(gid, []))
+            blocked_lk = blocked_keys_for_guild(gid)
             seen_urls_lk: set[str] = set()
             priority_tracks = []
             for info in liked_tracks:
                 t = await _fetch_liked(info)
                 if t is None:
                     continue
-                sid = t.get("spotify_id")
                 url = t.get("url", "")
-                dedup_key = sid if sid else f"url_{url}"
-                if dedup_key in played_set_lk or url in seen_urls_lk:
+                if track_is_recently_played(t, blocked_lk) or (url and url in seen_urls_lk):
                     continue
-                seen_urls_lk.add(url)
+                if url:
+                    seen_urls_lk.add(url)
                 priority_tracks.append(t)
                 queues.setdefault(gid, collections.deque())
                 queues[gid].append(t)
+                _remember_played_keys(gid, t, persist=True)
+                blocked_lk.update(played_keys_for_track(t))
                 await _try_early_play(
                     gid, guild, vc, text_channel,
                     early_play=early_play, triggered=early_play_triggered,
@@ -865,14 +958,17 @@ async def fill_radio_queue(
                         await play_next(guild, vc, text_channel)
                     return
 
-        recs = await _get_recommendations_hybrid(seed_tracks, seed_genres, limit=needed + RADIO_RECS_OVERFETCH)
+        # Over-fetch aggressively: niche moods (e.g. rock venezolano) return a small
+        # rotating pool; we need headroom after played/queue filtering.
+        rec_limit = max(needed + RADIO_RECS_OVERFETCH, needed * 3, needed + 12)
+        recs = await _get_recommendations_hybrid(seed_tracks, seed_genres, limit=rec_limit)
         using_fallback = False
         if not recs:
             logger.warning(
                 "radio.fill: Hybrid recommendations exhausted for guild=%s, usando fallback YouTube",
                 gid,
             )
-            recs = await _youtube_fallback_fill(gid, needed + RADIO_RECS_OVERFETCH)
+            recs = await _youtube_fallback_fill(gid, rec_limit)
             using_fallback = True
 
         if not recs:
@@ -928,67 +1024,96 @@ async def fill_radio_queue(
                 "webpage_url": yt_info.get("webpage_url"),
             }
 
-        played_set = set(_played_ids.get(gid, []))
+        async def _accept_fetched(
+            candidates: list,
+            *,
+            blocked: set[str],
+            seen_urls: set[str],
+            dest: list,
+        ) -> None:
+            for t in candidates:
+                if isinstance(t, Exception):
+                    logger.debug("radio.fill: fetch error (ignored): %s", t)
+                    continue
+                if t is None:
+                    continue
+                url = t.get("url", "")
+                if track_is_recently_played(t, blocked) or (url and url in seen_urls):
+                    continue
+                if url:
+                    seen_urls.add(url)
+                dest.append(t)
+                queues.setdefault(gid, collections.deque())
+                queues[gid].append(t)
+                _remember_played_keys(gid, t, persist=True)
+                blocked.update(played_keys_for_track(t))
+                await _try_early_play(
+                    gid, guild, vc, text_channel,
+                    early_play=early_play, triggered=early_play_triggered,
+                )
+                if len(dest) >= needed:
+                    break
+
+        blocked = blocked_keys_for_guild(gid)
         seen_urls: set[str] = set()
-        new_tracks = []
+        new_tracks: list[dict] = []
         # Concurrent fetch (governed by yt search semaphore + per-search throttle)
         fetch_coros = [_fetch(i, info) for i, info in enumerate(recs)]
         fetched_results = await asyncio.gather(*fetch_coros, return_exceptions=True)
-        for t in fetched_results:
-            if isinstance(t, Exception):
-                logger.debug("radio.fill: fetch error (ignored): %s", t)
-                continue
-            if t is None:
-                continue
-            sid = t.get("spotify_id")
-            url = t.get("url", "")
-            dedup_key = sid if sid else f"url_{url}"
-            if dedup_key in played_set or url in seen_urls:
-                continue
-            seen_urls.add(url)
-            new_tracks.append(t)
-            queues.setdefault(gid, collections.deque())
-            queues[gid].append(t)
-            await _try_early_play(
-                gid, guild, vc, text_channel,
-                early_play=early_play, triggered=early_play_triggered,
-            )
-            if len(new_tracks) >= needed:
-                break
+        await _accept_fetched(fetched_results, blocked=blocked, seen_urls=seen_urls, dest=new_tracks)
 
-        if not new_tracks:
-            ids = _played_ids.get(gid, [])
-            if ids:
-                keep = ids[-200:]
-                _played_ids[gid] = keep
-                _save_played_ids()
-                logger.warning(
-                    "radio.fill: played_ids saturado para guild=%s, trimming a 200 y reintentando",
-                    gid,
+        # Second pass: wider hybrid fetch (fresh random offsets) — do NOT wipe history.
+        if len(new_tracks) < needed:
+            more = await _get_recommendations_hybrid(
+                seed_tracks, seed_genres, limit=rec_limit + 10,
+            )
+            if more:
+                more_fetched = await asyncio.gather(
+                    *[_fetch(i, info) for i, info in enumerate(more)],
+                    return_exceptions=True,
                 )
-                retry_played_set = set(keep)
-                for i, info in enumerate(recs):
-                    t = await _fetch(i, info)
-                    if t is None:
+                await _accept_fetched(
+                    more_fetched, blocked=blocked, seen_urls=seen_urls, dest=new_tracks,
+                )
+
+        # Soft recycle only if the niche pool is exhausted (drop oldest 40%).
+        if len(new_tracks) < needed:
+            ids = _played_ids.get(gid, [])
+            if len(ids) > 30:
+                keep_n = max(20, int(len(ids) * 0.6))
+                _played_ids[gid] = ids[-keep_n:]
+                _save_played_ids()
+                logger.info(
+                    "radio.fill: soft-recycle played_ids guild=%s keep=%d (pool exhausted)",
+                    gid, keep_n,
+                )
+                blocked = blocked_keys_for_guild(gid)
+                for t in fetched_results:
+                    if len(new_tracks) >= needed:
+                        break
+                    if not isinstance(t, dict) or t is None:
                         continue
-                    sid = t.get("spotify_id")
                     url = t.get("url", "")
-                    dedup_key = sid if sid else f"url_{url}"
-                    if dedup_key in retry_played_set or url in seen_urls:
+                    if track_is_recently_played(t, blocked) or (url and url in seen_urls):
                         continue
-                    seen_urls.add(url)
+                    if url:
+                        seen_urls.add(url)
                     new_tracks.append(t)
                     queues.setdefault(gid, collections.deque())
                     queues[gid].append(t)
+                    _remember_played_keys(gid, t, persist=True)
+                    blocked.update(played_keys_for_track(t))
                     await _try_early_play(
                         gid, guild, vc, text_channel,
                         early_play=early_play, triggered=early_play_triggered,
                     )
-                    if len(new_tracks) >= needed:
-                        break
 
         if not new_tracks:
-            logger.warning("radio.fill: ninguna recomendacion encontrada en YouTube para guild=%s", gid)
+            logger.warning(
+                "radio.fill: ninguna recomendacion nueva para guild=%s "
+                "(todas ya tocadas/en cola; blocked=%d)",
+                gid, len(blocked),
+            )
             return
 
         logger.info("radio.fill: %d canciones añadidas a la cola de guild=%s", len(new_tracks), gid)

@@ -108,6 +108,42 @@ class FrontOffsetEnqueueTests(unittest.TestCase):
         self.assertEqual([t["title"] for t in session.queue], ["A", "B", "C"])
 
 
+class AwaitUnlessAbortedTests(unittest.IsolatedAsyncioTestCase):
+    async def test_returns_result_when_not_aborted(self):
+        import src.request_channel as rc
+
+        async def slow():
+            await asyncio.sleep(0.05)
+            return "ok"
+
+        result = await rc._await_unless_aborted(slow(), lambda: False, poll_sec=0.02)
+        self.assertEqual(result, "ok")
+
+    async def test_cancels_when_abort_flips(self):
+        import src.request_channel as rc
+
+        aborted = False
+
+        async def slow():
+            await asyncio.sleep(2.0)
+            return "late"
+
+        async def flip():
+            nonlocal aborted
+            await asyncio.sleep(0.05)
+            aborted = True
+
+        flip_task = asyncio.create_task(flip())
+        t0 = asyncio.get_event_loop().time()
+        result = await rc._await_unless_aborted(
+            slow(), lambda: aborted, poll_sec=0.02
+        )
+        elapsed = asyncio.get_event_loop().time() - t0
+        await flip_task
+        self.assertIsNone(result)
+        self.assertLess(elapsed, 1.0)
+
+
 class ExecutePlanPlayEarlyTests(unittest.IsolatedAsyncioTestCase):
     async def test_play_next_after_first_resolve_not_after_all(self):
         """First match must start playback before later queries finish resolving."""

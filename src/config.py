@@ -583,7 +583,37 @@ YOUTUBE_TITLE_NOISE_TERMS = {
     "full",
 }
 YOUTUBE_TITLE_VARIANT_TERMS = {"live", "remix", "cover", "karaoke", "acoustic", "instrumental"}
+# Prefer studio releases over lessons / play-throughs / fan uploads.
 YOUTUBE_PREFERRED_CHANNEL_HINTS = ("topic", "vevo", "official", "records", "music")
+# Heavy penalties if present in title/uploader (not mere noise tokens).
+YOUTUBE_BAD_RESULT_PATTERNS = (
+    r"play[\s\-]?through",
+    r"playthrough",
+    r"guitar\s+cover",
+    r"drum\s+cover",
+    r"bass\s+cover",
+    r"piano\s+cover",
+    r"cover\s+by",
+    r"reaction",
+    r"\breacts?\b",
+    r"nightcore",
+    r"slowed(?:\s*\+?\s*reverb)?",
+    r"8d\s+audio",
+    r"full\s+album",
+    r"hour\s+(?:long|version|mix)",
+    r"guitar\s+lesson",
+    r"how\s+to\s+play",
+    r"tutorial",
+    r"gameplay",
+    r"fan[\s\-]?made",
+)
+YOUTUBE_GOOD_RESULT_PATTERNS = (
+    r"\bofficial\s+(?:music\s+)?video\b",
+    r"\bofficial\s+audio\b",
+    r"\btopic\b",
+    r"\bvevo\b",
+    r"\bremaster(?:ed)?\b",
+)
 MIN_SPOTIFY_REFINEMENT_SCORE = 7.5
 
 

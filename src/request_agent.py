@@ -61,7 +61,14 @@ Reglas:
 - En "enqueue.queries" usá SIEMPRE búsquedas específicas: "Artista - Título de la canción".
   Nunca pongas solo un género, "mix", "playlist" o frases vagas en queries.
 - Si piden un género o "música de X", usá genre_playlist (no enqueue genérico).
-- Conservá el pedido del usuario cuando ya trae artista y tema concretos.
+- FIDELIDAD AL TÍTULO (crítico):
+  * Si el usuario nombra un tema, copiá ESE título (corregí typos obvios: mountaind→mountain,
+    "mi mind"→"my mind"). NUNCA lo reemplaces por otro hit del mismo artista
+    (ej. NO cambiar "My Mind Is a Mountain" por "My Own Summer").
+  * Si no estás seguro del título exacto, usá las palabras del usuario, no inventes un clásico.
+  * Varios temas en un mensaje ("X and Y", "X y Z", comas) → una query por tema.
+  * Ejemplo: "Deftones mi mind is a mountaind and Green Day basket case"
+    → queries: ["Deftones - My Mind Is a Mountain", "Green Day - Basket Case"]
 """
 
 

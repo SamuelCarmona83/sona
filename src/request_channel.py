@@ -113,6 +113,73 @@ def _can_apply_or_cancel(user_id: int, author_id: int) -> bool:
     return user_id == author_id or _is_admin(user_id)
 
 
+async def _ack_interaction(interaction: discord.Interaction) -> bool:
+    """Defer a component interaction; return False if the token already expired.
+
+    Discord requires a response within ~3s. If the event loop was busy (yt-dlp),
+    defer raises NotFound (10062). Callers must still run cancel/apply logic.
+    """
+    try:
+        if interaction.response.is_done():
+            return True
+        await interaction.response.defer()
+        return True
+    except discord.NotFound:
+        logger.warning(
+            "request_channel: interaction expired (10062) — continuing action offline"
+        )
+        return False
+    except discord.HTTPException as exc:
+        logger.warning("request_channel: interaction ack failed: %s", exc)
+        return False
+
+
+async def _await_unless_aborted(coro, should_abort, *, poll_sec: float = 0.25):
+    """Await *coro* but cancel it as soon as should_abort() is true.
+
+    yt-dlp work in a worker thread may keep running until the thread finishes,
+    but the plan loop unblocks immediately so Cancel feels responsive.
+    """
+    if should_abort is not None:
+        try:
+            if should_abort():
+                # Close coroutine if never started
+                if asyncio.iscoroutine(coro):
+                    coro.close()
+                return None
+        except Exception:
+            pass
+
+    task = asyncio.ensure_future(coro)
+    try:
+        while not task.done():
+            if should_abort is not None:
+                try:
+                    aborted = bool(should_abort())
+                except Exception:
+                    aborted = False
+                if aborted:
+                    task.cancel()
+                    try:
+                        await task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                    return None
+            try:
+                await asyncio.wait({task}, timeout=poll_sec)
+            except Exception:
+                break
+        if task.cancelled():
+            return None
+        exc = task.exception() if not task.cancelled() else None
+        if exc is not None:
+            raise exc
+        return task.result()
+    except asyncio.CancelledError:
+        task.cancel()
+        raise
+
+
 def _status_emoji(status: str) -> str:
     return {
         "pending": "⏸",
@@ -326,6 +393,11 @@ class PlanView(discord.ui.View):
             await self._edit(embed=self.build_embed(), view=self)
             self.stop()
 
+    def _lock_all_buttons(self) -> None:
+        for item in self.children:
+            if isinstance(item, discord.ui.Button):
+                item.disabled = True
+
     async def _cancel(self) -> None:
         """Abort pending timer and/or in-flight execute_plan."""
         self._abort.set()
@@ -341,20 +413,23 @@ class PlanView(discord.ui.View):
             prev,
             self.phase,
         )
-        # If apply is running, let it wind down via should_abort; update UI now
-        if prev == "apply" or self.phase == "running":
-            self.phase = "cancelled"
-            self.result_notes.append("Cancelado — se detiene el resolve.")
+        was_running = prev == "apply" or self.phase == "running"
+        self.phase = "cancelled"
+        # Free the guild immediately so a new request is not stuck behind a dying plan.
+        _pending_guilds.discard(self.guild_id)
+        self._lock_all_buttons()
+        self._update_auto_button()
+
+        # Mid-apply: execute_plan watches should_abort / interruptible resolve.
+        # _apply's finally will stop the view; we still refresh UI now.
+        if was_running:
+            if not any("Cancelado" in n for n in self.result_notes):
+                self.result_notes.append("Cancelado — se detiene el resolve.")
             await self._edit(embed=self.build_embed(), view=self)
             return
 
-        self.phase = "cancelled"
-        self.result_notes.append("Cancelado por el usuario.")
-        _pending_guilds.discard(self.guild_id)
-        self._disable_decision_buttons()
-        for item in self.children:
-            if isinstance(item, discord.ui.Button) and item.label == "Cancelar":
-                item.disabled = True
+        if not any("Cancelado" in n for n in self.result_notes):
+            self.result_notes.append("Cancelado por el usuario.")
         await self._edit(embed=self.build_embed(), view=self)
         self.stop()
 
@@ -362,22 +437,44 @@ class PlanView(discord.ui.View):
     @discord.ui.button(label="Aplicar", style=discord.ButtonStyle.success, row=0)
     async def apply_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not _can_apply_or_cancel(interaction.user.id, self.author_id):
-            await interaction.response.send_message(
-                "Solo quien pidió el plan o un admin puede aplicar.", ephemeral=True
-            )
+            try:
+                await interaction.response.send_message(
+                    "Solo quien pidió el plan o un admin puede aplicar.", ephemeral=True
+                )
+            except (discord.NotFound, discord.HTTPException):
+                pass
             return
-        await interaction.response.defer()
+        await _ack_interaction(interaction)
         await self._apply(reason="button")
 
     @discord.ui.button(label="Cancelar", style=discord.ButtonStyle.danger, row=0)
     async def cancel_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not _can_apply_or_cancel(interaction.user.id, self.author_id):
-            await interaction.response.send_message(
-                "Solo quien pidió el plan o un admin puede cancelar.", ephemeral=True
-            )
+            try:
+                await interaction.response.send_message(
+                    "Solo quien pidió el plan o un admin puede cancelar.", ephemeral=True
+                )
+            except (discord.NotFound, discord.HTTPException):
+                pass
             return
-        await interaction.response.defer()
-        await self._cancel()
+        acked = await _ack_interaction(interaction)
+        try:
+            await self._cancel()
+        except Exception:
+            logger.exception("request_channel: cancel handler failed")
+            if acked:
+                try:
+                    await interaction.followup.send(
+                        "No pude cancelar el plan (error interno).", ephemeral=True
+                    )
+                except (discord.NotFound, discord.HTTPException):
+                    pass
+            return
+        if acked:
+            try:
+                await interaction.followup.send("Plan cancelado.", ephemeral=True)
+            except (discord.NotFound, discord.HTTPException):
+                pass
 
     @discord.ui.button(label="Auto: off", style=discord.ButtonStyle.secondary, row=0)
     async def auto_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -753,7 +850,11 @@ async def execute_plan(
                 track_items[j]["status"] = "skipped"
             break
         try:
-            track = await _resolve_one_query(query, requester)
+            # Interruptible: Cancel unblocks without waiting for full yt-dlp search.
+            track = await _await_unless_aborted(
+                _resolve_one_query(query, requester),
+                should_abort,
+            )
         except Exception as exc:
             logger.warning("request_channel: resolve failed q=%r: %s", query, exc)
             track = None

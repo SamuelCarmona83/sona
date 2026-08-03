@@ -97,13 +97,23 @@ async def _watchdog_loop() -> None:
                 status = get_cookie_status()
                 age = status["age_h"]
                 age_str = f"{age:.0f}h" if age is not None else "desconocida"
+                from src.youtube import is_youtube_auth_failed
+                auth_note = ""
+                if is_youtube_auth_failed():
+                    auth_note = (
+                        "\nYouTube respondió **bot-check** aunque haya cookies montadas. "
+                        "En GCE esto suele ser **bloqueo por IP de datacenter**, no un "
+                        "archivo vacío. Opciones: re-exportar sesión fresca de Chrome "
+                        "logueado en youtube.com, esperar cooldown, o usar library local.\n"
+                    )
                 await _send_admin_alert(
                     ":warning: **Cookies de YouTube necesitan atención**\n"
                     f"Edad del archivo: **{age_str}** (máx recomendado: {YTDL_COOKIE_MAX_AGE_HOURS}h)\n"
+                    f"{auth_note}"
                     "En el Mac, ejecuta:\n"
-                    "```\n./refresh_cookies.sh chrome\n```\n"
-                    "El bot detectará el cambio automáticamente (sin reiniciar Docker).\n"
-                    "Mientras tanto, la biblioteca local y fallbacks sin login siguen activos."
+                    "```\n./refresh_cookies.sh --deploy\n```\n"
+                    "El bot recarga cookies al recrear o al cambiar mtime del archivo.\n"
+                    "Mientras tanto, la biblioteca local sigue activa."
                 )
         except asyncio.CancelledError:
             raise

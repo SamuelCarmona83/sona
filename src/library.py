@@ -396,15 +396,52 @@ def _is_pinned(entry: dict) -> bool:
     return entry.get("play_count", 0) >= LIBRARY_MIN_PLAYS_TO_PIN
 
 
+def _tid_from_track_dict(track: dict | None) -> str | None:
+    if not track:
+        return None
+    for key in ("track_id", "library_id", "tid"):
+        val = track.get(key)
+        if val:
+            return str(val)
+    vid = track.get("video_id")
+    if vid:
+        s = str(vid)
+        return s if s.startswith("yt_") else f"yt_{s}"
+    return None
+
+
+def _active_session_tids() -> set[str]:
+    """Tids currently playing or queued — never reclaim these mid-session."""
+    protected: set[str] = set()
+    try:
+        from src.playback import guild_sessions
+
+        for sess in guild_sessions.values():
+            tid = _tid_from_track_dict(sess.now_playing)
+            if tid:
+                protected.add(tid)
+            for track in list(getattr(sess, "queue", None) or []):
+                tid = _tid_from_track_dict(track)
+                if tid:
+                    protected.add(tid)
+    except Exception:
+        pass
+    return protected
+
+
 def _pick_eviction_victim(
     *,
     protect_tid: str | None = None,
+    protect_tids: set[str] | None = None,
     allow_pins: bool = False,
 ) -> str | None:
     """Return the LRU track id eligible for eviction, or None."""
+    blocked = set(protect_tids or ())
+    if protect_tid:
+        blocked.add(protect_tid)
     candidates: list[tuple[float, str]] = []
     for tid, entry in _index.items():
-        if protect_tid and tid == protect_tid:
+        if tid in blocked:
             continue
         if _is_pinned(entry) and not allow_pins:
             continue
@@ -426,7 +463,8 @@ def reclaim_disk(
     Source of truth for disk pressure is ``disk_free_mb()`` on the library
     filesystem, plus ``LIBRARY_MAX_MB`` / ``LIBRARY_MAX_TRACKS``. When free
     space starts below ``LIBRARY_MIN_FREE_MB``, reclaim until
-    ``LIBRARY_TARGET_FREE_MB`` (hysteresis). Never deletes *protect_tid*.
+    ``LIBRARY_TARGET_FREE_MB`` (hysteresis). Never deletes *protect_tid*,
+    nor tracks that are currently playing / queued.
     """
     stats = {
         "evicted": 0,
@@ -440,6 +478,9 @@ def reclaim_disk(
         return stats
 
     free_pressure = disk_free_mb() < LIBRARY_MIN_FREE_MB
+    session_protect = _active_session_tids()
+    if protect_tid:
+        session_protect.add(protect_tid)
 
     def _needs_more() -> bool:
         if len(_index) > LIBRARY_MAX_TRACKS:
@@ -454,10 +495,18 @@ def reclaim_disk(
         return free < target
 
     while _needs_more():
-        victim = _pick_eviction_victim(protect_tid=protect_tid, allow_pins=False)
+        victim = _pick_eviction_victim(
+            protect_tid=protect_tid,
+            protect_tids=session_protect,
+            allow_pins=False,
+        )
         used_emergency = False
         if victim is None and LIBRARY_EMERGENCY_EVICT_PINS and disk_free_mb() < LIBRARY_MIN_FREE_MB:
-            victim = _pick_eviction_victim(protect_tid=protect_tid, allow_pins=True)
+            victim = _pick_eviction_victim(
+                protect_tid=protect_tid,
+                protect_tids=session_protect,
+                allow_pins=True,
+            )
             used_emergency = victim is not None
         if victim is None:
             logger.warning(
@@ -1456,12 +1505,23 @@ async def get_radio_candidates(
             if mood_cluster:
                 break
 
+    try:
+        from src.radio import blocked_keys_for_guild, track_is_recently_played
+        blocked = blocked_keys_for_guild(guild_id)
+    except Exception:
+        blocked = set()
+
     candidates: list[tuple[int, dict, str]] = []
     for tid, entry in _index.items():
         path = pathlib.Path(entry.get("file_path", ""))
         if not path.is_file():
             continue
+        stub = track_from_entry(tid, entry, requester="📻 Radio (local)")
+        if blocked and track_is_recently_played(stub, blocked):
+            continue
         score = entry.get("play_count", 0) * 2 + entry.get("request_count", 0)
+        # Prefer less-recently-played for variety
+        score -= int(entry.get("last_played") or 0) % 1000
         if mood_cluster and entry.get("artist_id"):
             try:
                 from src.radio import get_track_cluster
@@ -1476,7 +1536,7 @@ async def get_radio_candidates(
         return []
 
     candidates.sort(key=lambda x: x[0], reverse=True)
-    top_pool = candidates[: max(limit * 3, 15)]
+    top_pool = candidates[: max(limit * 4, 20)]
     random.shuffle(top_pool)
     selected = top_pool[:limit]
 

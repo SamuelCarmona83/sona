@@ -5,6 +5,8 @@ import unicodedata
 
 from src.config import (
     MIN_SEARCH_SCORE,
+    YOUTUBE_BAD_RESULT_PATTERNS,
+    YOUTUBE_GOOD_RESULT_PATTERNS,
     YOUTUBE_PREFERRED_CHANNEL_HINTS,
     YOUTUBE_TITLE_NOISE_TERMS,
     YOUTUBE_TITLE_VARIANT_TERMS,
@@ -222,6 +224,17 @@ def _score_candidate(query: str, candidate: dict) -> float:
 
     if candidate.get("is_live") is True:
         score -= 10.0
+
+    # Play-throughs, lessons, reactions, etc. often match tokens but are not the song.
+    for pat in YOUTUBE_BAD_RESULT_PATTERNS:
+        if re.search(pat, normalized_blob, re.IGNORECASE):
+            score -= 8.0
+            break  # one heavy hit is enough
+
+    for pat in YOUTUBE_GOOD_RESULT_PATTERNS:
+        if re.search(pat, normalized_blob, re.IGNORECASE):
+            score += 2.0
+            break
 
     uploader_normalized = _normalize_text(candidate_uploader)
     if any(hint in uploader_normalized for hint in YOUTUBE_PREFERRED_CHANNEL_HINTS):

@@ -510,6 +510,10 @@ async def _search_youtube_candidates(query: str, *, urgent: bool = False) -> lis
         candidates = _search_sync(query, YTDL_OPTIONS)
         if candidates or is_youtube_rate_limited():
             return candidates
+        # One cookieless try (android_vr clients) — skip if we already know the
+        # session/IP is bot-checked so we do not double-hit YouTube.
+        if is_youtube_auth_failed():
+            return candidates
         if _should_try_cookieless():
             logger.info("_search_candidates: retrying '%s' without cookies", query[:60])
             fallback = _search_sync(query, YTDL_OPTIONS_NO_COOKIES)
@@ -521,12 +525,25 @@ async def _search_youtube_candidates(query: str, *, urgent: bool = False) -> lis
     return await _run_rate_limited_yt_request(_search, f"search {query[:60]}", urgent=urgent)
 
 
+def _youtube_search_blocked() -> bool:
+    """True when further yt-dlp searches would only spam bot-check errors."""
+    return is_youtube_rate_limited() or is_youtube_auth_failed()
+
+
 async def get_search_candidates(query: str) -> list[dict]:
     """Get top 5 search candidates for user selection (no auto-selection)."""
-    if is_youtube_rate_limited():
-        logger.info("get_search_candidates: omitiendo busqueda (rate-limited) para '%s'", query)
+    if _youtube_search_blocked():
+        logger.info(
+            "get_search_candidates: omitiendo busqueda (auth/rate-limit) para '%s'",
+            query,
+        )
         return []
     for candidate_query in _build_search_queries(query):
+        if _youtube_search_blocked():
+            logger.info(
+                "get_search_candidates: stop variants — YouTube bot-check/rate-limit activo"
+            )
+            break
         candidates = await _search_youtube_candidates(candidate_query)
         if not candidates:
             continue
@@ -583,14 +600,23 @@ async def search_youtube(
             logger.info("search_youtube: rate-limited, metadata sin URL para '%s'", query)
             return _metadata_to_candidate(meta, url=None)
 
-    if is_youtube_rate_limited():
-        logger.info("search_youtube: omitiendo busqueda (rate-limited) para '%s'", query)
+    if _youtube_search_blocked():
+        why = "rate-limited" if is_youtube_rate_limited() else "auth/bot-check"
+        logger.info("search_youtube: omitiendo busqueda (%s) para '%s'", why, query)
         return None
 
     best_overall: dict | None = None  # track the best candidate across all queries
 
     used_urgent = False
     for candidate_query in _build_search_queries(query):
+        # After the first bot-check, more query variants only worsen the ban.
+        if _youtube_search_blocked():
+            logger.info(
+                "search_youtube: stop variants for '%s' — YouTube bot-check/rate-limit activo "
+                "(cookies mounted does not always work from datacenter IPs)",
+                query,
+            )
+            break
         use_urgent = urgent and not used_urgent
         candidates = await _search_youtube_candidates(candidate_query, urgent=use_urgent)
         if use_urgent:
