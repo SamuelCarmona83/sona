@@ -133,23 +133,30 @@ class PlanView(discord.ui.View):
         track_items: list[dict[str, str]],
         timeout: float,
     ):
-        super().__init__(timeout=timeout)
+        # View timeout only disables UI; apply is owned by our countdown task.
+        # Use None so discord.py does not auto-apply / race with Cancel.
+        super().__init__(timeout=None)
         self.guild_id = guild_id
         self.author_id = author_id
         self.plan = plan
         self.track_items = track_items  # {label, status}
         self.message: discord.Message | None = None
-        self._settled = False
-        self._apply_task: asyncio.Task | None = None
+        self._decision_lock = asyncio.Lock()
+        self._decision: str | None = None  # None | "apply" | "cancel"
+        self._abort = asyncio.Event()  # set on Cancel — stops execute mid-flight
         self._timer_task: asyncio.Task | None = None
+        self._apply_task: asyncio.Task | None = None
         self.phase = "pending"  # pending | running | done | cancelled
         self.result_notes: list[str] = []
         self._update_auto_button()
 
+    def is_aborted(self) -> bool:
+        return self._abort.is_set()
+
     def _update_auto_button(self) -> None:
         auto = get_auto_apply(self.guild_id)
         for item in self.children:
-            if isinstance(item, discord.ui.Button) and item.custom_id == "req_auto":
+            if isinstance(item, discord.ui.Button) and (item.label or "").startswith("Auto:"):
                 item.label = f"Auto: {'on' if auto else 'off'}"
                 item.style = (
                     discord.ButtonStyle.success if auto else discord.ButtonStyle.secondary
@@ -233,19 +240,19 @@ class PlanView(discord.ui.View):
 
     async def start_timer_or_auto(self) -> None:
         if get_auto_apply(self.guild_id):
-            await self._apply(reason="auto")
+            self._apply_task = asyncio.create_task(self._apply(reason="auto"))
             return
         self._timer_task = asyncio.create_task(self._countdown())
 
     async def _countdown(self) -> None:
         remaining = REQUEST_CONFIRM_TIMEOUT_SEC
         try:
-            while remaining > 0 and not self._settled:
+            while remaining > 0 and self._decision is None and not self.is_aborted():
                 await self._edit(embed=self.build_embed(seconds_left=remaining), view=self)
                 step = 5 if remaining > 10 else 1
                 await asyncio.sleep(min(step, remaining))
                 remaining -= step
-            if not self._settled:
+            if self._decision is None and not self.is_aborted():
                 await self._apply(reason="timeout")
         except asyncio.CancelledError:
             return
@@ -257,13 +264,39 @@ class PlanView(discord.ui.View):
             self._timer_task.cancel()
         self._timer_task = None
 
+    def _disable_decision_buttons(self) -> None:
+        for item in self.children:
+            if not isinstance(item, discord.ui.Button):
+                continue
+            cid = getattr(item, "custom_id", None) or ""
+            # Match by label when custom_id is auto-generated
+            if cid in ("req_apply", "req_cancel") or item.label in ("Aplicar", "Cancelar"):
+                item.disabled = True
+
     async def _apply(self, *, reason: str) -> None:
-        if self._settled:
-            return
-        self._settled = True
+        async with self._decision_lock:
+            if self._decision == "cancel" or self.is_aborted():
+                logger.info("request_channel: apply skipped (cancelled) reason_was=%s", reason)
+                return
+            if self._decision == "apply":
+                return
+            self._decision = "apply"
         self._cancel_timer()
+        if self.is_aborted():
+            return
         self.phase = "running"
+        self._disable_decision_buttons()
+        # Cancel stays enabled so user can abort mid-resolve
+        for item in self.children:
+            if isinstance(item, discord.ui.Button) and item.label == "Cancelar":
+                item.disabled = False
         await self._edit(embed=self.build_embed(), view=self)
+        logger.info(
+            "request_channel: applying plan guild=%s reason=%s actions=%s",
+            self.guild_id,
+            reason,
+            [a.get("type") for a in self.plan.actions],
+        )
         try:
             await execute_plan(
                 self.guild_id,
@@ -271,42 +304,62 @@ class PlanView(discord.ui.View):
                 self.plan,
                 track_items=self.track_items,
                 notes_out=self.result_notes,
+                should_abort=self.is_aborted,
             )
-            self.phase = "done"
+            if self.is_aborted():
+                self.phase = "cancelled"
+                if not any("Cancelado" in n for n in self.result_notes):
+                    self.result_notes.append("Cancelado durante la ejecución.")
+            else:
+                self.phase = "done"
         except Exception as exc:
             logger.exception("request_channel: execute failed: %s", exc)
             self.result_notes.append(f"Error: {exc}")
-            self.phase = "done"
+            self.phase = "cancelled" if self.is_aborted() else "done"
         finally:
             _pending_guilds.discard(self.guild_id)
+            self._disable_decision_buttons()
+            for item in self.children:
+                if isinstance(item, discord.ui.Button) and item.label == "Cancelar":
+                    item.disabled = True
             self._update_auto_button()
             await self._edit(embed=self.build_embed(), view=self)
-            # Keep buttons visible but disable apply/cancel after settle
-            for item in self.children:
-                if isinstance(item, discord.ui.Button) and item.custom_id in (
-                    "req_apply",
-                    "req_cancel",
-                ):
-                    item.disabled = True
-            await self._edit(embed=self.build_embed(), view=self)
+            self.stop()
 
     async def _cancel(self) -> None:
-        if self._settled:
-            return
-        self._settled = True
+        """Abort pending timer and/or in-flight execute_plan."""
+        self._abort.set()
+        async with self._decision_lock:
+            prev = self._decision
+            if prev == "cancel":
+                return
+            self._decision = "cancel"
         self._cancel_timer()
+        logger.info(
+            "request_channel: cancel guild=%s prev_decision=%s phase=%s",
+            self.guild_id,
+            prev,
+            self.phase,
+        )
+        # If apply is running, let it wind down via should_abort; update UI now
+        if prev == "apply" or self.phase == "running":
+            self.phase = "cancelled"
+            self.result_notes.append("Cancelado — se detiene el resolve.")
+            await self._edit(embed=self.build_embed(), view=self)
+            return
+
         self.phase = "cancelled"
         self.result_notes.append("Cancelado por el usuario.")
         _pending_guilds.discard(self.guild_id)
+        self._disable_decision_buttons()
         for item in self.children:
-            if isinstance(item, discord.ui.Button) and item.custom_id in (
-                "req_apply",
-                "req_cancel",
-            ):
+            if isinstance(item, discord.ui.Button) and item.label == "Cancelar":
                 item.disabled = True
         await self._edit(embed=self.build_embed(), view=self)
+        self.stop()
 
-    @discord.ui.button(label="Aplicar", style=discord.ButtonStyle.success, custom_id="req_apply", row=0)
+    # No fixed custom_id: temporary views get unique IDs (avoids sticky handlers).
+    @discord.ui.button(label="Aplicar", style=discord.ButtonStyle.success, row=0)
     async def apply_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not _can_apply_or_cancel(interaction.user.id, self.author_id):
             await interaction.response.send_message(
@@ -316,7 +369,7 @@ class PlanView(discord.ui.View):
         await interaction.response.defer()
         await self._apply(reason="button")
 
-    @discord.ui.button(label="Cancelar", style=discord.ButtonStyle.danger, custom_id="req_cancel", row=0)
+    @discord.ui.button(label="Cancelar", style=discord.ButtonStyle.danger, row=0)
     async def cancel_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not _can_apply_or_cancel(interaction.user.id, self.author_id):
             await interaction.response.send_message(
@@ -326,7 +379,7 @@ class PlanView(discord.ui.View):
         await interaction.response.defer()
         await self._cancel()
 
-    @discord.ui.button(label="Auto: off", style=discord.ButtonStyle.secondary, custom_id="req_auto", row=0)
+    @discord.ui.button(label="Auto: off", style=discord.ButtonStyle.secondary, row=0)
     async def auto_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not _is_admin(interaction.user.id):
             await interaction.response.send_message(
@@ -337,11 +390,6 @@ class PlanView(discord.ui.View):
         set_auto_apply(self.guild_id, new_val)
         self._update_auto_button()
         await interaction.response.edit_message(embed=self.build_embed(), view=self)
-
-    async def on_timeout(self) -> None:
-        # discord.ui.View timeout — treat as apply if still pending
-        if not self._settled:
-            await self._apply(reason="view_timeout")
 
 
 def _track_from_library(tid: str, entry: dict, requester: str) -> dict:
@@ -522,10 +570,23 @@ async def execute_plan(
     *,
     track_items: list[dict[str, str]],
     notes_out: list[str],
+    should_abort: Any | None = None,
 ) -> None:
+    def _aborted() -> bool:
+        if should_abort is None:
+            return False
+        try:
+            return bool(should_abort())
+        except Exception:
+            return False
+
     guild = bot.get_guild(guild_id)
     if guild is None:
         notes_out.append("Guild no disponible.")
+        return
+
+    if _aborted():
+        notes_out.append("Cancelado antes de ejecutar.")
         return
 
     member = guild.get_member(author_id)
@@ -536,12 +597,18 @@ async def execute_plan(
 
     # Apply set_auto first
     for action in plan.actions:
+        if _aborted():
+            notes_out.append("Cancelado.")
+            return
         if action["type"] == "set_auto":
             set_auto_apply(guild_id, bool(action.get("enabled")))
             notes_out.append(f"Auto → {'on' if action.get('enabled') else 'off'}")
 
     # Mutate queue (non-resolve)
     for action in plan.actions:
+        if _aborted():
+            notes_out.append("Cancelado antes de mutar la cola.")
+            return
         t = action["type"]
         if t == "move":
             track = move_queue_track(guild_id, int(action["from_pos"]), int(action["to_pos"]))
@@ -577,9 +644,16 @@ async def execute_plan(
             else:
                 notes_out.append("Skip: nada sonando.")
 
+    if _aborted():
+        notes_out.append("Cancelado.")
+        return
+
     # Expand enqueue / genre into queries then resolve
     resolve_jobs: list[tuple[str, str]] = []  # (label, position)
     for action in plan.actions:
+        if _aborted():
+            notes_out.append("Cancelado.")
+            return
         if action["type"] == "enqueue":
             pos = action.get("position") or "end"
             for q in action.get("queries") or []:
@@ -590,6 +664,9 @@ async def execute_plan(
                 int(action.get("count") or 1),
                 str(action.get("hints") or ""),
             )
+            if _aborted():
+                notes_out.append("Cancelado durante genre_playlist.")
+                return
             for q in genre_qs:
                 resolve_jobs.append((q, "end"))
 
@@ -599,7 +676,14 @@ async def execute_plan(
     for i, (label, _) in enumerate(resolve_jobs):
         if i < len(track_items):
             track_items[i]["label"] = label
-            track_items[i]["status"] = "running"
+            track_items[i]["status"] = "pending"
+
+    if _aborted():
+        for item in track_items:
+            if item.get("status") == "pending":
+                item["status"] = "skipped"
+        notes_out.append("Cancelado antes de buscar en YouTube.")
+        return
 
     vc = guild.voice_client
     if member and member.voice:
@@ -619,10 +703,25 @@ async def execute_plan(
             except Exception as exc:
                 notes_out.append(f"No pude moverme de voice: {exc}")
 
+    if _aborted():
+        for item in track_items:
+            if item.get("status") == "pending":
+                item["status"] = "skipped"
+        notes_out.append("Cancelado.")
+        return
+
     playback_active = bool(vc and (vc.is_playing() or vc.is_paused()))
     resolved_by_pos: dict[str, list[dict]] = {"end": [], "front": []}
 
     for i, (query, position) in enumerate(resolve_jobs):
+        if _aborted():
+            for j in range(i, len(track_items)):
+                if track_items[j].get("status") in ("pending", "running"):
+                    track_items[j]["status"] = "skipped"
+            notes_out.append(f"Cancelado tras {i}/{len(resolve_jobs)} búsquedas.")
+            break
+        if i < len(track_items):
+            track_items[i]["status"] = "running"
         slots_left = REQUEST_MAX_QUEUE_USER_TRACKS - count_user_tracks_in_queue(guild_id)
         already = sum(len(v) for v in resolved_by_pos.values())
         if slots_left - already <= 0:
@@ -637,6 +736,15 @@ async def execute_plan(
         except Exception as exc:
             logger.warning("request_channel: resolve failed q=%r: %s", query, exc)
             track = None
+        if _aborted():
+            if i < len(track_items):
+                track_items[i]["status"] = "skipped"
+            for j in range(i + 1, len(track_items)):
+                track_items[j]["status"] = "skipped"
+            notes_out.append("Cancelado — no se encola lo pendiente.")
+            # Do not keep the track we just resolved if abort won the race
+            track = None
+            break
         if not track:
             if i < len(track_items):
                 track_items[i]["status"] = "fail"
@@ -651,6 +759,11 @@ async def execute_plan(
         if i < len(track_items):
             track_items[i]["status"] = "ok"
             track_items[i]["label"] = track.get("title") or query
+
+    if _aborted():
+        # Drop any resolved-but-not-yet-enqueued tracks
+        notes_out.append("Cancelado: no se encolaron tracks.")
+        return
 
     # Enqueue front first, then end
     for pos in ("front", "end"):
