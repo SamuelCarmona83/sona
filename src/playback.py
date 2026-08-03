@@ -215,8 +215,14 @@ def enqueue_user_tracks(
     *,
     playback_active: bool,
     position: str = "end",
+    front_offset: int = 0,
 ) -> None:
-    """Insert user tracks; when radio is on and playing, keep them before radio fill."""
+    """Insert user tracks; when radio is on and playing, keep them before radio fill.
+
+    *front_offset*: when enqueuing front tracks one-by-one (play-as-you-resolve),
+    pass how many front tracks from this plan were already inserted so order is
+    preserved (0, then 1, then 2…). Batch calls can leave it at 0.
+    """
     from src import radio as _radio
 
     if not tracks:
@@ -225,15 +231,12 @@ def enqueue_user_tracks(
     items = list(session.queue)
     position = (position or "end").lower()
     if position == "front":
-        if _radio.is_radio_active(guild_id) and playback_active:
-            insert_at = 0
-            for offset, track in enumerate(tracks):
-                items.insert(insert_at + offset, track)
-            session.queue = collections.deque(items)
-        else:
-            for track in reversed(tracks):
-                items.insert(0, track)
-            session.queue = collections.deque(items)
+        # Always insert contiguously from front_offset so sequential singles
+        # keep resolve order (A then B → [A, B], not [B, A]).
+        insert_at = max(0, int(front_offset or 0))
+        for offset, track in enumerate(tracks):
+            items.insert(insert_at + offset, track)
+        session.queue = collections.deque(items)
         return
     if _radio.is_radio_active(guild_id) and playback_active:
         insert_at = first_radio_track_index(items)

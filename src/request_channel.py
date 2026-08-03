@@ -711,7 +711,28 @@ async def execute_plan(
         return
 
     playback_active = bool(vc and (vc.is_playing() or vc.is_paused()))
-    resolved_by_pos: dict[str, list[dict]] = {"end": [], "front": []}
+    enqueued_any = False
+    front_inserted = 0
+    started_playback = False
+
+    async def _kick_playback_if_idle() -> None:
+        """Start audio as soon as the first track is ready (do not wait for the full plan)."""
+        nonlocal playback_active, started_playback, vc
+        if started_playback or not guild or not text_channel:
+            return
+        if vc is None:
+            return
+        if vc.is_playing() or vc.is_paused():
+            playback_active = True
+            started_playback = True
+            return
+        try:
+            await play_next(guild, vc, text_channel)
+        except Exception as exc:
+            logger.warning("request_channel: early play_next failed: %s", exc)
+            return
+        playback_active = bool(vc.is_playing() or vc.is_paused())
+        started_playback = True
 
     for i, (query, position) in enumerate(resolve_jobs):
         if _aborted():
@@ -722,9 +743,9 @@ async def execute_plan(
             break
         if i < len(track_items):
             track_items[i]["status"] = "running"
+        # Tracks already enqueued count toward the user-queue cap.
         slots_left = REQUEST_MAX_QUEUE_USER_TRACKS - count_user_tracks_in_queue(guild_id)
-        already = sum(len(v) for v in resolved_by_pos.values())
-        if slots_left - already <= 0:
+        if slots_left <= 0:
             if i < len(track_items):
                 track_items[i]["status"] = "skipped"
             notes_out.append("Cola de usuario llena; resto omitido.")
@@ -742,8 +763,7 @@ async def execute_plan(
             for j in range(i + 1, len(track_items)):
                 track_items[j]["status"] = "skipped"
             notes_out.append("Cancelado — no se encola lo pendiente.")
-            # Do not keep the track we just resolved if abort won the race
-            track = None
+            # Track just resolved is not enqueued; already-playing tracks stay.
             break
         if not track:
             if i < len(track_items):
@@ -755,31 +775,37 @@ async def execute_plan(
                 notes_out.append(f"Sin match: {query}")
             continue
         record_request(track)
-        resolved_by_pos.setdefault(position, []).append(track)
+        pos = (position or "end").lower()
+        enqueue_user_tracks(
+            guild_id,
+            [track],
+            playback_active=playback_active,
+            position=pos,
+            front_offset=front_inserted if pos == "front" else 0,
+        )
+        if pos == "front":
+            front_inserted += 1
+        enqueued_any = True
         if i < len(track_items):
             track_items[i]["status"] = "ok"
             track_items[i]["label"] = track.get("title") or query
-
-    if _aborted():
-        # Drop any resolved-but-not-yet-enqueued tracks
-        notes_out.append("Cancelado: no se encolaron tracks.")
-        return
-
-    # Enqueue front first, then end
-    for pos in ("front", "end"):
-        batch = resolved_by_pos.get(pos) or []
-        if batch:
-            enqueue_user_tracks(
-                guild_id,
-                batch,
-                playback_active=playback_active,
-                position=pos,
-            )
+        # First successful resolve → start playback immediately; rest keep resolving.
+        await _kick_playback_if_idle()
 
     if text_channel and guild:
-        if vc and not playback_active and any(resolved_by_pos.values()):
-            await play_next(guild, vc, text_channel)
-        elif any(resolved_by_pos.values()) or any(
+        if enqueued_any:
+            # Fallback if early start failed (e.g. VC not ready on first track).
+            if vc and not (vc.is_playing() or vc.is_paused()):
+                try:
+                    await play_next(guild, vc, text_channel)
+                except Exception as exc:
+                    logger.warning("request_channel: final play_next failed: %s", exc)
+            else:
+                try:
+                    await refresh_player_embed_fresh(guild, text_channel)
+                except Exception:
+                    pass
+        elif any(
             a["type"] in ("move", "remove", "remove_match", "priority", "clear_user_tracks", "skip")
             for a in plan.actions
         ):

@@ -48,12 +48,37 @@ class SweepTempsAndOrphansTests(unittest.TestCase):
         part.write_bytes(b"partial")
         temp.write_bytes(b"tempdata")
         keep.write_bytes(b"good")
+        # Age-gate: only abandoned temps (not in-flight / not brand-new).
+        old = time.time() - 10_000
+        os.utime(part, (old, old))
+        os.utime(temp, (old, old))
 
         stats = library.sweep_library_temps()
         self.assertEqual(stats["removed"], 2)
         self.assertFalse(part.exists())
         self.assertFalse(temp.exists())
         self.assertTrue(keep.exists())
+
+    def test_sweep_temps_skips_pending_and_young(self) -> None:
+        pending_temp = self.lib_dir / "yt_live.temp.m4a"
+        young_temp = self.lib_dir / "yt_fresh.temp.m4a"
+        old_temp = self.lib_dir / "yt_old.temp.m4a"
+        pending_temp.write_bytes(b"downloading")
+        young_temp.write_bytes(b"just-started")
+        old_temp.write_bytes(b"abandoned")
+        old = time.time() - 10_000
+        os.utime(old_temp, (old, old))
+        # Even if mtime is old, pending must win.
+        os.utime(pending_temp, (old, old))
+        library._pending_downloads.add("yt_live")
+
+        stats = library.sweep_library_temps(min_age_sec=300)
+        self.assertEqual(stats["removed"], 1)
+        self.assertEqual(stats["skipped_pending"], 1)
+        self.assertGreaterEqual(stats["skipped_young"], 1)
+        self.assertTrue(pending_temp.exists())
+        self.assertTrue(young_temp.exists())
+        self.assertFalse(old_temp.exists())
 
     def test_sweep_orphan_index_drops_missing_files(self) -> None:
         missing = self.lib_dir / "yt_gone.m4a"
@@ -96,6 +121,18 @@ class SweepTempsAndOrphansTests(unittest.TestCase):
         stats = library.sweep_orphan_files(min_age_sec=60)
         self.assertEqual(stats["removed"], 0)
         self.assertTrue(pending.exists())
+
+    def test_sweep_orphan_index_skips_pending(self) -> None:
+        missing = self.lib_dir / "yt_pending.m4a"
+        library._index["yt_pending"] = {"file_path": str(missing), "title": "Pending"}
+        library._pending_downloads.add("yt_pending")
+        other_missing = self.lib_dir / "yt_gone.m4a"
+        library._index["yt_gone"] = {"file_path": str(other_missing), "title": "Gone"}
+
+        stats = library.sweep_orphan_index_entries()
+        self.assertEqual(stats["removed"], 1)
+        self.assertIn("yt_pending", library._index)
+        self.assertNotIn("yt_gone", library._index)
 
 
 class SweepDjAudioTests(unittest.TestCase):

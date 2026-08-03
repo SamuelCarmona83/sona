@@ -518,25 +518,65 @@ def _is_temp_artifact_name(name: str) -> bool:
     return False
 
 
-def sweep_library_temps() -> dict:
-    """Remove yt-dlp partials and temp remux artifacts under the library dir."""
+def _library_stem_from_name(name: str) -> str:
+    """Leading id for library files (``yt_xxx.temp.m4a`` → ``yt_xxx``)."""
+    return name.split(".", 1)[0]
+
+
+# Abandoned yt-dlp partials only; never touch in-flight downloads (see pending set).
+_LIBRARY_TEMP_MIN_AGE_SEC = 300
+
+
+def sweep_library_temps(*, min_age_sec: int | None = None) -> dict:
+    """Remove yt-dlp partials and temp remux artifacts under the library dir.
+
+    Skips stems in ``_pending_downloads`` so the reaper cannot delete a
+    ``.temp.m4a`` while yt-dlp is still remuxing (that race renames into ENOENT
+    and can stall the host). Age-gates the rest so a crashed download's temps
+    are cleaned after a few minutes without racing live writes.
+    """
+    age_gate = (
+        _LIBRARY_TEMP_MIN_AGE_SEC if min_age_sec is None else max(0, int(min_age_sec))
+    )
     removed = 0
     bytes_freed = 0
+    skipped_pending = 0
+    skipped_young = 0
     if not _LIBRARY_DIR.is_dir():
-        return {"removed": 0, "bytes_freed": 0}
+        return {"removed": 0, "bytes_freed": 0, "skipped_pending": 0, "skipped_young": 0}
+    now = time.time()
     for path in _LIBRARY_DIR.iterdir():
         if not path.is_file() or not _is_temp_artifact_name(path.name):
             continue
+        stem = _library_stem_from_name(path.name)
+        if stem in _pending_downloads:
+            skipped_pending += 1
+            continue
         try:
-            size = path.stat().st_size
+            st = path.stat()
+            if age_gate > 0 and (now - st.st_mtime) < age_gate:
+                skipped_young += 1
+                continue
+            size = st.st_size
             path.unlink()
             removed += 1
             bytes_freed += size
         except OSError as exc:
             logger.warning("library: could not remove temp %s: %s", path, exc)
-    if removed:
-        logger.info("library: swept %s temp artifacts (%s bytes)", removed, bytes_freed)
-    return {"removed": removed, "bytes_freed": bytes_freed}
+    if removed or skipped_pending:
+        logger.info(
+            "library: swept %s temp artifacts (%s bytes) skipped_pending=%s skipped_young=%s",
+            removed,
+            bytes_freed,
+            skipped_pending,
+            skipped_young,
+        )
+    return {
+        "removed": removed,
+        "bytes_freed": bytes_freed,
+        "skipped_pending": skipped_pending,
+        "skipped_young": skipped_young,
+    }
 
 
 def sweep_orphan_index_entries() -> dict:
@@ -545,7 +585,8 @@ def sweep_orphan_index_entries() -> dict:
     stale = [
         tid
         for tid, entry in list(_index.items())
-        if not pathlib.Path(entry.get("file_path") or "").is_file()
+        if tid not in _pending_downloads
+        and not pathlib.Path(entry.get("file_path") or "").is_file()
     ]
     for tid in stale:
         del _index[tid]
@@ -584,7 +625,7 @@ def sweep_orphan_files(*, min_age_sec: int | None = None) -> dict:
             continue  # temps handled separately
         if path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".json"}:
             continue
-        stem = path.name.split(".", 1)[0]
+        stem = _library_stem_from_name(path.name)
         if stem in _pending_downloads or stem in referenced_stems:
             continue
         try:

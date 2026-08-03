@@ -1,9 +1,10 @@
 """Queue helpers used by the request agent (radio-aware enqueue)."""
 from __future__ import annotations
 
+import asyncio
 import collections
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from src.playback import (
     clear_user_tracks_from_queue,
@@ -14,6 +15,7 @@ from src.playback import (
     remove_queue_track_at,
     remove_queue_track_match,
 )
+from src.request_agent import RequestPlan
 
 
 class RequestQueueHelpersTests(unittest.TestCase):
@@ -86,6 +88,114 @@ class RequestSettingsTests(unittest.TestCase):
             rc.set_auto_apply(gid, False)
             self.assertFalse(rc.get_auto_apply(gid))
         rc._guild_auto.pop(gid, None)
+
+
+class FrontOffsetEnqueueTests(unittest.TestCase):
+    def test_sequential_front_preserves_order(self):
+        gid = 55
+        session = guild_session(gid)
+        session.queue = collections.deque()
+        with patch("src.radio.is_radio_active", return_value=False):
+            enqueue_user_tracks(
+                gid, [{"title": "A"}], playback_active=False, position="front", front_offset=0
+            )
+            enqueue_user_tracks(
+                gid, [{"title": "B"}], playback_active=False, position="front", front_offset=1
+            )
+            enqueue_user_tracks(
+                gid, [{"title": "C"}], playback_active=False, position="front", front_offset=2
+            )
+        self.assertEqual([t["title"] for t in session.queue], ["A", "B", "C"])
+
+
+class ExecutePlanPlayEarlyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_play_next_after_first_resolve_not_after_all(self):
+        """First match must start playback before later queries finish resolving."""
+        import src.request_channel as rc
+
+        gid = 777001
+        author_id = 42
+        session = guild_session(gid)
+        session.queue = collections.deque()
+        session.now_playing = None
+
+        plan = RequestPlan(
+            actions=[
+                {
+                    "type": "enqueue",
+                    "queries": ["Song One", "Song Two", "Song Three"],
+                    "position": "end",
+                }
+            ],
+            source="test",
+            model="test",
+        )
+        track_items = [
+            {"label": "Song One", "status": "pending"},
+            {"label": "Song Two", "status": "pending"},
+            {"label": "Song Three", "status": "pending"},
+        ]
+        notes: list[str] = []
+        resolve_order: list[str] = []
+        play_at_resolve_count: list[int] = []
+
+        async def fake_resolve(query: str, requester: str):
+            resolve_order.append(query)
+            # Simulate slow YT search so ordering of play_next is observable.
+            await asyncio.sleep(0)
+            return {
+                "title": query,
+                "yt_query": query,
+                "url": f"https://example.test/{query}",
+                "requester": requester,
+                "artist": "Test",
+                "duration": 120,
+            }
+
+        async def play_next_side_effect(guild, vc, text_channel):
+            play_at_resolve_count.append(len(resolve_order))
+            vc.is_playing = MagicMock(return_value=True)
+
+        play_next = AsyncMock(side_effect=play_next_side_effect)
+
+        guild = MagicMock()
+        guild.id = gid
+        member = MagicMock()
+        member.display_name = "Tester"
+        member.voice = None
+        guild.get_member.return_value = member
+        vc = MagicMock()
+        vc.is_playing.return_value = False
+        vc.is_paused.return_value = False
+        guild.voice_client = vc
+
+        with patch.object(rc, "bot") as bot_mock, patch.object(
+            rc, "_resolve_one_query", side_effect=fake_resolve
+        ), patch.object(rc, "play_next", play_next), patch.object(
+            rc, "record_request"
+        ), patch.object(
+            rc, "refresh_player_embed_fresh", new_callable=AsyncMock
+        ), patch(
+            "src.playback.bot.get_guild", return_value=guild
+        ):
+            bot_mock.get_guild.return_value = guild
+            bot_mock.get_channel.return_value = MagicMock()
+            await rc.execute_plan(
+                gid,
+                author_id,
+                plan,
+                track_items=track_items,
+                notes_out=notes,
+            )
+
+        self.assertEqual(resolve_order, ["Song One", "Song Two", "Song Three"])
+        # Early start: first play_next while only the first track was resolved.
+        self.assertGreaterEqual(play_next.await_count, 1)
+        self.assertEqual(play_at_resolve_count[0], 1)
+        self.assertEqual([t["status"] for t in track_items], ["ok", "ok", "ok"])
+        # All three should have been enqueued (first may have been consumed by play_next
+        # only if play_next mutates queue — our mock does not, so all three remain).
+        self.assertEqual(len(session.queue), 3)
 
 
 if __name__ == "__main__":
