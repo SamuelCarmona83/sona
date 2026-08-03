@@ -58,6 +58,10 @@ Reglas:
 - Si piden activar/desactivar modo auto, usa set_auto.
 - Preferí pocas acciones claras. Posiciones 1-based de la cola del contexto.
 - Si solo preguntan el estado del auto o la cola, reply + show_queue o actions vacías.
+- En "enqueue.queries" usá SIEMPRE búsquedas específicas: "Artista - Título de la canción".
+  Nunca pongas solo un género, "mix", "playlist" o frases vagas en queries.
+- Si piden un género o "música de X", usá genre_playlist (no enqueue genérico).
+- Conservá el pedido del usuario cuando ya trae artista y tema concretos.
 """
 
 
@@ -364,11 +368,21 @@ async def plan_from_llm(message: str, snapshot: dict, *, auto_enabled: bool, use
                 "model": model,
                 "messages": messages,
                 "timeout": REQUEST_AGENT_TIMEOUT_SEC,
+                # Slightly lower temp = more consistent "Artist - Title" queries
+                "temperature": 0.2,
             }
-            # Best-effort JSON mode; some models ignore/reject it
-            try:
-                resp = await litellm.acompletion(**kwargs, response_format={"type": "json_object"})
-            except Exception:
+            # Skip response_format by default: DeepSeek/xAI often reject it and
+            # a retry doubles latency. Parser already extracts JSON fences.
+            # Opt-in for providers that handle json_object well.
+            model_l = model.lower()
+            if model_l.startswith(("openai/", "gpt-", "azure/")):
+                try:
+                    resp = await litellm.acompletion(
+                        **kwargs, response_format={"type": "json_object"}
+                    )
+                except Exception:
+                    resp = await litellm.acompletion(**kwargs)
+            else:
                 resp = await litellm.acompletion(**kwargs)
             content = ""
             try:

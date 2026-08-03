@@ -344,8 +344,39 @@ class PlanView(discord.ui.View):
             await self._apply(reason="view_timeout")
 
 
+def _track_from_library(tid: str, entry: dict, requester: str) -> dict:
+    from src.library import entry_to_queue_track
+
+    return entry_to_queue_track(tid, entry, requester=requester)
+
+
+def _track_from_yt_and_spotify(yt_info: dict, spotify_info: dict, requester: str) -> dict:
+    artist, _ = _split_query_parts(spotify_info.get("query") or "")
+    refined = bool(spotify_info.get("spotify_refined"))
+    return {
+        "title": yt_info["title"],
+        "yt_query": spotify_info.get("query") or yt_info.get("title"),
+        "url": yt_info["url"],
+        "requester": requester,
+        "artist": artist or "Unknown",
+        "duration": yt_info.get("duration") or 0,
+        "thumbnail": yt_info.get("thumbnail") or "",
+        "cover_url": yt_info.get("cover_url") or "",
+        "spotify_id": spotify_info.get("spotify_id") if refined else None,
+        "artist_id": spotify_info.get("artist_id") if refined else None,
+        "spotify_refined": refined,
+        "video_id": yt_info.get("video_id"),
+        "webpage_url": yt_info.get("webpage_url", ""),
+        "acodec": yt_info.get("acodec", "?"),
+        "abr": yt_info.get("abr", 0),
+    }
+
+
 async def _resolve_one_query(query: str, requester: str) -> dict | None:
-    """Resolve a free-text / URL query to a single queue track dict."""
+    """Resolve a free-text / URL query to a single queue track dict.
+
+    Prefer library → Spotify-refined title → YouTube (no LLM tie-break for speed).
+    """
     query = (query or "").strip()
     if not query:
         return None
@@ -374,85 +405,113 @@ async def _resolve_one_query(query: str, requester: str) -> dict | None:
         if not infos:
             return None
         info = infos[0]
-        yt_info = await search_youtube(info["query"], enable_llm=True, trusted=True, urgent=True)
+        # Library hit on the refined query first
+        from src.library import search_index
+
+        lib_hits = search_index(info["query"], limit=1)
+        if lib_hits:
+            return _track_from_library(lib_hits[0][0], lib_hits[0][1], requester)
+        yt_info = await search_youtube(
+            info["query"], enable_llm=False, trusted=True, urgent=True
+        )
         if not yt_info:
             return None
-        artist, _ = _split_query_parts(info["query"])
-        return {
-            "title": yt_info["title"],
-            "yt_query": info["query"],
-            "url": yt_info["url"],
-            "requester": requester,
-            "artist": artist or "Unknown",
-            "duration": yt_info.get("duration") or 0,
-            "thumbnail": yt_info.get("thumbnail") or "",
-            "cover_url": yt_info.get("cover_url") or "",
-            "spotify_id": info.get("spotify_id"),
-            "artist_id": info.get("artist_id"),
-            "spotify_refined": True,
-            "video_id": yt_info.get("video_id"),
-            "webpage_url": yt_info.get("webpage_url", ""),
-            "acodec": yt_info.get("acodec", "?"),
-            "abr": yt_info.get("abr", 0),
-        }
+        return _track_from_yt_and_spotify(yt_info, info, requester)
 
     if re.search(r"https?://", query):
         return None
 
+    # Local library before network (fast + accurate for known tracks)
+    try:
+        from src.library import search_index
+
+        lib_hits = search_index(query, limit=1)
+        if lib_hits:
+            tid, entry = lib_hits[0]
+            logger.info("request_channel: library hit for %r → %s", query, tid)
+            return _track_from_library(tid, entry, requester)
+    except Exception as exc:
+        logger.debug("request_channel: library search failed: %s", exc)
+
     info = await _get_spotify_track_info(query)
+    # Prefer Spotify's canonical "Artist - Title" for YT matching
+    yt_query = info.get("query") or query
+    if info.get("spotify_refined"):
+        # Second library pass with refined name
+        try:
+            from src.library import search_index
+
+            lib_hits = search_index(yt_query, limit=1)
+            if lib_hits:
+                return _track_from_library(lib_hits[0][0], lib_hits[0][1], requester)
+        except Exception:
+            pass
+
     yt_info = await search_youtube(
-        info["query"],
-        enable_llm=True,
+        yt_query,
+        enable_llm=False,  # agent path: skip Anthropic tie-break (latency)
         trusted=bool(info.get("spotify_refined")),
         urgent=True,
     )
     if not yt_info:
         return None
-    artist, _ = _split_query_parts(info["query"])
-    return {
-        "title": yt_info["title"],
-        "yt_query": info["query"],
-        "url": yt_info["url"],
-        "requester": requester,
-        "artist": artist or "Unknown",
-        "duration": yt_info.get("duration") or 0,
-        "thumbnail": yt_info.get("thumbnail") or "",
-        "cover_url": yt_info.get("cover_url") or "",
-        "spotify_id": info.get("spotify_id") if info.get("spotify_refined") else None,
-        "artist_id": info.get("artist_id") if info.get("spotify_refined") else None,
-        "spotify_refined": bool(info.get("spotify_refined")),
-        "video_id": yt_info.get("video_id"),
-        "webpage_url": yt_info.get("webpage_url", ""),
-        "acodec": yt_info.get("acodec", "?"),
-        "abr": yt_info.get("abr", 0),
-    }
+    return _track_from_yt_and_spotify(yt_info, info, requester)
 
 
 async def _genre_queries(genre: str, count: int, hints: str) -> list[str]:
-    """Cheap proposal list (no heavy resolve). Prefer Spotify search if available."""
-    q = f"{genre} {hints}".strip()
+    """Propose specific 'Artist - Title' lines via Spotify; no vague filler queries."""
+    genre = (genre or "").strip()
+    hints = (hints or "").strip()
+    count = max(1, min(count, 10))
     queries: list[str] = []
+    seen: set[str] = set()
+
+    def _add_from_result(result: dict) -> None:
+        for item in (result.get("tracks") or {}).get("items") or []:
+            name = (item.get("name") or "").strip()
+            artists = ", ".join(
+                a.get("name", "") for a in (item.get("artists") or []) if a.get("name")
+            )
+            if not name:
+                continue
+            line = f"{artists} - {name}" if artists else name
+            key = line.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            queries.append(line)
+            if len(queries) >= count:
+                return
+
     try:
         from src.config import sp
 
         if sp is not None:
-            def _search():
-                return sp.search(q=q, type="track", limit=min(count, 10))
+            # Ordered attempts: specific → broader
+            search_terms = []
+            if hints:
+                search_terms.append(f"{genre} {hints}")
+            search_terms.append(genre)
+            # Spotify genre filter works for many mainstream tags
+            if " " not in genre and len(genre) < 32:
+                search_terms.append(f'genre:"{genre}"')
 
-            result = await asyncio.to_thread(_search)
-            for item in (result.get("tracks") or {}).get("items") or []:
-                name = item.get("name") or ""
-                artists = ", ".join(a.get("name", "") for a in (item.get("artists") or []))
-                if name:
-                    queries.append(f"{artists} - {name}" if artists else name)
+            for term in search_terms:
                 if len(queries) >= count:
                     break
+
+                def _search(q=term, limit=min(count * 2, 20)):
+                    return sp.search(q=q, type="track", limit=limit)
+
+                result = await asyncio.to_thread(_search)
+                _add_from_result(result or {})
     except Exception as exc:
         logger.debug("request_channel: genre spotify search failed: %s", exc)
 
-    while len(queries) < count:
-        n = len(queries) + 1
-        queries.append(f"{genre} mix song {n}" if not hints else f"{genre} {hints} {n}")
+    # Do not invent "mix song N" — bad YT matches. Return what we have.
+    if not queries:
+        # Last resort: one specific-looking seed the resolver can Spotify-refine
+        queries.append(f"{genre} {hints}".strip() or genre)
     return queries[:count]
 
 
@@ -671,40 +730,62 @@ async def handle_request_message(message: discord.Message) -> bool:
     except Exception:
         pass
 
+    _pending_guilds.add(gid)
+    thinking = discord.Embed(
+        title="🎧 Plan",
+        description="Pensando…",
+        color=0x5865F2,
+    )
+    thinking.set_footer(text="LLM + cola")
+    plan_msg: discord.Message | None = None
+    try:
+        plan_msg = await message.channel.send(embed=thinking)
+    except Exception as exc:
+        _pending_guilds.discard(gid)
+        logger.warning("request_channel: could not send thinking embed: %s", exc)
+        return True
+
     auto = get_auto_apply(gid)
     snapshot = build_queue_snapshot(gid)
     user_slots = max(0, REQUEST_MAX_QUEUE_USER_TRACKS - int(snapshot.get("queue_user_count") or 0))
 
-    plan = await build_request_plan(
-        content,
-        snapshot,
-        auto_enabled=auto,
-        user_slots_left=user_slots,
-    )
-    # Re-cap after latest queue
-    plan = validate_and_cap_plan(plan, user_slots_left=user_slots)
-
-    labels = planned_track_labels(plan)
-    track_items = [{"label": lab, "status": "pending"} for lab in labels]
-
-    timeout = float(REQUEST_CONFIRM_TIMEOUT_SEC)
-    view = PlanView(
-        guild_id=gid,
-        author_id=message.author.id,
-        plan=plan,
-        track_items=track_items,
-        timeout=timeout + 30,  # view outlives countdown slightly
-    )
-    _pending_guilds.add(gid)
-    embed = view.build_embed(seconds_left=None if auto else REQUEST_CONFIRM_TIMEOUT_SEC)
     try:
-        plan_msg = await message.channel.send(embed=embed, view=view)
+        plan = await build_request_plan(
+            content,
+            snapshot,
+            auto_enabled=auto,
+            user_slots_left=user_slots,
+        )
+        plan = validate_and_cap_plan(plan, user_slots_left=user_slots)
+
+        labels = planned_track_labels(plan)
+        track_items = [{"label": lab, "status": "pending"} for lab in labels]
+
+        timeout = float(REQUEST_CONFIRM_TIMEOUT_SEC)
+        view = PlanView(
+            guild_id=gid,
+            author_id=message.author.id,
+            plan=plan,
+            track_items=track_items,
+            timeout=timeout + 30,
+        )
         view.message = plan_msg
+        embed = view.build_embed(
+            seconds_left=None if auto else REQUEST_CONFIRM_TIMEOUT_SEC
+        )
+        await plan_msg.edit(embed=embed, view=view)
         await view.start_timer_or_auto()
     except Exception as exc:
         _pending_guilds.discard(gid)
-        logger.exception("request_channel: failed to post plan: %s", exc)
-        await message.channel.send(f"No pude crear el plan: {exc}", delete_after=12)
+        logger.exception("request_channel: failed to build/post plan: %s", exc)
+        try:
+            await plan_msg.edit(
+                content=f"No pude crear el plan: {exc}",
+                embed=None,
+                view=None,
+            )
+        except Exception:
+            pass
     return True
 
 

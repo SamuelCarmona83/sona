@@ -158,48 +158,50 @@ function transitionsForStation(stationuuid: string) {
         <h1 class="text-lg font-bold text-ink m-0 tracking-tight">explorer</h1>
       </div>
       <nav class="flex-1 p-3 space-y-0.5" aria-label="Principal">
-        <button
-          v-for="item in navMain"
-          :key="item.id"
-          type="button"
-          class="w-full text-left px-3 py-2 text-sm rounded-sm transition-colors"
-          :class="
-            (item.id === 'library'
-              ? cat.view.value === 'library' ||
-                cat.view.value === 'artist' ||
-                cat.view.value === 'album'
-              : cat.view.value === item.id)
-              ? 'bg-ink text-canvas font-medium'
-              : 'text-mute hover:text-ink hover:bg-canvas'
-          "
-          @click="onNav(item.id)"
-        >
-          {{ item.label }}
-        </button>
-        <div
-          v-if="
-            cat.view.value === 'library' ||
-            cat.view.value === 'artist' ||
-            cat.view.value === 'album'
-          "
-          class="pl-2 mt-1 space-y-0.5 border-l border-black/10 ml-3"
-        >
+        <!-- template so library subsections sit under Biblioteca, not under Radio FM -->
+        <template v-for="item in navMain" :key="item.id">
           <button
-            v-for="sec in libSections"
-            :key="sec.id"
             type="button"
-            class="w-full text-left px-3 py-1.5 text-[12px] rounded-sm"
+            class="w-full text-left px-3 py-2 text-sm rounded-sm transition-colors"
             :class="
-              cat.view.value === 'library' &&
-              cat.librarySection.value === sec.id
-                ? 'text-ink font-medium'
-                : 'text-ash hover:text-ink'
+              (item.id === 'library'
+                ? cat.view.value === 'library' ||
+                  cat.view.value === 'artist' ||
+                  cat.view.value === 'album'
+                : cat.view.value === item.id)
+                ? 'bg-ink text-canvas font-medium'
+                : 'text-mute hover:text-ink hover:bg-canvas'
             "
-            @click="cat.goLibrary(sec.id)"
+            @click="onNav(item.id)"
           >
-            {{ sec.label }}
+            {{ item.label }}
           </button>
-        </div>
+          <div
+            v-if="
+              item.id === 'library' &&
+              (cat.view.value === 'library' ||
+                cat.view.value === 'artist' ||
+                cat.view.value === 'album')
+            "
+            class="pl-2 mt-1 mb-1 space-y-0.5 border-l border-black/10 ml-3"
+          >
+            <button
+              v-for="sec in libSections"
+              :key="sec.id"
+              type="button"
+              class="w-full text-left px-3 py-1.5 text-[12px] rounded-sm"
+              :class="
+                cat.view.value === 'library' &&
+                cat.librarySection.value === sec.id
+                  ? 'text-ink font-medium'
+                  : 'text-ash hover:text-ink'
+              "
+              @click="cat.goLibrary(sec.id)"
+            >
+              {{ sec.label }}
+            </button>
+          </div>
+        </template>
       </nav>
       <div class="p-3 border-t border-black/10">
         <button
