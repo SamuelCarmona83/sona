@@ -113,6 +113,88 @@ class RequestAgentTests(unittest.TestCase):
         self.assertIn("skip", summary)
         self.assertIn("+2", summary)
 
+    def test_heuristic_style_mix_two_vibes(self):
+        from src.request_agent import heuristic_plan
+
+        msg = (
+            "nu-metal como limp bizkit y rock de principios de los 2000 "
+            "como soundtrack de tony hawk pro skater 4"
+        )
+        plan = heuristic_plan(msg, auto_enabled=False)
+        genres = [a for a in plan.actions if a["type"] == "genre_playlist"]
+        self.assertGreaterEqual(len(genres), 2)
+        blobs = " ".join(
+            f"{a.get('genre','')} {a.get('hints','')}" for a in genres
+        ).lower()
+        self.assertIn("nu", blobs.replace("-", " "))
+        self.assertTrue("limp" in blobs or "bizkit" in blobs)
+        self.assertTrue("hawk" in blobs or "skater" in blobs or "tony" in blobs)
+        # Must not be a single enqueue of the whole sentence
+        self.assertFalse(
+            any(
+                a["type"] == "enqueue" and len(a.get("queries") or []) == 1
+                and "tony hawk" in (a.get("queries") or [""])[0].lower()
+                for a in plan.actions
+            )
+        )
+
+    def test_repair_collapsed_style_enqueue(self):
+        from src.request_agent import (
+            RequestPlan,
+            repair_style_plan_if_collapsed,
+        )
+
+        msg = "nu-metal como limp bizkit y rock como tony hawk"
+        bad = RequestPlan(
+            reply="ok",
+            actions=[{
+                "type": "enqueue",
+                "queries": [msg],
+                "position": "end",
+            }],
+            source="llm",
+            model="test",
+        )
+        fixed = repair_style_plan_if_collapsed(bad, msg)
+        self.assertTrue(any(a["type"] == "genre_playlist" for a in fixed.actions))
+        self.assertGreaterEqual(
+            sum(1 for a in fixed.actions if a["type"] == "genre_playlist"), 2
+        )
+
+    def test_repair_two_style_blob_enqueues(self):
+        """LLM put two style phrases as enqueue queries — must become playlists."""
+        from src.request_agent import (
+            RequestPlan,
+            is_style_blob_query,
+            repair_style_plan_if_collapsed,
+        )
+
+        self.assertTrue(is_style_blob_query("Limp Bizkit nu-metal"))
+        self.assertTrue(
+            is_style_blob_query("Tony Hawk Pro Skater 4 soundtrack early 2000s rock")
+        )
+        self.assertFalse(is_style_blob_query("Korn - Freak on a Leash"))
+
+        msg = "nu-metal limp bizkit y rock tony hawk"
+        bad = RequestPlan(
+            reply="¡Dale! Te armo dos playlists",
+            actions=[{
+                "type": "enqueue",
+                "queries": [
+                    "Tony Hawk Pro Skater 4 soundtrack early 2000s rock",
+                    "Limp Bizkit nu-metal",
+                ],
+                "position": "end",
+            }],
+            source="llm",
+            model="test",
+        )
+        fixed = repair_style_plan_if_collapsed(bad, msg)
+        genres = [a for a in fixed.actions if a["type"] == "genre_playlist"]
+        self.assertGreaterEqual(len(genres), 2)
+        for g in genres:
+            self.assertGreaterEqual(int(g["count"]), 3)
+
 
 if __name__ == "__main__":
     unittest.main()

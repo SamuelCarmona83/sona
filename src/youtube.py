@@ -15,9 +15,11 @@ except ImportError:
 from src.config import (
     YTDL_OPTIONS,
     YTDL_OPTIONS_NO_COOKIES,
+    _YT_PLAYER_CLIENTS_RETRY,
     get_cookie_status,
     is_cookie_load_error,
     mark_cookies_unusable,
+    ytdl_opts_with_player_clients,
     SEARCH_RESULT_COUNT,
     MIN_SEARCH_SCORE,
     LLM_SCORE_MARGIN,
@@ -144,12 +146,20 @@ _last_rate_limit_time: float = 0.0
 _rate_limit_cooldown_sec = 3600  # 1 hour
 _rate_limit_message = "This content isn't available, try again later"
 _auth_failed: bool = False
+# Session-killing bot-check only. A googlevideo 403 is a player-client / CDN
+# reject and must not disable every later search.
 _AUTH_PATTERNS = (
     "sign in to confirm you're not a bot",
     "confirm you're not a bot",
     "cookies are rotated",
+    "login required to confirm your age",
+)
+_MEDIA_FORBIDDEN_PATTERNS = (
     "http error 403",
-    "unable to extract data",
+    "403: forbidden",
+    "403 forbidden",
+    "server returned 403",
+    "unable to download video data",
 )
 
 
@@ -185,10 +195,37 @@ def maybe_detect_rate_limit(msg: str) -> bool:
     return False
 
 
+def is_media_forbidden_error(msg: str) -> bool:
+    """True for googlevideo / yt-dlp media 403s (not a session bot-check)."""
+    lower = (msg or "").lower()
+    # PO-token *warnings* mention 403 without a failed download.
+    if "po token" in lower or "may yield http error 403" in lower:
+        return False
+    return any(pat in lower for pat in _MEDIA_FORBIDDEN_PATTERNS)
+
+
+def is_audio_only_format(info: dict | None) -> bool:
+    """True only for a direct googlevideo audio URL ffmpeg can open.
+
+    Watch-page URLs and muxed leftovers (itag 18) are not playable streams.
+    """
+    if not info:
+        return False
+    url = str(info.get("url") or "")
+    if "googlevideo.com" not in url:
+        return False
+    if "itag=18" in url or "mime=video" in url:
+        return False
+    vcodec = str(info.get("vcodec") or "none").lower()
+    if vcodec not in ("none", "n/a", "", "null"):
+        return False
+    return True
+
+
 def maybe_detect_auth_failure(msg: str) -> bool:
     if maybe_detect_rate_limit(msg):
         return False
-    lower = msg.lower()
+    lower = (msg or "").lower()
     if any(pat in lower for pat in _AUTH_PATTERNS):
         set_youtube_auth_failed()
         try:
@@ -309,6 +346,13 @@ def _extract_video_sync(video_id: str, base_opts: dict) -> dict | None:
             raise
     if not info or not info.get("url"):
         return None
+    if not is_audio_only_format(info):
+        logger.info(
+            "youtube.refresh_url: skipping non-audio format for %s (vcodec=%s)",
+            video_id,
+            info.get("vcodec"),
+        )
+        return None
     return {
         "title": info.get("title", ""),
         "url": info["url"],
@@ -318,7 +362,9 @@ def _extract_video_sync(video_id: str, base_opts: dict) -> dict | None:
         "webpage_url": info.get("webpage_url") or f"https://www.youtube.com/watch?v={video_id}",
         "acodec": info.get("acodec") or "?",
         "abr": info.get("abr") or 0,
+        "vcodec": info.get("vcodec") or "none",
         "video_id": video_id,
+        "http_headers": info.get("http_headers") or {},
     }
 
 
@@ -336,6 +382,37 @@ async def _refresh_url_from_video_id(video_id: str) -> dict | None:
         return result
 
     return await _run_rate_limited_yt_request(_extract, f"refresh {video_id}")
+
+
+async def refresh_playback_url(track: dict) -> dict | None:
+    """Drop cached stream URLs and re-extract with a different client family.
+
+    Used after ffmpeg/yt-dlp 403s or SABR leftover progressive URLs.
+    """
+    query = track.get("yt_query") or track.get("title")
+    if query:
+        _url_cache.pop(_normalize_text(query), None)
+
+    video_id = track.get("video_id") or _extract_video_id(
+        track.get("webpage_url") or track.get("url")
+    )
+    if not video_id or is_youtube_rate_limited():
+        return None
+
+    def _extract():
+        tv_opts = ytdl_opts_with_player_clients(YTDL_OPTIONS, list(_YT_PLAYER_CLIENTS_RETRY))
+        result = _extract_video_sync(video_id, tv_opts)
+        if result or is_youtube_rate_limited():
+            return result
+        logger.info("youtube.refresh_playback_url: cookieless retry for %s", video_id)
+        return _extract_video_sync(
+            video_id,
+            ytdl_opts_with_player_clients(YTDL_OPTIONS_NO_COOKIES, list(_YT_PLAYER_CLIENTS_RETRY)),
+        )
+
+    return await _run_rate_limited_yt_request(
+        _extract, f"refresh-play {video_id}", urgent=True
+    )
 
 
 _load_metadata_index()
@@ -395,6 +472,8 @@ class _YtDlpLogger:
             logger.warning("yt-dlp: [RATE-LIMIT DETECTED] %s", msg)
         elif maybe_detect_auth_failure(msg):
             pass
+        elif is_media_forbidden_error(msg):
+            logger.warning("yt-dlp: media 403 (not marking auth failed): %s", msg[:200])
         else:
             logger.warning("yt-dlp: %s", msg)
 
@@ -403,6 +482,8 @@ class _YtDlpLogger:
             logger.warning("yt-dlp: [RATE-LIMIT DETECTED] %s", msg)
         elif maybe_detect_auth_failure(msg):
             pass
+        elif is_media_forbidden_error(msg):
+            logger.warning("yt-dlp: media 403 (not marking auth failed): %s", msg[:200])
         else:
             logger.warning("yt-dlp: %s", msg)
 
@@ -461,7 +542,7 @@ def _parse_search_entries(query: str, info: dict | None) -> list[dict]:
         return []
     candidates = []
     for entry in info["entries"]:
-        if not entry or not entry.get("url"):
+        if not entry:
             continue
         if entry.get("availability") in ("needs_auth", "subscriber_only", "premium_only", "unavailable"):
             logger.info(
@@ -469,24 +550,47 @@ def _parse_search_entries(query: str, info: dict | None) -> list[dict]:
                 entry.get("id"), entry.get("availability"),
             )
             continue
+        video_id = entry.get("id")
+        raw_url = entry.get("url") or ""
+        url = raw_url if is_audio_only_format(entry) else None
+        if not url and not video_id:
+            continue
+        webpage = entry.get("webpage_url") or ""
+        if not webpage and video_id:
+            webpage = f"https://www.youtube.com/watch?v={video_id}"
+        elif not webpage and "youtube.com/watch" in raw_url:
+            webpage = raw_url
+        thumb = entry.get("thumbnail") or ""
+        if not thumb:
+            thumbs = entry.get("thumbnails") or []
+            if thumbs and isinstance(thumbs[-1], dict):
+                thumb = thumbs[-1].get("url") or ""
         candidates.append({
             "title": entry.get("title", query),
-            "url": entry["url"],
+            "url": url,
             "duration": entry.get("duration"),
-            "uploader": entry.get("uploader") or "",
+            "uploader": entry.get("uploader") or entry.get("channel") or "",
             "channel": entry.get("channel") or "",
-            "webpage_url": entry.get("webpage_url") or "",
-            "thumbnail": entry.get("thumbnail") or "",
+            "webpage_url": webpage,
+            "thumbnail": thumb,
             "acodec": entry.get("acodec") or "?",
             "abr": entry.get("abr") or 0,
-            "video_id": entry.get("id"),
+            "vcodec": entry.get("vcodec") or "none",
+            "video_id": video_id,
+            "http_headers": entry.get("http_headers") or {},
         })
     return candidates
 
 
 def _search_sync(query: str, base_opts: dict) -> list[dict]:
     import yt_dlp  # lazy
+    # Flat search: titles + video ids only. Requiring bestaudio here fails the
+    # whole query when ios/mweb need a PO token and tv is SABR-only.
     opts = {**base_opts, "logger": _YtDlpLogger()}
+    opts.pop("format", None)
+    opts.pop("extractor_args", None)
+    opts["extract_flat"] = "in_playlist"
+    opts["skip_download"] = True
     with _CookieFallbackYDL(opts) as ydl:
         try:
             info = ydl.extract_info(f"ytsearch{SEARCH_RESULT_COUNT}:{query}", download=False)
@@ -510,7 +614,7 @@ async def _search_youtube_candidates(query: str, *, urgent: bool = False) -> lis
         candidates = _search_sync(query, YTDL_OPTIONS)
         if candidates or is_youtube_rate_limited():
             return candidates
-        # One cookieless try (android_vr clients) — skip if we already know the
+        # One cookieless try (tv clients) — skip if we already know the
         # session/IP is bot-checked so we do not double-hit YouTube.
         if is_youtube_auth_failed():
             return candidates
@@ -580,7 +684,7 @@ async def search_youtube(
     cache_key = _normalize_text(query)
 
     cached_url = _get_cached_url(cache_key)
-    if cached_url and cached_url.get("url"):
+    if cached_url and is_audio_only_format(cached_url):
         logger.info("search_youtube: usando URL en cache para '%s'", query)
         return cached_url
 

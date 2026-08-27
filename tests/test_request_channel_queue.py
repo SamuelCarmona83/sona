@@ -108,6 +108,139 @@ class FrontOffsetEnqueueTests(unittest.TestCase):
         self.assertEqual([t["title"] for t in session.queue], ["A", "B", "C"])
 
 
+class OrganicMergeAndMaterializeTests(unittest.TestCase):
+    def test_organic_merge_not_strict_halves(self):
+        import src.request_channel as rc
+
+        pools = [
+            [f"A{i}" for i in range(5)],
+            [f"B{i}" for i in range(5)],
+        ]
+        # Run several times — should not always be AAAAA then BBBBB
+        sequential = 0
+        for _ in range(20):
+            out = rc._organic_merge_pools(pools, 10)
+            self.assertEqual(len(out), 10)
+            self.assertEqual(len(set(out)), 10)
+            if out[:5] == [f"A{i}" for i in range(5)]:
+                sequential += 1
+        self.assertLess(sequential, 15)
+
+    def test_curated_fallback_nu_metal_and_thps(self):
+        import src.request_channel as rc
+
+        nm = rc._curated_style_queries("nu-metal", "Limp Bizkit", 5)
+        self.assertGreaterEqual(len(nm), 5)
+        self.assertTrue(all(" - " in q for q in nm))
+        th = rc._curated_style_queries(
+            "rock", "Tony Hawk Pro Skater 4 soundtrack early 2000s", 12
+        )
+        self.assertGreaterEqual(len(th), 5)
+        self.assertTrue(
+            any(
+                name in q
+                for q in th
+                for name in ("Goldfinger", "Sum 41", "Blink-182", "Millencolin")
+            )
+        )
+
+    def test_curated_mf_doom_hiphop_lofi_not_rock(self):
+        """Regression: MF DOOM / lofi must never fall through to early-2000s rock."""
+        import src.request_channel as rc
+
+        for genre, hints in (
+            ("hip-hop lofi", "MF DOOM"),
+            ("hip-hop", "MF Doom similares"),
+            ("lofi", "mf doom"),
+        ):
+            qs = rc._curated_style_queries(genre, hints, 8)
+            self.assertGreaterEqual(len(qs), 5, msg=f"{genre!r} {hints!r}")
+            joined = " ".join(qs)
+            self.assertFalse(
+                any(
+                    bad in joined
+                    for bad in (
+                        "Foo Fighters",
+                        "Nickelback",
+                        "Evanescence",
+                        "White Stripes",
+                    )
+                ),
+                msg=f"got rock pack for {genre!r} {hints!r}: {qs}",
+            )
+            self.assertTrue(
+                any(
+                    name in joined
+                    for name in ("MF DOOM", "Madvillain", "Nujabes", "J Dilla", "Madlib")
+                ),
+                msg=f"missing doom/lofi artists in {qs}",
+            )
+
+
+class MaterializeGenreTests(unittest.IsolatedAsyncioTestCase):
+    async def test_materialize_replaces_genre_with_enqueue_queries(self):
+        import src.request_channel as rc
+        from src.request_agent import RequestPlan, planned_track_labels
+
+        plan = RequestPlan(
+            reply="mix",
+            actions=[
+                {"type": "genre_playlist", "genre": "nu-metal", "count": 3, "hints": ""},
+                {"type": "genre_playlist", "genre": "rock", "count": 3, "hints": ""},
+            ],
+            source="test",
+        )
+
+        async def fake_genre(genre, count, hints):
+            # Concrete Artist - Title lines (what Spotify would return)
+            return [f"{genre.title()} Band - Song {i}" for i in range(count)]
+
+        with patch.object(rc, "_genre_queries", side_effect=fake_genre):
+            out = await rc.materialize_genre_playlists(plan)
+
+        self.assertTrue(all(a["type"] != "genre_playlist" for a in out.actions))
+        enqueue = [a for a in out.actions if a["type"] == "enqueue"]
+        self.assertEqual(len(enqueue), 1)
+        queries = enqueue[0]["queries"]
+        self.assertEqual(len(queries), 6)
+        labels = planned_track_labels(out)
+        self.assertFalse(any("#" in lab and lab.split("#")[-1].strip().isdigit() for lab in labels))
+        self.assertTrue(any("Song" in lab for lab in labels))
+
+    async def test_materialize_expands_style_blob_enqueues(self):
+        import src.request_channel as rc
+        from src.request_agent import RequestPlan, planned_track_labels
+
+        plan = RequestPlan(
+            reply="¡Dale! Te armo dos playlists",
+            actions=[{
+                "type": "enqueue",
+                "queries": [
+                    "Tony Hawk Pro Skater 4 soundtrack early 2000s rock",
+                    "Limp Bizkit nu-metal",
+                ],
+                "position": "end",
+            }],
+            source="llm",
+        )
+
+        async def fake_genre(genre, count, hints):
+            tag = "NM" if "metal" in genre.lower() else "RK"
+            return [f"Artist {tag} - Track {i}" for i in range(count)]
+
+        with patch.object(rc, "_genre_queries", side_effect=fake_genre):
+            out = await rc.materialize_genre_playlists(plan)
+
+        enqueue = [a for a in out.actions if a["type"] == "enqueue"]
+        self.assertEqual(len(enqueue), 1)
+        queries = enqueue[0]["queries"]
+        self.assertGreaterEqual(len(queries), 6)
+        labels = planned_track_labels(out)
+        self.assertFalse(any("Limp Bizkit nu-metal" == lab for lab in labels))
+        self.assertFalse(any("Tony Hawk" in lab and " - " not in lab for lab in labels))
+        self.assertTrue(all(" - " in lab for lab in labels))
+
+
 class AwaitUnlessAbortedTests(unittest.IsolatedAsyncioTestCase):
     async def test_returns_result_when_not_aborted(self):
         import src.request_channel as rc
@@ -210,7 +343,7 @@ class ExecutePlanPlayEarlyTests(unittest.IsolatedAsyncioTestCase):
         ), patch.object(rc, "play_next", play_next), patch.object(
             rc, "record_request"
         ), patch.object(
-            rc, "refresh_player_embed_fresh", new_callable=AsyncMock
+            rc, "update_player_embed", new_callable=AsyncMock
         ), patch(
             "src.playback.bot.get_guild", return_value=guild
         ):

@@ -3,6 +3,7 @@ import collections
 import json
 import logging
 import pathlib
+import time
 
 import discord
 
@@ -19,6 +20,7 @@ MOODS: dict[str, list[str]] = {
     "neutral":  [],
     "mixed":    [],
     "metal":    ["metal", "heavy-metal", "thrash-metal"],
+    "nu-metal": ["nu-metal", "metal", "alternative-metal"],
     "hiphop":   ["hip-hop", "rap", "trap"],
     "techno":   ["techno", "minimal-techno", "electronic"],
     "dubstep":  ["dubstep", "drum-and-bass", "breakbeat"],
@@ -35,6 +37,12 @@ MOODS: dict[str, list[str]] = {
     # Stream-seeded test mood: listens to Rock & Pop AR, enqueues clean YT tracks
     "rock-radio": [],
 }
+
+# Sticky vibe from agent genre plans (does NOT change !mood).
+_STICKY_PRIMARY_TTL_SEC = 2 * 3600
+_STICKY_SECONDARY_TTL_SEC = 40 * 60
+_STICKY_PATH = pathlib.Path(".cache/sticky_vibe.json")
+_sticky_vibe: dict[int, dict] = {}  # guild_id -> {primary, secondary}
 
 # Macro genre clusters: raw Spotify genre tags → cluster key.
 # Used to measure diversity in play history and avoid locking onto one genre.
@@ -177,9 +185,154 @@ def _save_radio_profiles() -> None:
         logger.warning("radio: could not save radio_profiles: %s", exc)
 
 
+def _load_sticky_vibe() -> None:
+    if not _STICKY_PATH.exists():
+        return
+    try:
+        data = json.loads(_STICKY_PATH.read_text())
+        for gid_str, payload in (data or {}).items():
+            if isinstance(payload, dict):
+                _sticky_vibe[int(gid_str)] = payload
+    except Exception:
+        pass
+
+
+def _save_sticky_vibe() -> None:
+    try:
+        _STICKY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        data = {str(gid): payload for gid, payload in _sticky_vibe.items()}
+        _STICKY_PATH.write_text(json.dumps(data))
+    except Exception as exc:
+        logger.warning("radio: could not save sticky_vibe: %s", exc)
+
+
 _load_played_ids()
 _load_custom_moods()
 _load_radio_profiles()
+_load_sticky_vibe()
+
+
+def _vibe_key(genres: list[str], hints: list[str]) -> str:
+    parts = [g.strip().lower() for g in genres if g and str(g).strip()]
+    parts += [h.strip().lower()[:40] for h in hints if h and str(h).strip()]
+    return "|".join(parts) or "unknown"
+
+
+def _slot_alive(slot: dict | None) -> bool:
+    if not slot or not isinstance(slot, dict):
+        return False
+    try:
+        return float(slot.get("expires_at") or 0) > time.time()
+    except (TypeError, ValueError):
+        return False
+
+
+def set_sticky_vibe(
+    guild_id: int,
+    *,
+    genres: list[str],
+    hints: list[str] | None = None,
+    user_id: int | None = None,
+) -> None:
+    """Last-write sticky vibe from agent style plans (primary + secondary).
+
+    Does not change !mood. Same vibe key renews TTL; different key moves old
+    primary → secondary (short TTL) for soft multi-user transitions.
+    """
+    genres_clean = [str(g).strip() for g in (genres or []) if str(g).strip()]
+    hints_clean = [str(h).strip() for h in (hints or []) if str(h).strip()]
+    if not genres_clean and not hints_clean:
+        return
+    now = time.time()
+    new_key = _vibe_key(genres_clean, hints_clean)
+    state = _sticky_vibe.get(guild_id) or {}
+    old_primary = state.get("primary")
+    if _slot_alive(old_primary) and old_primary.get("key") != new_key:
+        secondary = dict(old_primary)
+        secondary["expires_at"] = now + _STICKY_SECONDARY_TTL_SEC
+        state["secondary"] = secondary
+    elif not _slot_alive(state.get("secondary")):
+        state["secondary"] = None
+
+    state["primary"] = {
+        "genres": genres_clean,
+        "hints": hints_clean,
+        "user_id": user_id,
+        "key": new_key,
+        "set_at": now,
+        "expires_at": now + _STICKY_PRIMARY_TTL_SEC,
+    }
+    _sticky_vibe[guild_id] = state
+    _save_sticky_vibe()
+    logger.info(
+        "radio: sticky vibe guild=%s primary=%s secondary=%s",
+        guild_id,
+        new_key[:80],
+        (state.get("secondary") or {}).get("key", "-"),
+    )
+
+
+def get_sticky_vibe(guild_id: int) -> dict | None:
+    """Return {primary, secondary} with only live slots (or None if empty)."""
+    state = _sticky_vibe.get(guild_id)
+    if not state:
+        return None
+    primary = state.get("primary") if _slot_alive(state.get("primary")) else None
+    secondary = state.get("secondary") if _slot_alive(state.get("secondary")) else None
+    if not primary and not secondary:
+        return None
+    return {"primary": primary, "secondary": secondary}
+
+
+def clear_sticky_vibe(guild_id: int) -> None:
+    if guild_id in _sticky_vibe:
+        _sticky_vibe.pop(guild_id, None)
+        _save_sticky_vibe()
+
+
+def is_mood_locked(guild_id: int) -> bool:
+    """True when a formal !mood is active (not neutral/mixed/empty stream seed)."""
+    mood = (get_mood(guild_id) or "neutral").strip().lower()
+    if mood in ("neutral", "mixed", ""):
+        return False
+    # Stream-seeded moods handle their own fill path
+    if mood == "rock-radio":
+        return False
+    return True
+
+
+def mood_genre_tags(guild_id: int) -> list[str]:
+    mood = get_mood(guild_id)
+    return list(
+        _custom_moods.get(guild_id, {}).get(mood)
+        or MOODS.get(mood, [])
+        or []
+    )
+
+
+def mood_target_cluster(guild_id: int) -> str | None:
+    for g in mood_genre_tags(guild_id):
+        c = _GENRE_CLUSTER_MAP.get(g)
+        if c:
+            return c
+        # free-text custom: try first token
+        token = (g or "").split()[0].lower() if g else ""
+        c = _GENRE_CLUSTER_MAP.get(token)
+        if c:
+            return c
+    # nu-metal style names without tags
+    mood = (get_mood(guild_id) or "").lower()
+    if "metal" in mood:
+        return "metal"
+    if "hip" in mood or "rap" in mood:
+        return "hiphop"
+    if "rock" in mood or "punk" in mood:
+        return "rock"
+    if "pop" in mood:
+        return "pop"
+    if "latin" in mood or "reggaeton" in mood:
+        return "latin"
+    return None
 
 
 def get_profile_mode(guild_id: int) -> str:
@@ -409,6 +562,9 @@ def played_keys_for_track(track: dict | None) -> list[str]:
     if sid:
         keys.append(f"sp:{sid}")
         keys.append(str(sid))  # bare id (likes / legacy dedup)
+    sz = track.get("shazam_id")
+    if sz:
+        keys.append(f"sz:{sz}")
     vid = track.get("video_id")
     if vid:
         v = str(vid)
@@ -475,11 +631,20 @@ async def record_played(guild_id: int, track: dict) -> None:
         genres = await _get_artist_genres(artist_id)
         cluster = _map_cluster(genres)
 
+    shazam_id = track.get("shazam_id")
+    try:
+        shazam_id = int(shazam_id) if shazam_id is not None else None
+    except (TypeError, ValueError):
+        shazam_id = None
+
     _play_history[guild_id].append({
         "spotify_id":  spotify_id,
         "artist_id":   artist_id,
         "cluster":     cluster,
         "artist_name": track.get("artist"),
+        "shazam_id":   shazam_id,
+        "title":       track.get("title"),
+        "yt_query":    track.get("yt_query"),
     })
 
     track_title = track.get("title", "")
@@ -508,32 +673,67 @@ async def record_played(guild_id: int, track: dict) -> None:
 _FALLBACK_GENRES = ["pop", "rock", "hip-hop", "electronic", "latin"]
 
 
+def _spotify_seed_genres_from_tags(tags: list[str], *, limit: int = 3) -> list[str]:
+    """Normalize free-text / mood tags into Spotify-ish genre seeds."""
+    out: list[str] = []
+    for g in tags:
+        g = (g or "").strip()
+        if not g:
+            continue
+        if g in _GENRE_CLUSTER_MAP or " " not in g:
+            if g not in out:
+                out.append(g)
+        else:
+            # "nu metal" → try first token and hyphen form
+            for cand in (g.replace(" ", "-"), g.split()[0]):
+                if cand and cand not in out:
+                    out.append(cand)
+                    break
+        if len(out) >= limit:
+            break
+    return out[:limit]
+
+
 def _build_diversity_seeds(guild_id: int) -> tuple[list[str], list[str]]:
     """Return (seed_track_ids, seed_genre_tags) for Spotify recommendations.
 
     Strategy:
-    1. Count recent history by cluster. Prefer seed_tracks from clusters with
-       fewer plays (so the radio doesn't lock onto the most-requested genre).
-    2. Blend up to 2 genre seeds from the active mood.
-    3. Total seeds ≤ 5 (Spotify limit).
-    4. If no seeds at all (no history, neutral mood) → fall back to diverse genre set.
+    1. Formal !mood (locked) → mood genres only (+ history in same cluster).
+    2. Else agent sticky vibe (neutral mood) → sticky genres/hints as seeds.
+    3. Else history diversity / global fallback.
     """
     mood = get_mood(guild_id)
-    raw_mood_genres = (
-        _custom_moods.get(guild_id, {}).get(mood)
-        or MOODS.get(mood, [])
-    )
-    # Only pass Spotify-valid genre seeds (single-word or hyphenated, known in cluster map).
-    # Free-text tokens from raw-token moods are kept for YouTube fallback only.
-    mood_seed_genres = [
-        g for g in raw_mood_genres
-        if g in _GENRE_CLUSTER_MAP or " " not in g
-    ][:2]
+    raw_mood_genres = mood_genre_tags(guild_id)
+    locked = is_mood_locked(guild_id)
+
+    sticky = None if locked else get_sticky_vibe(guild_id)
+    sticky_tags: list[str] = []
+    if sticky:
+        primary = sticky.get("primary") or {}
+        secondary = sticky.get("secondary") or {}
+        # ~70/30 blend of genre tags
+        sticky_tags = list(primary.get("genres") or [])
+        sticky_tags += list(primary.get("hints") or [])[:2]
+        if secondary:
+            sticky_tags += list(secondary.get("genres") or [])[:1]
+            sticky_tags += list(secondary.get("hints") or [])[:1]
+
+    if locked:
+        mood_seed_genres = _spotify_seed_genres_from_tags(raw_mood_genres, limit=3)
+    elif sticky_tags:
+        mood_seed_genres = _spotify_seed_genres_from_tags(sticky_tags, limit=3)
+        logger.info(
+            "radio.seeds: using sticky vibe guild=%s genres=%s",
+            guild_id, mood_seed_genres,
+        )
+    else:
+        mood_seed_genres = _spotify_seed_genres_from_tags(raw_mood_genres, limit=2)
 
     history = list(_play_history.get(guild_id, []))
     if not history:
-        # No play history yet — use mood genres if available, else fallback diverse set
-        genres = mood_seed_genres if mood_seed_genres else _FALLBACK_GENRES
+        genres = mood_seed_genres if mood_seed_genres else (
+            [] if (locked or sticky_tags) else _FALLBACK_GENRES
+        )
         return [], genres[:5]
 
     # Count tracks per cluster
@@ -544,11 +744,19 @@ def _build_diversity_seeds(guild_id: int) -> tuple[list[str], list[str]]:
         if sid:
             cluster_tracks.setdefault(c, []).append(sid)
 
-    # When a specific mood is active (not neutral/mixed), only consider seed
-    # tracks whose cluster matches the mood.  This prevents leftover hiphop
-    # history from seeding metal recommendations (and vice-versa).
     mood_cluster: str | None = None
-    if mood not in ("neutral", "mixed"):
+    if locked:
+        mood_cluster = mood_target_cluster(guild_id)
+    elif sticky_tags:
+        # Prefer metal if any metal-ish tag in sticky
+        for g in sticky_tags:
+            c = _GENRE_CLUSTER_MAP.get(g) or _GENRE_CLUSTER_MAP.get(
+                (g or "").split()[0].lower()
+            )
+            if c:
+                mood_cluster = c
+                break
+    elif mood not in ("neutral", "mixed"):
         for g in raw_mood_genres:
             mood_cluster = _GENRE_CLUSTER_MAP.get(g)
             if mood_cluster:
@@ -560,23 +768,24 @@ def _build_diversity_seeds(guild_id: int) -> tuple[list[str], list[str]]:
     else:
         filtered_clusters = cluster_tracks
 
-    # Sort clusters by count ascending → underrepresented first
     sorted_clusters = sorted(filtered_clusters.items(), key=lambda x: len(x[1]))
 
-    # Pick 1 track ID from each cluster (underrepresented first) until we have
-    # enough to fill remaining slots after mood genres
     track_slots = 5 - len(mood_seed_genres)
     seed_tracks: list[str] = []
     seen_ids: set[str] = set()
     for _cluster, track_ids in sorted_clusters:
-        for tid in reversed(track_ids):  # most recent within cluster
+        for tid in reversed(track_ids):
             if tid not in seen_ids and len(seed_tracks) < track_slots:
                 seed_tracks.append(tid)
                 seen_ids.add(tid)
                 break
 
-    # If history exists but all tracks lacked spotify_id, fall back to genre seeds
     if not seed_tracks and not mood_seed_genres:
+        # Never spray global pop/hip-hop while sticky or mood locked.
+        if locked or sticky_tags:
+            return [], _spotify_seed_genres_from_tags(
+                sticky_tags or raw_mood_genres or ["rock"], limit=3
+            )
         return [], _FALLBACK_GENRES
 
     return seed_tracks, mood_seed_genres
@@ -610,24 +819,37 @@ async def _youtube_fallback_fill(guild_id: int, needed: int) -> list[dict]:
         if len(queries) >= needed:
             break
 
-    # --- From mood genres: genre playlist queries ---
+    # --- From mood / sticky genres (never global pop-pad while locked or sticky) ---
     mood = get_mood(guild_id)
-    mood_genres = (
-        _custom_moods.get(guild_id, {}).get(mood)
-        or MOODS.get(mood, [])
-        or _FALLBACK_GENRES
-    )
+    locked = is_mood_locked(guild_id)
+    sticky = None if locked else get_sticky_vibe(guild_id)
+    mood_genres = list(mood_genre_tags(guild_id))
+    if sticky:
+        primary = sticky.get("primary") or {}
+        secondary = sticky.get("secondary") or {}
+        mood_genres = list(primary.get("genres") or []) + list(primary.get("hints") or [])[:2]
+        if secondary:
+            mood_genres += list(secondary.get("genres") or [])[:1]
+    if not mood_genres and not locked and not sticky:
+        mood_genres = list(_FALLBACK_GENRES)
     _random.shuffle(mood_genres)
     for genre in mood_genres:
         if len(queries) >= needed:
             break
         queries.append(f"{genre} playlist mix")
 
-    # Pad with fallback if still short
-    for genre in _FALLBACK_GENRES:
-        if len(queries) >= needed:
-            break
-        queries.append(f"{genre} popular songs")
+    # Pad with global fallback ONLY when free-form radio (no mood lock, no sticky)
+    if not locked and not sticky:
+        for genre in _FALLBACK_GENRES:
+            if len(queries) >= needed:
+                break
+            queries.append(f"{genre} popular songs")
+    elif len(queries) < needed:
+        # Stay on-vibe: curated-style search strings
+        for genre in (mood_genres or ["rock"]):
+            if len(queries) >= needed:
+                break
+            queries.append(f"{genre} hits 2000s")
 
     _random.shuffle(queries)
 
@@ -747,15 +969,32 @@ async def fill_radio_queue(
         queue_was_empty = len(q) == 0
         yt_search_needs_urgent = early_play and queue_was_empty
 
+        locked = is_mood_locked(gid)
+        sticky = None if locked else get_sticky_vibe(gid)
+        seed_tracks, seed_genres = _build_diversity_seeds(gid)
+
         taste_profile = await _resolve_taste_profile(guild)
-        if taste_profile and (taste_profile.seed_track_ids or taste_profile.seed_genres):
-            seed_tracks = taste_profile.seed_track_ids[:5]
-            seed_genres = taste_profile.seed_genres[:2]
-        else:
-            seed_tracks, seed_genres = _build_diversity_seeds(gid)
+        # Profile must not wipe mood/sticky seeds (that caused hip-hop/pop drift).
+        if taste_profile and not locked and not sticky:
+            if taste_profile.seed_track_ids or taste_profile.seed_genres:
+                seed_tracks = taste_profile.seed_track_ids[:5] or seed_tracks
+                seed_genres = (taste_profile.seed_genres[:2] or seed_genres)
+        elif taste_profile and (locked or sticky):
+            # Light blend: at most 1 profile track seed; keep mood/sticky genres
+            if taste_profile.seed_track_ids and len(seed_tracks) < 4:
+                seed_tracks = (seed_tracks + taste_profile.seed_track_ids[:1])[:5]
+
         logger.info(
-            "radio.fill: guild=%s mood=%s profile=%s seed_tracks=%s seed_genres=%s needed=%s",
-            gid, get_mood(gid), get_profile_mode(gid), seed_tracks, seed_genres, needed,
+            "radio.fill: guild=%s mood=%s locked=%s sticky=%s profile=%s "
+            "seed_tracks=%s seed_genres=%s needed=%s",
+            gid,
+            get_mood(gid),
+            locked,
+            bool(sticky),
+            get_profile_mode(gid),
+            seed_tracks,
+            seed_genres,
+            needed,
         )
 
         if is_youtube_rate_limited():
@@ -776,8 +1015,8 @@ async def fill_radio_queue(
             await maybe_notify_rate_limited(gid, text_channel)
             return
 
-        # --- Spotify profile direct mix ---
-        if taste_profile and taste_profile.direct_tracks:
+        # --- Spotify profile direct mix (skip when mood locked or agent sticky) ---
+        if taste_profile and taste_profile.direct_tracks and not locked and not sticky:
             import random as _random
             from src.youtube import search_youtube as _syt_profile
 
@@ -868,17 +1107,19 @@ async def fill_radio_queue(
                         await play_next(guild, vc, text_channel)
                     return
 
-        # --- Liked-tracks priority ---
+        # --- Liked-tracks priority (disabled under mood lock; causes genre drift) ---
         from src import likes as _likes_mod
         liked_tracks = []
         vc_channel = getattr(guild.voice_client, "channel", None)
-        if vc_channel is not None:
+        if vc_channel is not None and not locked:
             connected_ids = [m.id for m in vc_channel.members if not m.bot]
             if connected_ids:
                 played_set_for_likes = blocked_keys_for_guild(gid)
                 liked_tracks = _likes_mod.get_prioritized_tracks(
                     gid, connected_ids, played_set_for_likes, limit=needed
                 )
+        elif locked:
+            logger.info("radio.fill: likes skipped (mood locked) guild=%s", gid)
         # Resolve liked tracks through YouTube
         if liked_tracks:
             from src.youtube import search_youtube as _syt
@@ -963,6 +1204,52 @@ async def fill_radio_queue(
         rec_limit = max(needed + RADIO_RECS_OVERFETCH, needed * 3, needed + 12)
         recs = await _get_recommendations_hybrid(seed_tracks, seed_genres, limit=rec_limit)
         using_fallback = False
+
+        # Shazam charts + related — second catalog so Spotify's small top pool does not loop.
+        try:
+            from src import shazam_catalog as _shazam_cat
+
+            history = list(_play_history.get(gid, []))
+            recent_sz = [
+                int(e["shazam_id"])
+                for e in reversed(history)
+                if e.get("shazam_id") is not None
+            ][:5]
+            recent_q = []
+            for e in reversed(history):
+                name = e.get("artist_name")
+                title = e.get("title") or e.get("yt_query")
+                if name and title:
+                    recent_q.append(f"{name} - {title}")
+                elif title:
+                    recent_q.append(str(title))
+            shazam_recs = await _shazam_cat.radio_seed_recs(
+                seed_genres=seed_genres or [],
+                mood_name=get_mood(gid),
+                recent_shazam_ids=recent_sz,
+                recent_queries=recent_q[:3],
+                limit=rec_limit,
+            )
+            if shazam_recs:
+                # Prefer mixing: shazam first half for diversity when Spotify is sticky
+                seen_q = {(r.get("query") or "").lower() for r in (recs or [])}
+                merged = list(recs or [])
+                for item in shazam_recs:
+                    q = (item.get("query") or "").lower()
+                    if q and q not in seen_q:
+                        seen_q.add(q)
+                        merged.append(item)
+                import random as _random
+
+                _random.shuffle(merged)
+                recs = merged
+                logger.info(
+                    "radio.fill: shazam pool +%d → total candidates=%d guild=%s",
+                    len(shazam_recs), len(recs), gid,
+                )
+        except Exception as exc:
+            logger.debug("radio.fill: shazam seed skipped: %s", exc)
+
         if not recs:
             logger.warning(
                 "radio.fill: Hybrid recommendations exhausted for guild=%s, usando fallback YouTube",
@@ -987,15 +1274,21 @@ async def fill_radio_queue(
                 "spotify_id": info.get("spotify_id"),
                 "artist_id": info.get("artist_id"),
                 "artist": info.get("artist", "Unknown"),
+                "shazam_id": info.get("shazam_id"),
             }
             local = resolve_local_track(stub)
             if local:
                 local["requester"] = "📻 Radio"
+                if info.get("shazam_id") and not local.get("shazam_id"):
+                    local["shazam_id"] = info.get("shazam_id")
                 return local
             tid = track_id(stub)
             entry = get_entry(tid)
             if entry:
-                return track_from_entry(tid, entry, requester="📻 Radio")
+                t = track_from_entry(tid, entry, requester="📻 Radio")
+                if info.get("shazam_id") and not t.get("shazam_id"):
+                    t["shazam_id"] = info.get("shazam_id")
+                return t
 
             if using_fallback:
                 yt_info = info.get("yt_info")
@@ -1017,9 +1310,11 @@ async def fill_radio_queue(
                 "requester":  "📻 Radio",
                 "artist":     info.get("artist") or artist or "Unknown",
                 "duration":   yt_info.get("duration") or 0,
-                "thumbnail":  yt_info.get("thumbnail") or "",
+                "thumbnail":  yt_info.get("thumbnail") or info.get("cover_url") or "",
+                "cover_url":  info.get("cover_url") or "",
                 "spotify_id": info.get("spotify_id"),
                 "artist_id":  info.get("artist_id"),
+                "shazam_id":  info.get("shazam_id"),
                 "video_id":   yt_info.get("video_id"),
                 "webpage_url": yt_info.get("webpage_url"),
             }

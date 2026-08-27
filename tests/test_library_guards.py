@@ -147,5 +147,32 @@ class DeleteTrackEntryTests(unittest.TestCase):
             self.assertEqual(result["bytes_freed"], 100)
 
 
+class RemuxVideoDownloadTests(unittest.TestCase):
+    def test_first_audio_remuxes_mp4(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            lib = pathlib.Path(tmp) / "library"
+            lib.mkdir()
+            orig_lib = library._LIBRARY_DIR
+            library._LIBRARY_DIR = lib
+            try:
+                mp4 = lib / "yt_ad.mp4"
+                mp4.write_bytes(b"video" * 400)
+                m4a = lib / "yt_ad.m4a"
+
+                def fake_run(cmd, **_kwargs):
+                    m4a.write_bytes(b"audio" * 400)
+                    return type("R", (), {"returncode": 0, "stderr": ""})()
+
+                from unittest.mock import patch
+
+                with patch.object(library.subprocess, "run", side_effect=fake_run):
+                    got = library._first_downloaded_audio("yt_ad")
+                self.assertEqual(got, str(m4a.resolve()))
+                self.assertTrue(m4a.is_file())
+                self.assertFalse(mp4.exists())
+            finally:
+                library._LIBRARY_DIR = orig_lib
+
+
 if __name__ == "__main__":
     unittest.main()

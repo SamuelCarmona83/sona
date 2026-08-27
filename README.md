@@ -503,6 +503,7 @@ After changing OAuth scopes, run `!auth` again. Voice mode requires each user to
 | Symptom | What to do |
 |---------|------------|
 | `Sign in to confirm you're not a bot` | Run `./refresh_cookies.sh chrome` on the host |
+| Remote YT `403 Forbidden` / `unable to download video data` | Media CDN reject, not always a bot-check. Rebuild the image so `yt-dlp` is ≥ 2026.7.4, then `./refresh_cookies.sh --deploy`. Cached library tracks still play. |
 | Stale cookies (`!cookies`) | Same as above; check `.cache/cookie_refresh.log` |
 | Bot hangs with `Enter the URL you were redirected to` | Spotify token expired — run `!auth`; the bot no longer blocks on stdin |
 | Commands ignored | Verify `BOT_TEXT_CHANNEL_ID` in [`src/config.py`](src/config.py) |

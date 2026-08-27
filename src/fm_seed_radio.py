@@ -514,6 +514,7 @@ async def _handle_seed_match(guild: Any, text_channel: Any, mood: str, match: di
         "fm_seed_mood": mood,
         "fm_match_key": key,
         "fm_soft_key": soft,
+        "shazam_id": match.get("shazam_id"),
         "recognized_shazam_url": match.get("shazam_url"),
     }
 
@@ -536,6 +537,8 @@ async def _handle_seed_match(guild: Any, text_channel: Any, mood: str, match: di
             track["fm_soft_key"] = soft
             track["requester"] = RADIO_REQUESTER_LABEL
             track["recognized_shazam_url"] = match.get("shazam_url")
+            if match.get("shazam_id") and not track.get("shazam_id"):
+                track["shazam_id"] = match.get("shazam_id")
             track = _apply_shazam_cover(track)
     except Exception as exc:
         logger.debug("fm_seed: local resolve: %s", exc)

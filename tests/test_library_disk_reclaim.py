@@ -1,4 +1,5 @@
 """Tests for free-space-aware library reclaim."""
+import logging
 import os
 import pathlib
 import tempfile
@@ -163,6 +164,41 @@ class LibraryDiskReclaimTests(unittest.TestCase):
         self.assertFalse(other.is_file())
         self.assertNotIn("yt_other", library._index)
 
+    def test_now_playing_session_track_is_not_evicted(self) -> None:
+        """Regression: reclaim must not wipe the track currently playing."""
+        playing = self._add_track("yt_playing", size=600_000, last_played=1.0, title="Playing")
+        other = self._add_track("yt_other", size=600_000, last_played=2.0, title="Other")
+
+        class _FakeSess:
+            now_playing = {"video_id": "playing", "title": "Playing"}
+            queue = []
+
+        with patch.object(library, "disk_free_mb", return_value=10_000.0), patch(
+            "src.playback.iter_guild_sessions", return_value=[_FakeSess()]
+        ):
+            library.reclaim_disk(reason="test-session-protect")
+
+        self.assertTrue(playing.is_file())
+        self.assertIn("yt_playing", library._index)
+        self.assertFalse(other.is_file())
+        self.assertNotIn("yt_other", library._index)
+
+    def test_pending_download_tid_is_not_evicted(self) -> None:
+        pending = self._add_track("yt_pending", size=600_000, last_played=1.0)
+        other = self._add_track("yt_other", size=600_000, last_played=2.0)
+        library._pending_downloads.add("yt_pending")
+        try:
+            with patch.object(library, "disk_free_mb", return_value=10_000.0), patch(
+                "src.playback.iter_guild_sessions", return_value=[]
+            ):
+                library.reclaim_disk(reason="test-pending-protect")
+        finally:
+            library._pending_downloads.discard("yt_pending")
+
+        self.assertTrue(pending.is_file())
+        self.assertIn("yt_pending", library._index)
+        self.assertFalse(other.is_file())
+
     def test_noop_when_under_caps_and_free_ok(self) -> None:
         path = self._add_track("yt_ok", size=10_000, last_played=1.0)
         with patch.object(library, "disk_free_mb", return_value=10_000.0):
@@ -170,6 +206,22 @@ class LibraryDiskReclaimTests(unittest.TestCase):
             stats = library.reclaim_disk(reason="test-noop")
         self.assertEqual(stats["evicted"], 0)
         self.assertTrue(path.is_file())
+
+    def test_no_victims_without_pressure_is_not_a_warning(self) -> None:
+        """Over the size cap with only pins and plenty of free disk is policy, not an alarm."""
+        pinned = self._add_track(
+            "yt_pin", size=50_000, play_count=99, last_played=1.0, title="Pinned"
+        )
+        library.LIBRARY_MAX_MB = 0.01
+        library.LIBRARY_EMERGENCY_EVICT_PINS = True
+        with patch.object(library, "disk_free_mb", return_value=10_000.0):
+            with self.assertLogs("src.library", level="DEBUG") as cm:
+                stats = library.reclaim_disk(reason="test-quiet-pins")
+        warnings = [rec for rec in cm.records if rec.levelno >= logging.WARNING]
+        self.assertEqual(warnings, [])
+        self.assertEqual(stats["evicted"], 0)
+        self.assertTrue(pinned.is_file())
+        self.assertIn("yt_pin", library._index)
 
 
 if __name__ == "__main__":

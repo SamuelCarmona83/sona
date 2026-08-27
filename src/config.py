@@ -1,6 +1,7 @@
 import logging
 import os
 import re
+import shlex
 import time
 
 import spotipy
@@ -47,7 +48,18 @@ _YTDL_DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
-_YTDL_FORMAT = "bestaudio[ext=m4a]/bestaudio[acodec=opus]/bestaudio/best"
+# Never fall back to progressive video (itag 18). SABR leaves that as the only
+# URL and ffmpeg 403s it. Downloads may use _YTDL_DOWNLOAD_FORMAT + remux.
+_YTDL_FORMAT = "bestaudio[ext=m4a]/bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio"
+_YTDL_DOWNLOAD_FORMAT = (
+    "bestaudio[ext=m4a]/bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio/"
+    "best[height<=480]/best"
+)
+# tv/web are often SABR-only or DRM in 2026; ios/mweb still mint https audio.
+# Retry uses a different family so we do not repeat the same experiment.
+_YT_PLAYER_CLIENTS = ["ios", "mweb", "tv", "android_vr"]
+_YT_PLAYER_CLIENTS_COOKIELESS = ["android_vr", "tv", "tv_embedded"]
+_YT_PLAYER_CLIENTS_RETRY = ["android_vr", "android", "web_embedded", "tv_embedded"]
 
 _ytdl_base_options = {
     "format": _YTDL_FORMAT,
@@ -63,10 +75,17 @@ _ytdl_base_options = {
         "extractor": lambda n: 2 ** n,
         "http": lambda n: 2 ** n,
     },
-    "http_headers": {
-        "User-Agent": get_config_value("YTDL_USER_AGENT", dotenv_values, _YTDL_DEFAULT_USER_AGENT),
+    "extractor_args": {
+        "youtube": {
+            "player_client": list(_YT_PLAYER_CLIENTS),
+        },
     },
 }
+# A forced desktop Chrome UA overrides per-client headers and 403s android/tv streams.
+# Only apply when the operator sets YTDL_USER_AGENT explicitly.
+_explicit_ytdl_user_agent = get_config_value("YTDL_USER_AGENT", dotenv_values, "").strip()
+if _explicit_ytdl_user_agent:
+    _ytdl_base_options["http_headers"] = {"User-Agent": _explicit_ytdl_user_agent}
 
 COOKIES_FILE = get_config_value("YTDL_COOKIES_FILE", dotenv_values, "/app/cookies.txt")
 COOKIES_BROWSER = get_config_value("YTDL_COOKIES_FROM_BROWSER", dotenv_values, "").strip()
@@ -194,6 +213,17 @@ def cookieless_merged_opts(opts: dict) -> dict:
     return merged
 
 
+def ytdl_opts_with_player_clients(base: dict, clients: list[str]) -> dict:
+    """Copy *base* yt-dlp opts with youtube player_client overridden."""
+    opts = {**base}
+    extractor_args = dict(opts.get("extractor_args") or {})
+    youtube_args = dict(extractor_args.get("youtube") or {})
+    youtube_args["player_client"] = list(clients)
+    extractor_args["youtube"] = youtube_args
+    opts["extractor_args"] = extractor_args
+    return opts
+
+
 def _parse_browser_cookies_spec(spec: str):
     """Return yt-dlp cookiesfrombrowser tuple, or None if invalid.
 
@@ -318,15 +348,11 @@ def reload_cookies_if_changed() -> bool:
 
 apply_cookie_strategy()
 YTDL_OPTIONS = _ytdl_base_options
+YTDL_DOWNLOAD_FORMAT = _YTDL_DOWNLOAD_FORMAT
 
-YTDL_OPTIONS_NO_COOKIES = {
-    **_ytdl_base_options,
-    "extractor_args": {
-        "youtube": {
-            "player_client": ["android_vr", "web", "web_safari"],
-        },
-    },
-}
+YTDL_OPTIONS_NO_COOKIES = ytdl_opts_with_player_clients(
+    _ytdl_base_options, _YT_PLAYER_CLIENTS_COOKIELESS
+)
 YTDL_OPTIONS_NO_COOKIES.pop("cookiefile", None)
 YTDL_OPTIONS_NO_COOKIES.pop("cookiesfrombrowser", None)
 
@@ -395,6 +421,34 @@ def _build_ffmpeg_options(*, for_streaming: bool) -> dict:
 
 
 FFMPEG_OPTIONS = _build_ffmpeg_options(for_streaming=True)
+FFMPEG_LOCAL_OPTIONS = _build_ffmpeg_options(for_streaming=False)
+
+
+def ffmpeg_options_for_url(*, local: bool, headers=None) -> dict:
+    """FFmpeg options for a local file or remote URL.
+
+    googlevideo rejects requests without a Referer (and often without the
+    same User-Agent yt-dlp used to mint the URL).
+    """
+    opts = dict(FFMPEG_LOCAL_OPTIONS if local else FFMPEG_OPTIONS)
+    # headers is None: local file or live radio — do not attach YouTube Referer.
+    # headers is a dict (possibly empty): remote YT stream, always send Referer.
+    if local or headers is None:
+        return opts
+    ua = headers.get("User-Agent") or headers.get("user-agent")
+    referer = (
+        headers.get("Referer")
+        or headers.get("referer")
+        or "https://www.youtube.com/"
+    )
+    extra_parts = []
+    if ua:
+        extra_parts.append(f"-user_agent {shlex.quote(str(ua))}")
+    extra_parts.append(f"-referer {shlex.quote(str(referer))}")
+    extra = " " + " ".join(extra_parts)
+    opts["before_options"] = (opts.get("before_options", "") + extra).strip()
+    return opts
+
 
 SEARCH_RESULT_COUNT = 5
 MIN_SEARCH_SCORE = 6.0
@@ -562,8 +616,6 @@ elif GENIUS_CLIENT_ID and GENIUS_CLIENT_SECRET:
     logger.info("Genius client_id/secret present (ACCESS_TOKEN recommended for direct API use)")
 
 GENIUS_ENABLED = bool(GENIUS_ACCESS_TOKEN)
-
-FFMPEG_LOCAL_OPTIONS = _build_ffmpeg_options(for_streaming=False)
 
 YOUTUBE_TITLE_NOISE_TERMS = {
     "official",

@@ -199,12 +199,21 @@ def _parse_spotify_url(url: str) -> dict | None:
 
 def _track_to_info(track: dict) -> dict:
     """Extract {query, spotify_id, artist_id} from a Spotify track object."""
+    artists = track.get("artists") or []
+    artist_name = (artists[0].get("name") if artists else None) or "Unknown"
     return {
         "query":     _format_spotify_track_query(track),
+        "title":     (track.get("name") or "").strip() or None,
+        "artist":    artist_name,
         "spotify_id": track.get("id"),
-        "artist_id":  (track.get("artists") or [{}])[0].get("id"),
+        "artist_id":  (artists[0].get("id") if artists else None),
         "spotify_refined": True,
     }
+
+
+# In-process cache for playlist search samples (agent genre expand hits this often).
+_playlist_sample_cache: dict[str, tuple[float, list[dict]]] = {}
+_PLAYLIST_SAMPLE_TTL_SEC = 3600
 
 
 def _embed_track_to_info(item: dict) -> dict | None:
@@ -301,6 +310,147 @@ async def _fetch_playlist_tracks_via_api(playlist_id: str) -> list[dict]:
         playlist_name,
     )
     return infos
+
+
+async def fetch_playlist_track_infos(
+    playlist_id: str,
+    *,
+    max_tracks: int = 40,
+) -> list[dict]:
+    """Load playlist tracks via API, falling back to public embed on 403."""
+    infos: list[dict] = []
+    try:
+        infos = await _fetch_playlist_tracks_via_api(playlist_id)
+    except Exception as exc:
+        logger.debug(
+            "spotify: playlist API failed id=%s (%s); trying embed",
+            playlist_id, exc,
+        )
+        try:
+            infos = await asyncio.to_thread(
+                _fetch_playlist_tracks_from_embed, playlist_id
+            )
+        except Exception as embed_exc:
+            logger.warning(
+                "spotify: playlist embed failed id=%s: %s",
+                playlist_id, embed_exc,
+            )
+            return []
+    if max_tracks > 0 and len(infos) > max_tracks:
+        # Prefer a random slice so repeated fills diversify
+        if len(infos) > max_tracks * 2:
+            infos = _random.sample(infos, max_tracks)
+        else:
+            _random.shuffle(infos)
+            infos = infos[:max_tracks]
+    return infos
+
+
+async def search_spotify_playlists(
+    query: str,
+    *,
+    limit: int = 5,
+) -> list[dict]:
+    """Search public Spotify playlists. Returns [{id, name, owner, total}]."""
+    q = (query or "").strip()
+    if not q or sp is None:
+        return []
+    if not await _spotify_api_ready():
+        return []
+    try:
+        res = await asyncio.to_thread(
+            lambda: sp.search(q=q, type="playlist", limit=max(1, min(limit, 10)))
+        )
+    except Exception as exc:
+        logger.warning("spotify: playlist search failed q=%r: %s", q, exc)
+        return []
+    items = (res or {}).get("playlists", {}).get("items") or []
+    out: list[dict] = []
+    for pl in items:
+        if not pl or not pl.get("id"):
+            continue
+        owner = ((pl.get("owner") or {}).get("display_name") or "").strip()
+        out.append({
+            "id": pl["id"],
+            "name": (pl.get("name") or "Playlist").strip(),
+            "owner": owner,
+            "total": (pl.get("tracks") or {}).get("total") or 0,
+        })
+    return out
+
+
+async def sample_tracks_from_playlist_search(
+    query: str,
+    *,
+    limit: int = 15,
+    max_playlists: int = 3,
+    tracks_per_playlist: int = 20,
+) -> list[dict]:
+    """Search playlists by free text and sample tracks for radio/agent inspiration.
+
+    Returns list of {query, spotify_id, artist_id, title, artist, source_playlist}.
+    """
+    import time as _time
+
+    q = (query or "").strip()
+    if not q:
+        return []
+    cache_key = f"{q.lower()}|{limit}|{max_playlists}"
+    cached = _playlist_sample_cache.get(cache_key)
+    if cached and (_time.time() - cached[0]) < _PLAYLIST_SAMPLE_TTL_SEC:
+        return list(cached[1])[:limit]
+
+    playlists = await search_spotify_playlists(q, limit=max_playlists)
+    if not playlists:
+        # Slightly broader second try
+        if "playlist" not in q.lower():
+            playlists = await search_spotify_playlists(
+                f"{q} playlist", limit=max_playlists
+            )
+    if not playlists:
+        return []
+
+    collected: list[dict] = []
+    seen_ids: set[str] = set()
+    seen_q: set[str] = set()
+    for pl in playlists:
+        if len(collected) >= limit * 2:
+            break
+        infos = await fetch_playlist_track_infos(
+            pl["id"], max_tracks=tracks_per_playlist
+        )
+        _random.shuffle(infos)
+        for info in infos:
+            sid = info.get("spotify_id") or ""
+            qq = (info.get("query") or "").lower()
+            if sid and sid in seen_ids:
+                continue
+            if qq and qq in seen_q:
+                continue
+            if sid:
+                seen_ids.add(sid)
+            if qq:
+                seen_q.add(qq)
+            row = dict(info)
+            row["source_playlist"] = pl.get("name")
+            collected.append(row)
+            if len(collected) >= limit * 2:
+                break
+
+    _random.shuffle(collected)
+    result = collected[:limit]
+    _playlist_sample_cache[cache_key] = (_time.time(), list(result))
+    # Cap cache size
+    if len(_playlist_sample_cache) > 80:
+        oldest = sorted(_playlist_sample_cache.items(), key=lambda kv: kv[1][0])[:30]
+        for k, _ in oldest:
+            _playlist_sample_cache.pop(k, None)
+
+    logger.info(
+        "spotify: playlist inspiration q=%r playlists=%d samples=%d",
+        q, len(playlists), len(result),
+    )
+    return result
 
 
 async def _get_tracks_from_spotify_url(url: str) -> list[dict] | None:

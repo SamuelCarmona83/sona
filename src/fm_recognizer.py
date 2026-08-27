@@ -107,12 +107,24 @@ def parse_shazam_response(payload: dict | None) -> Optional[dict]:
             if album:
                 break
 
+    shazam_id = None
+    for key_name in ("key", "id"):
+        raw_id = track.get(key_name)
+        if raw_id is None:
+            continue
+        try:
+            shazam_id = int(str(raw_id).strip())
+            break
+        except (TypeError, ValueError):
+            continue
+
     return {
         "title": title,
         "artist": artist or "Unknown",
         "album": album,
         "cover_url": cover or None,
         "shazam_url": (track.get("url") or "").strip() or None,
+        "shazam_id": shazam_id,
         "recognized_at": time.time(),
     }
 

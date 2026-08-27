@@ -34,7 +34,7 @@ from src.playback import (
     move_queue_track,
     play_next,
     priority_queue_track,
-    refresh_player_embed_fresh,
+    update_player_embed,
     remove_queue_track_at,
     remove_queue_track_match,
 )
@@ -581,6 +581,37 @@ async def _resolve_one_query(query: str, requester: str) -> dict | None:
     info = await _get_spotify_track_info(query)
     # Prefer Spotify's canonical "Artist - Title" for YT matching
     yt_query = info.get("query") or query
+    shazam_id = None
+
+    # Shazam search as safety net: typos / wrong LLM title / Spotify miss.
+    if not info.get("spotify_refined"):
+        try:
+            from src import shazam_catalog as _shazam_cat
+
+            hit = await _shazam_cat.best_search_match(query)
+            if hit and hit.get("query"):
+                shazam_id = hit.get("shazam_id")
+                yt_query = hit["query"]
+                logger.info(
+                    "request_channel: shazam refined %r → %r (id=%s)",
+                    query, yt_query, shazam_id,
+                )
+                # Re-try Spotify with the cleaner Shazam title for ids/artwork.
+                info2 = await _get_spotify_track_info(yt_query)
+                if info2.get("spotify_refined"):
+                    info = info2
+                    yt_query = info2.get("query") or yt_query
+                else:
+                    info = {
+                        "query": yt_query,
+                        "spotify_id": None,
+                        "artist_id": None,
+                        "spotify_refined": False,
+                        "artist": hit.get("artist"),
+                    }
+        except Exception as exc:
+            logger.debug("request_channel: shazam refine failed: %s", exc)
+
     if info.get("spotify_refined"):
         # Second library pass with refined name
         try:
@@ -595,24 +626,388 @@ async def _resolve_one_query(query: str, requester: str) -> dict | None:
     yt_info = await search_youtube(
         yt_query,
         enable_llm=False,  # agent path: skip Anthropic tie-break (latency)
-        trusted=bool(info.get("spotify_refined")),
+        trusted=bool(info.get("spotify_refined") or shazam_id),
         urgent=True,
     )
     if not yt_info:
         return None
-    return _track_from_yt_and_spotify(yt_info, info, requester)
+    track = _track_from_yt_and_spotify(yt_info, info, requester)
+    if shazam_id and not track.get("shazam_id"):
+        track["shazam_id"] = shazam_id
+    if info.get("artist") and (not track.get("artist") or track.get("artist") == "Unknown"):
+        track["artist"] = info["artist"]
+    return track
+
+
+def _organic_merge_pools(pools: list[list[str]], total: int) -> list[str]:
+    """Mix several genre pools into one organic playlist (not sequential 5+5 blocks).
+
+    Each round picks a random non-empty pool (weighted by remaining size) so
+    genres interleave unevenly instead of fixed halves.
+    """
+    import random as _random
+
+    remaining = [list(p) for p in pools if p]
+    for p in remaining:
+        _random.shuffle(p)
+    out: list[str] = []
+    seen: set[str] = set()
+    total = max(0, int(total))
+    while remaining and len(out) < total:
+        weights = [max(1, len(p)) for p in remaining]
+        idx = _random.choices(range(len(remaining)), weights=weights, k=1)[0]
+        q = remaining[idx].pop(0)
+        key = q.lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(q)
+        if not remaining[idx]:
+            remaining.pop(idx)
+    return out[:total]
+
+
+async def materialize_genre_playlists(
+    plan: RequestPlan,
+    *,
+    guild_id: int | None = None,
+    user_id: int | None = None,
+) -> RequestPlan:
+    """Expand genre_playlist / style-blob enqueues → concrete Artist - Title lines.
+
+    Multiple genres are merged into one organically shuffled enqueue so the
+    plan embed shows real songs (never 'Limp Bizkit nu-metal' as a track).
+    Also sets radio sticky vibe (does not change !mood) when guild_id is set.
+    """
+    from src.request_agent import (
+        is_concrete_artist_title,
+        is_style_blob_query,
+        style_blobs_to_genre_actions,
+    )
+
+    # Convert style-blob enqueues into genre_playlist first
+    converted: list[dict] = []
+    for a in plan.actions:
+        if a.get("type") != "enqueue":
+            converted.append(a)
+            continue
+        queries = [str(q).strip() for q in (a.get("queries") or []) if str(q).strip()]
+        style_qs = [q for q in queries if is_style_blob_query(q)]
+        concrete_qs = [q for q in queries if not is_style_blob_query(q)]
+        if style_qs:
+            converted.extend(style_blobs_to_genre_actions(style_qs, default_count=5))
+            if concrete_qs:
+                converted.append({
+                    "type": "enqueue",
+                    "queries": concrete_qs,
+                    "position": a.get("position") or "end",
+                })
+        else:
+            converted.append(a)
+    plan = RequestPlan(
+        reply=plan.reply,
+        actions=converted,
+        source=plan.source,
+        model=plan.model,
+    )
+
+    if not any(a.get("type") == "genre_playlist" for a in plan.actions):
+        return plan
+
+    genre_actions = [a for a in plan.actions if a.get("type") == "genre_playlist"]
+    pools: list[list[str]] = []
+    total = 0
+    for a in genre_actions:
+        count = max(3, int(a.get("count") or 5))  # style playlists: never 1
+        total += count
+        fetch_n = min(12, count + max(3, count // 2))
+        qs = await _genre_queries(
+            str(a.get("genre") or ""),
+            fetch_n,
+            str(a.get("hints") or ""),
+        )
+        # Drop non-song leftovers (last-resort blobs)
+        qs = [q for q in qs if is_concrete_artist_title(q) or " - " in q]
+        pools.append(qs)
+        logger.info(
+            "request_channel: materialized genre=%r hints=%r wanted=%d got=%d sample=%s",
+            a.get("genre"),
+            (a.get("hints") or "")[:40],
+            count,
+            len(qs),
+            (qs[0] if qs else None),
+        )
+
+    combined = _organic_merge_pools(pools, total)
+    # Keep any already-concrete enqueues from the plan
+    concrete_keep: list[str] = []
+    for a in plan.actions:
+        if a.get("type") == "enqueue":
+            for q in a.get("queries") or []:
+                if is_concrete_artist_title(str(q)) or (
+                    not is_style_blob_query(str(q)) and " - " in str(q)
+                ):
+                    concrete_keep.append(str(q).strip())
+
+    if concrete_keep:
+        seen = {c.lower() for c in concrete_keep}
+        for q in combined:
+            if q.lower() not in seen:
+                concrete_keep.append(q)
+                seen.add(q.lower())
+        combined = concrete_keep[: max(total, len(concrete_keep))]
+
+    if not combined:
+        logger.warning(
+            "request_channel: materialize produced 0 concrete tracks; leaving plan"
+        )
+        return plan
+
+    new_actions: list[dict] = []
+    inserted = False
+    for a in plan.actions:
+        if a.get("type") == "genre_playlist":
+            if not inserted:
+                new_actions.append({
+                    "type": "enqueue",
+                    "queries": combined,
+                    "position": "end",
+                })
+                inserted = True
+            continue
+        if a.get("type") == "enqueue":
+            # Already merged into combined
+            continue
+        new_actions.append(a)
+    if not inserted:
+        new_actions.append({
+            "type": "enqueue",
+            "queries": combined,
+            "position": "end",
+        })
+
+    if guild_id is not None:
+        try:
+            from src import radio as _radio
+
+            genres = [str(a.get("genre") or "").strip() for a in genre_actions]
+            hints = [str(a.get("hints") or "").strip() for a in genre_actions if a.get("hints")]
+            genres = [g for g in genres if g]
+            hints = [h for h in hints if h]
+            if genres or hints:
+                _radio.set_sticky_vibe(
+                    guild_id,
+                    genres=genres,
+                    hints=hints,
+                    user_id=user_id,
+                )
+        except Exception as exc:
+            logger.debug("request_channel: sticky vibe set failed: %s", exc)
+
+    return RequestPlan(
+        reply=plan.reply,
+        actions=new_actions,
+        source=plan.source,
+        model=plan.model,
+    )
+
+
+# Offline style packs used when Spotify/Shazam return nothing (auth, 403, shazam JSON errors).
+_CURATED_NU_METAL = [
+    "Limp Bizkit - Rollin' (Air Raid Vehicle)",
+    "Limp Bizkit - Break Stuff",
+    "Korn - Freak on a Leash",
+    "Korn - Got the Life",
+    "Linkin Park - One Step Closer",
+    "Linkin Park - Crawling",
+    "Papa Roach - Last Resort",
+    "Disturbed - Down with the Sickness",
+    "System Of A Down - Chop Suey!",
+    "System Of A Down - Toxicity",
+    "Slipknot - Wait and Bleed",
+    "Mudvayne - Dig",
+    "Drowning Pool - Bodies",
+    "P.O.D. - Youth of the Nation",
+    "Incubus - Pardon Me",
+]
+_CURATED_THPS_SKATE = [
+    "Goldfinger - Superman",
+    "Sum 41 - Fat Lip",
+    "Blink-182 - First Date",
+    "The Offspring - Want You Bad",
+    "Millencolin - No Cigar",
+    "Less Than Jake - All My Best Friends Are Metalheads",
+    "Reel Big Fish - Sell Out",
+    "Rage Against The Machine - Guerrilla Radio",
+    "Powerman 5000 - When Worlds Collide",
+    "Papa Roach - Broken Home",
+    "Alien Ant Farm - Smooth Criminal",
+    "Crazy Town - Butterfly",
+    "Zebrahead - Check",
+    "CKY - 96 Quite Bitter Beings",
+    "JFA - Beach Blanket Bongout",
+]
+_CURATED_EARLY_2000S_ROCK = [
+    "Foo Fighters - All My Life",
+    "The White Stripes - Seven Nation Army",
+    "Jet - Are You Gonna Be My Girl",
+    "The Vines - Get Free",
+    "Audioslave - Cochise",
+    "Queens of the Stone Age - No One Knows",
+    "Red Hot Chili Peppers - By the Way",
+    "Nickelback - How You Remind Me",
+    "3 Doors Down - Kryptonite",
+    "Evanescence - Bring Me to Life",
+]
+# Underground / abstract / boom-bap adjacent to MF DOOM & chillhop/lofi hip-hop.
+_CURATED_MF_DOOM_HIPHOP = [
+    "MF DOOM - Doomsday",
+    "MF DOOM - Rhinestone Cowboy",
+    "Madvillain - All Caps",
+    "Madvillain - Accordion",
+    "MF DOOM - One Beer",
+    "Danger Doom - Sofa King",
+    "Madlib - Slim's Return",
+    "J Dilla - So Far to Go",
+    "J Dilla - Workinonit",
+    "A Tribe Called Quest - Electric Relaxation",
+    "Gang Starr - Mass Appeal",
+    "Mos Def - Mathematics",
+    "Talib Kweli - Get By",
+    "Common - The Light",
+    "Nas - The World Is Yours",
+    "Pete Rock & C.L. Smooth - They Reminisce Over You (T.R.O.Y.)",
+    "De La Soul - Stakes Is High",
+    "The Pharcyde - Passin' Me By",
+    "Black Star - Definition",
+    "KMD - Peachfuzz",
+]
+_CURATED_LOFI_HIPHOP = [
+    "Nujabes - Aruarian Dance",
+    "Nujabes - Feather",
+    "Nujabes - Luv (sic) Part 3",
+    "J Dilla - Don't Cry",
+    "J Dilla - Time: The Donut of the Heart",
+    "Madlib - Road of the Lonely Ones",
+    "MF DOOM - Soft Landing",
+    "Emancipator - Soon It Will Be Cold Enough",
+    "Bonobo - Kong",
+    "DJ Shadow - Midnight in a Perfect World",
+    "Blockhead - The Music Scene",
+    "Blue Sky Black Death - And Stars, Ringed",
+    "Knxwledge - [bc] tm_rpm.001",
+    "Idealism - both of us",
+    "Tomppabeats - won't leave you",
+]
+
+
+def _curated_style_queries(genre: str, hints: str, count: int) -> list[str]:
+    """Always-available Artist - Title packs for common vibes.
+
+    Order matters: match specific anchors (DOOM, lofi, nu-metal) before generic
+    'rock', and never default hip-hop requests to early-2000s rock.
+    """
+    import random as _random
+
+    blob = f"{genre} {hints}".lower()
+    pool: list[str] = []
+
+    # --- Hip-hop / DOOM / lofi (must win over generic rock default) ---
+    if re.search(
+        r"\b(mf\s*doom|madvillain|doom\b|madlib|dilla|nujabes|tribe\s*called|"
+        r"gang\s*starr|abstract\s*hip|boom[\s\-]?bap)\b",
+        blob,
+    ):
+        pool.extend(_CURATED_MF_DOOM_HIPHOP)
+    if re.search(
+        r"\b(lo[\s\-]?fi|lofi|chillhop|chill\s*hop|study\s*beats|jazzy\s*hip)\b",
+        blob,
+    ):
+        pool.extend(_CURATED_LOFI_HIPHOP)
+        # lofi + doom vibe often overlap
+        if not any("DOOM" in q or "Madvillain" in q for q in pool):
+            pool.extend(_CURATED_MF_DOOM_HIPHOP[:6])
+    if re.search(
+        r"\b(hip[\s\-]?hop|hiphop|rap\b|underground\s*rap|east\s*coast)\b",
+        blob,
+    ) and len(pool) < count:
+        pool.extend(_CURATED_MF_DOOM_HIPHOP)
+
+    # --- Rock / metal packs ---
+    if re.search(r"limp|bizkit|nu[\s\-]?metal|korn|linkin|papa\s*roach|slipknot", blob):
+        pool.extend(_CURATED_NU_METAL)
+    if re.search(
+        r"hawk|skater|thps|goldfinger|millencolin|skate|soundtrack|ost\b|sum\s*41",
+        blob,
+    ):
+        pool.extend(_CURATED_THPS_SKATE)
+    # "rock" only if we didn't already pick hip-hop/lofi (avoid "hip-hop" false paths)
+    if (
+        re.search(r"\b(rock|punk|pop.?punk|indie\s*rock)\b", blob)
+        and not re.search(r"hip[\s\-]?hop|lo[\s\-]?fi|rap\b|doom", blob)
+        and len(pool) < count
+    ):
+        pool.extend(_CURATED_EARLY_2000S_ROCK)
+
+    if not pool:
+        if re.search(r"metal", blob):
+            pool.extend(_CURATED_NU_METAL)
+        elif re.search(r"hip|rap|doom|lofi|lo-fi", blob):
+            pool.extend(_CURATED_MF_DOOM_HIPHOP)
+        elif re.search(r"rock|punk|indie", blob):
+            pool.extend(_CURATED_EARLY_2000S_ROCK)
+        else:
+            # Last resort: prefer hip-hop abstract over random rock if unsure
+            pool.extend(_CURATED_MF_DOOM_HIPHOP if "hop" in blob or "rap" in blob else _CURATED_EARLY_2000S_ROCK)
+
+    # Drop garbage lines that aren't real tracks
+    pool = [q for q in pool if " - " in q and "search:" not in q.lower()]
+
+    seen: set[str] = set()
+    out: list[str] = []
+    for q in pool:
+        k = q.lower()
+        if k not in seen:
+            seen.add(k)
+            out.append(q)
+    _random.shuffle(out)
+    return out[: max(count, 1)]
 
 
 async def _genre_queries(genre: str, count: int, hints: str) -> list[str]:
-    """Propose specific 'Artist - Title' lines via Spotify; no vague filler queries."""
+    """Propose specific 'Artist - Title' lines via Spotify (fast), then curated fallback.
+
+    *hints* is a style anchor (artist, soundtrack, era) — not a single track to play.
+    Shazam is optional and skipped when its API is failing (JSON decode errors).
+    """
+    import random as _random
+
     genre = (genre or "").strip()
     hints = (hints or "").strip()
     count = max(1, min(count, 10))
     queries: list[str] = []
     seen: set[str] = set()
+    anchor_artist_norm = ""
 
-    def _add_from_result(result: dict) -> None:
-        for item in (result.get("tracks") or {}).get("items") or []:
+    def _add_line(line: str, *, allow_anchor_artist: bool = True) -> None:
+        line = (line or "").strip()
+        if not line:
+            return
+        if " - " not in line and " – " not in line:
+            return  # only concrete Artist - Title lines in the plan embed
+        key = line.lower()
+        if key in seen:
+            return
+        if not allow_anchor_artist and anchor_artist_norm:
+            head = re.split(r"\s[–-]\s", key, maxsplit=1)[0]
+            if anchor_artist_norm in head or head in anchor_artist_norm:
+                return
+        seen.add(key)
+        queries.append(line)
+
+    def _add_from_tracks(items: list, *, allow_anchor_artist: bool = True) -> None:
+        for item in items or []:
+            if len(queries) >= count * 3:
+                return
             name = (item.get("name") or "").strip()
             artists = ", ".join(
                 a.get("name", "") for a in (item.get("artists") or []) if a.get("name")
@@ -620,43 +1015,172 @@ async def _genre_queries(genre: str, count: int, hints: str) -> list[str]:
             if not name:
                 continue
             line = f"{artists} - {name}" if artists else name
-            key = line.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            queries.append(line)
-            if len(queries) >= count:
-                return
+            _add_line(line, allow_anchor_artist=allow_anchor_artist)
 
+    def _add_from_search_result(result: dict, *, allow_anchor_artist: bool = True) -> None:
+        _add_from_tracks(
+            (result.get("tracks") or {}).get("items") or [],
+            allow_anchor_artist=allow_anchor_artist,
+        )
+
+    is_soundtrack = bool(
+        re.search(r"soundtrack|ost\b|tony\s*hawk|pro\s*skater|video\s*game", hints, re.I)
+    )
+
+    # --- Fast path: simple Spotify track search (most reliable) ---
     try:
         from src.config import sp
+        from src.spotify import _spotify_api_ready
 
-        if sp is not None:
-            # Ordered attempts: specific → broader
-            search_terms = []
-            if hints:
-                search_terms.append(f"{genre} {hints}")
-            search_terms.append(genre)
-            # Spotify genre filter works for many mainstream tags
-            if " " not in genre and len(genre) < 32:
-                search_terms.append(f'genre:"{genre}"')
+        if sp is None:
+            logger.warning("request_channel: genre_queries: Spotify client is None")
+        elif not await _spotify_api_ready():
+            logger.warning(
+                "request_channel: genre_queries: Spotify not authorized — using curated fallbacks"
+            )
+        else:
+            search_terms: list[str] = []
+            if is_soundtrack and hints:
+                search_terms.extend([
+                    f"{hints} soundtrack",
+                    "tony hawk pro skater soundtrack",
+                    "tony hawk soundtrack",
+                    hints,
+                ])
+            if hints and not is_soundtrack:
+                search_terms.append(f"artist:{hints.split()[0]}" if hints else "")
+                search_terms.append(hints)
+                # Peer artists via track search (avoids related-artists 403)
+                if re.search(r"limp|bizkit", hints, re.I):
+                    search_terms.extend([
+                        "nu metal 2000s",
+                        "korn papa roach linkin park",
+                        "genre:nu metal",
+                    ])
+            if genre:
+                search_terms.append(genre)
+            if re.search(r"nu[\s\-]?metal", f"{genre} {hints}", re.I):
+                search_terms.extend(["nu metal hits", "nu metal 2001", "genre:nu metal"])
+            if re.search(r"rock", genre, re.I) and is_soundtrack:
+                search_terms.extend([
+                    "early 2000s punk rock",
+                    "pop punk 2001",
+                    "skate punk 2000s",
+                ])
 
+            seen_terms: set[str] = set()
             for term in search_terms:
-                if len(queries) >= count:
+                term = (term or "").strip()
+                if not term or term.lower() in seen_terms:
+                    continue
+                seen_terms.add(term.lower())
+                if len(queries) >= count * 2:
                     break
+                try:
+                    result = await asyncio.to_thread(
+                        lambda q=term, lim=min(count * 2, 10): sp.search(
+                            q=q, type="track", limit=lim
+                        )
+                    )
+                    before = len(queries)
+                    _add_from_search_result(result or {})
+                    if len(queries) > before:
+                        logger.info(
+                            "request_channel: genre spotify track search q=%r +%d",
+                            term, len(queries) - before,
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "request_channel: spotify track search failed q=%r: %s",
+                        term, exc,
+                    )
 
-                def _search(q=term, limit=min(count * 2, 20)):
-                    return sp.search(q=q, type="track", limit=limit)
+            # Artist top tracks (1 call) if we still need more and have an artist hint
+            if hints and not is_soundtrack and len(queries) < count:
+                try:
+                    art_res = await asyncio.to_thread(
+                        lambda: sp.search(q=hints, type="artist", limit=3)
+                    )
+                    artists = (art_res or {}).get("artists", {}).get("items") or []
+                    if artists and artists[0].get("id"):
+                        anchor_artist_norm = (artists[0].get("name") or "").lower()
+                        aid = artists[0]["id"]
+                        top = await asyncio.to_thread(
+                            lambda: sp.artist_top_tracks(aid, country="US")
+                        )
+                        _add_from_tracks(((top or {}).get("tracks") or [])[:3])
+                        # Search similar vibe tracks instead of related-artists API
+                        for peer in (
+                            f"{genre} similar to {artists[0].get('name')}",
+                            f"{genre} 2000s",
+                        ):
+                            if len(queries) >= count * 2:
+                                break
+                            res = await asyncio.to_thread(
+                                lambda q=peer: sp.search(q=q, type="track", limit=10)
+                            )
+                            _add_from_search_result(res or {}, allow_anchor_artist=False)
+                except Exception as exc:
+                    logger.warning(
+                        "request_channel: artist expansion failed hints=%r: %s",
+                        hints, exc,
+                    )
 
-                result = await asyncio.to_thread(_search)
-                _add_from_result(result or {})
+            # One playlist sample (optional, can be slow / 403)
+            if len(queries) < count:
+                try:
+                    from src.spotify import sample_tracks_from_playlist_search
+
+                    pl_q = f"{genre} {hints}".strip() or genre
+                    samples = await sample_tracks_from_playlist_search(
+                        pl_q, limit=max(count, 6), max_playlists=2
+                    )
+                    for info in samples:
+                        _add_line(info.get("query") or "")
+                    if samples:
+                        logger.info(
+                            "request_channel: playlist sample q=%r n=%d",
+                            pl_q, len(samples),
+                        )
+                except Exception as exc:
+                    logger.info("request_channel: playlist sample skipped: %s", exc)
+
     except Exception as exc:
-        logger.debug("request_channel: genre spotify search failed: %s", exc)
+        logger.warning("request_channel: genre spotify block failed: %s", exc)
 
-    # Do not invent "mix song N" — bad YT matches. Return what we have.
+    # Optional Shazam pad (skipped automatically when API is broken)
+    if len(queries) < count:
+        try:
+            from src import shazam_catalog as _shazam_cat
+
+            if _shazam_cat.shazam_available():
+                blob = f"{genre} {hints}".strip()
+                for item in await _shazam_cat.search_tracks(blob, limit=count):
+                    _add_line(item.get("query") or "")
+        except Exception as exc:
+            logger.debug("request_channel: genre shazam skipped: %s", exc)
+
+    # Curated offline packs — guarantee names in the embed
+    if len(queries) < count:
+        for line in _curated_style_queries(genre, hints, count * 2):
+            _add_line(line)
+        logger.info(
+            "request_channel: curated fallback genre=%r hints=%r total=%d",
+            genre, hints[:40], len(queries),
+        )
+
+    if len(queries) > count:
+        head = queries[:2] if (anchor_artist_norm or is_soundtrack) else []
+        tail = [q for q in queries if q not in head]
+        _random.shuffle(tail)
+        queries = (head + tail)[:count]
+
     if not queries:
-        # Last resort: one specific-looking seed the resolver can Spotify-refine
-        queries.append(f"{genre} {hints}".strip() or genre)
+        logger.warning(
+            "request_channel: genre_queries still empty genre=%r hints=%r",
+            genre, hints,
+        )
+
     return queries[:count]
 
 
@@ -903,7 +1427,8 @@ async def execute_plan(
                     logger.warning("request_channel: final play_next failed: %s", exc)
             else:
                 try:
-                    await refresh_player_embed_fresh(guild, text_channel)
+                    # In-place PATCH — avoid POST spam when Discord is flaky.
+                    await update_player_embed(guild, text_channel)
                 except Exception:
                     pass
         elif any(
@@ -911,7 +1436,7 @@ async def execute_plan(
             for a in plan.actions
         ):
             try:
-                await refresh_player_embed_fresh(guild, text_channel)
+                await update_player_embed(guild, text_channel)
             except Exception:
                 pass
 
@@ -997,6 +1522,40 @@ async def handle_request_message(message: discord.Message) -> bool:
             user_slots_left=user_slots,
         )
         plan = validate_and_cap_plan(plan, user_slots_left=user_slots)
+
+        # Expand genre / style-blob placeholders → real "Artist - Title" for the embed.
+        needs_materialize = any(
+            a.get("type") == "genre_playlist"
+            or (
+                a.get("type") == "enqueue"
+                and any(
+                    # style blobs like "Limp Bizkit nu-metal"
+                    (" - " not in str(q) and " – " not in str(q))
+                    or re.search(
+                        r"soundtrack|nu[\s\-]?metal|playlist|early\s*2000",
+                        str(q),
+                        re.I,
+                    )
+                    for q in (a.get("queries") or [])
+                )
+            )
+            for a in plan.actions
+        )
+        if needs_materialize:
+            try:
+                await plan_msg.edit(
+                    embed=discord.Embed(
+                        title="🎧 Plan",
+                        description="Buscando playlists y canciones del estilo…",
+                        color=0x5865F2,
+                    )
+                )
+            except Exception:
+                pass
+            plan = await materialize_genre_playlists(
+                plan, guild_id=gid, user_id=message.author.id
+            )
+            plan = validate_and_cap_plan(plan, user_slots_left=user_slots)
 
         labels = planned_track_labels(plan)
         track_items = [{"label": lab, "status": "pending"} for lab in labels]

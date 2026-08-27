@@ -604,7 +604,7 @@ async def _switch_to_fm_station(
     playback_active = vc.is_playing() or vc.is_paused()
     if playback_active:
         vc.stop()
-        asyncio.ensure_future(refresh_player_embed_fresh(guild, text_channel))
+        asyncio.ensure_future(update_player_embed(guild, text_channel))
     else:
         await play_next(guild, vc, text_channel)
     return playback_active
@@ -1110,7 +1110,7 @@ async def play(ctx: commands.Context, *, query: str):
         added_count = len(tracks_to_queue)
         label = tracks_to_queue[0]["title"] if added_count == 1 else f"{added_count} canciones"
         await ctx.send(f"\u2795 {label} anadida(s) a la cola.", delete_after=8)
-        asyncio.ensure_future(refresh_player_embed_fresh(ctx.guild, ctx.channel))
+        asyncio.ensure_future(update_player_embed(ctx.guild, ctx.channel))
     else:
         await play_next(ctx.guild, vc, ctx.channel)
 

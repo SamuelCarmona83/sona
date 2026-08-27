@@ -29,7 +29,11 @@ from src.config import (
     LIBRARY_PATH,
     LIBRARY_REJECT_LIVE,
     LIBRARY_TARGET_FREE_MB,
+    YTDL_DOWNLOAD_FORMAT,
     YTDL_OPTIONS,
+    YTDL_OPTIONS_NO_COOKIES,
+    _YT_PLAYER_CLIENTS_RETRY,
+    ytdl_opts_with_player_clients,
 )
 from src.scoring import _score_candidate
 
@@ -97,6 +101,7 @@ _pending_downloads: set[str] = set()
 # Allowed on-disk formats for library cache (never keep full video containers).
 _LIBRARY_AUDIO_SUFFIXES = {".m4a", ".opus", ".webm", ".mp3", ".ogg", ".flac", ".wav", ".aac"}
 _LIBRARY_SKIP_SUFFIXES = {".part", ".ytdl", ".jpg", ".jpeg", ".png", ".webp", ".json", ".vtt", ".srt"}
+_LIBRARY_VIDEO_REMUX_SUFFIXES = {".mp4", ".mkv", ".avi", ".mov"}
 
 # 24/7 radio / livestream title patterns — not individual songs.
 # Avoid bare "radio" (would block e.g. "Video Killed the Radio Star").
@@ -411,19 +416,31 @@ def _tid_from_track_dict(track: dict | None) -> str | None:
 
 
 def _active_session_tids() -> set[str]:
-    """Tids currently playing or queued — never reclaim these mid-session."""
+    """Tids currently playing, queued, or mid-download — never reclaim mid-session.
+
+    Failures are logged so a broken import cannot silently disable protection.
+    """
     protected: set[str] = set()
     try:
-        from src.playback import guild_sessions
+        from src.playback import iter_guild_sessions
 
-        for sess in guild_sessions.values():
-            tid = _tid_from_track_dict(sess.now_playing)
+        for sess in iter_guild_sessions():
+            tid = _tid_from_track_dict(getattr(sess, "now_playing", None))
             if tid:
                 protected.add(tid)
             for track in list(getattr(sess, "queue", None) or []):
                 tid = _tid_from_track_dict(track)
                 if tid:
                     protected.add(tid)
+    except Exception as exc:
+        # Without this set, reclaim can delete the file under the active stream.
+        logger.warning(
+            "library: session protect unavailable (%s); reclaim may evict active tracks",
+            exc,
+        )
+    # In-flight yt-dlp downloads must not be reaped mid-write.
+    try:
+        protected.update(_pending_downloads)
     except Exception:
         pass
     return protected
@@ -509,10 +526,14 @@ def reclaim_disk(
             )
             used_emergency = victim is not None
         if victim is None:
-            logger.warning(
+            free_now = disk_free_mb()
+            # Size/track caps can leave only pins; that is policy, not an emergency
+            # unless the filesystem is actually under MIN_FREE.
+            log = logger.warning if free_now < LIBRARY_MIN_FREE_MB else logger.debug
+            log(
                 "library: reclaim stopped (%s); no victims free=%.0fMB size=%.0fMB tracks=%s",
                 reason or "?",
-                disk_free_mb(),
+                free_now,
                 _file_size_mb(),
                 len(_index),
             )
@@ -1317,6 +1338,58 @@ def _validate_downloaded_file(path: str, track: dict) -> str | None:
     return str(p.resolve())
 
 
+def _remux_video_to_audio(path: pathlib.Path) -> str | None:
+    """Strip video from a muxed download (itag 18) into a library .m4a."""
+    dest = path.with_suffix(".m4a")
+    try:
+        lib_dir = _LIBRARY_DIR.resolve()
+        src = path.resolve()
+        if not str(src).startswith(str(lib_dir)):
+            return None
+        cmd = [
+            "ffmpeg", "-y", "-i", str(src),
+            "-vn", "-c:a", "copy",
+            "-movflags", "+faststart",
+            str(dest),
+        ]
+        res = subprocess.run(cmd, capture_output=True, timeout=90, text=True, shell=False)
+        if res.returncode != 0 or not dest.is_file() or dest.stat().st_size < 1000:
+            dest.unlink(missing_ok=True)
+            if res.returncode != 0:
+                logger.debug("library: remux copy failed for %s: %s", path, (res.stderr or "")[:200])
+            return None
+        src.unlink(missing_ok=True)
+        logger.info("library: remuxed %s -> %s", path.name, dest.name)
+        return str(dest.resolve())
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        logger.debug("library: remux failed for %s: %s", path, exc)
+        dest.unlink(missing_ok=True)
+        return None
+
+
+def _first_downloaded_audio(tid: str) -> str | None:
+    for path in sorted(_LIBRARY_DIR.glob(f"{tid}.*")):
+        if not path.is_file():
+            continue
+        if path.suffix.lower() in _LIBRARY_SKIP_SUFFIXES or path.suffix in (".part", ".ytdl"):
+            continue
+        if path.suffix.lower() not in _LIBRARY_AUDIO_SUFFIXES:
+            if path.suffix.lower() in _LIBRARY_VIDEO_REMUX_SUFFIXES:
+                remuxed = _remux_video_to_audio(path)
+                if remuxed:
+                    return remuxed
+            logger.warning("library: removing non-audio download %s", path)
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            continue
+        return str(path.resolve())
+    return None
+
+
 def _download_sync(video_id: str, tid: str, track: dict) -> str | None:
     from src.youtube import _YtDlpLogger, is_youtube_rate_limited, maybe_detect_rate_limit
 
@@ -1348,10 +1421,11 @@ def _download_sync(video_id: str, tid: str, track: dict) -> str | None:
     url = f"https://www.youtube.com/watch?v={video_id}"
     outtmpl = str(_LIBRARY_DIR / f"{tid}.%(ext)s")
 
-    def _run():
-        import yt_dlp  # lazy import so modules that only use library for stats/enrich (e.g. explorer) don't require yt-dlp
+    def _run(base_opts: dict) -> bool:
+        """Download once. Returns False if extract precheck rejected the file."""
         opts = {
-            **YTDL_OPTIONS,
+            **base_opts,
+            "format": YTDL_DOWNLOAD_FORMAT,
             "outtmpl": outtmpl,
             "logger": _YtDlpLogger(),
             "writethumbnail": True,
@@ -1387,50 +1461,111 @@ def _download_sync(video_id: str, tid: str, track: dict) -> str | None:
                         "library: skip download after extract for %s ('%s'): %s",
                         video_id, pre.get("title", "?"), pre_reason,
                     )
-                    return
+                    return False
                 # Keep richer metadata for post-validation.
                 track.update({
                     k: pre[k] for k in ("title", "duration", "is_live", "live_status")
                     if pre.get(k) is not None
                 })
             ydl.download([url])
+        return True
 
-    try:
-        _run()
-    except Exception as exc:
-        # yt_dlp may not be imported if failure was earlier; treat generically.
+    def _attempt(base_opts: dict) -> bool:
         try:
-            import yt_dlp
-            if isinstance(exc, yt_dlp.utils.DownloadError):
-                maybe_detect_rate_limit(str(exc))
-        except Exception:
-            pass
-        try:
-            from src.config import is_cookie_load_error, mark_cookies_unusable
-            if is_cookie_load_error(exc):
-                mark_cookies_unusable(str(exc))
-        except Exception:
-            pass
-        logger.warning("library: download failed for %s: %s", video_id, exc)
-        _cleanup_tid_artifacts(tid)
+            return _run(base_opts)
+        except Exception as exc:
+            try:
+                import yt_dlp
+                if isinstance(exc, yt_dlp.utils.DownloadError):
+                    maybe_detect_rate_limit(str(exc))
+            except Exception:
+                pass
+            try:
+                from src.config import is_cookie_load_error, mark_cookies_unusable
+                if is_cookie_load_error(exc):
+                    mark_cookies_unusable(str(exc))
+            except Exception:
+                pass
+            logger.warning("library: download failed for %s: %s", video_id, exc)
+            _cleanup_tid_artifacts(tid)
+            return True
+
+    if not _attempt(YTDL_OPTIONS):
         return None
 
-    for path in sorted(_LIBRARY_DIR.glob(f"{tid}.*")):
-        if not path.is_file():
-            continue
-        if path.suffix.lower() in _LIBRARY_SKIP_SUFFIXES or path.suffix in (".part", ".ytdl"):
-            continue
-        if path.suffix.lower() not in _LIBRARY_AUDIO_SUFFIXES:
-            logger.warning("library: removing non-audio download %s", path)
+    resolved = _first_downloaded_audio(tid)
+    if not resolved and not is_youtube_rate_limited():
+        retry_opts = ytdl_opts_with_player_clients(
+            YTDL_OPTIONS_NO_COOKIES, list(_YT_PLAYER_CLIENTS_RETRY)
+        )
+        logger.info(
+            "library: retrying download %s with alternate player clients",
+            video_id,
+        )
+        if not _attempt(retry_opts):
+            return None
+        resolved = _first_downloaded_audio(tid)
+
+    if not resolved:
+        return None
+    resolved = _sanitize_audio_file(resolved)
+    return _validate_downloaded_file(resolved, track)
+
+
+async def download_now(track: dict, video_ref: str | None = None) -> str | None:
+    """Download (or remux) a track and return the local path, or None."""
+    if not LIBRARY_ENABLED:
+        return None
+
+    _maybe_reload_index()
+
+    reason = cache_reject_reason({k: v for k, v in track.items() if k != "file_path"})
+    if reason:
+        logger.info(
+            "library: skip download_now for '%s': %s",
+            track.get("title", "?"), reason,
+        )
+        return None
+
+    video_id = track_video_id(track, video_ref)
+    if not video_id:
+        return None
+
+    existing_tid = _find_tid_by_video_id(video_id)
+    if existing_tid:
+        local_path = get_local_path(existing_tid)
+        if local_path:
+            _upsert_entry_from_track(track, str(local_path), video_id, tid=existing_tid)
+            return str(local_path)
+
+    tid = _resolve_index_tid(track)
+    existing = get_local_path(tid)
+    if existing:
+        return str(existing)
+
+    for _ in range(150):
+        if tid not in _pending_downloads:
+            break
+        await asyncio.sleep(0.2)
+    existing = get_local_path(tid)
+    if existing:
+        return str(existing)
+
+    _pending_downloads.add(tid)
+    try:
+        async with _download_sem:
+            file_path = await asyncio.to_thread(_download_sync, video_id, tid, track)
+        if file_path:
+            _upsert_entry_from_track(track, file_path, video_id, tid=tid)
+            logger.info("library: cached '%s' -> %s", track.get("title", tid), file_path)
             try:
-                path.unlink()
-            except OSError:
+                asyncio.create_task(enrich_entry(tid))
+            except Exception:
                 pass
-            continue
-        resolved = str(path.resolve())
-        resolved = _sanitize_audio_file(resolved)
-        return _validate_downloaded_file(resolved, track)
-    return None
+            return file_path
+        return None
+    finally:
+        _pending_downloads.discard(tid)
 
 
 async def enqueue_download(track: dict, video_ref: str | None = None) -> None:
@@ -1748,10 +1883,15 @@ async def enrich_entry(tid: str) -> bool:
         # Best-effort: if this track is currently playing, refresh its player embed so the new 1:1 artwork appears
         # instead of stale YT thumbnail. Overlay in _build_v2_payload also helps on next build.
         try:
-            from src.playback import guild_sessions, update_player_embed, bot as _bot
-            for gid, sess in list(guild_sessions.items()):
+            from src.playback import iter_guild_session_items, update_player_embed
+            from src.bot_instance import bot as _bot
+
+            for gid, sess in iter_guild_session_items():
                 np = sess.now_playing
-                if np and (np.get("track_id") == tid or (tid.startswith("yt_") and np.get("video_id") == tid[3:])):
+                if np and (
+                    np.get("track_id") == tid
+                    or (tid.startswith("yt_") and np.get("video_id") == tid[3:])
+                ):
                     if sess.player_channel and _bot:
                         g = _bot.get_guild(gid)
                         if g:

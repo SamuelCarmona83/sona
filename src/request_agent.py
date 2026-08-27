@@ -61,7 +61,27 @@ Reglas:
 - En "enqueue.queries" usá SIEMPRE búsquedas específicas: "Artista - Título de la canción".
   Nunca pongas solo un género, "mix", "playlist" o frases vagas en queries.
 - Si piden un género o "música de X", usá genre_playlist (no enqueue genérico).
-- FIDELIDAD AL TÍTULO (crítico):
+- ESTILOS / "COMO X" (crítico — NO es un solo track):
+  * "nu-metal como Limp Bizkit y rock de los 2000 como Tony Hawk" → DOS (o más)
+    genre_playlist, NUNCA un enqueue con toda la frase.
+  * genre = etiqueta corta (nu-metal, rock, pop). hints = ancla de estilo:
+    artista, banda, soundtrack o época (ej. "Limp Bizkit", "Tony Hawk Pro Skater 4",
+    "early 2000s skate rock").
+  * "como X" / "tipo X" / "estilo X" / "similar a X" / "soundtrack de X" = hints,
+    NO el título de una canción a encolar.
+  * El bot, al expandir, busca playlists de Spotify inspiradas en genre+hints
+    (y related artists / charts). Poné hints ricos para orientar esas playlists.
+  * Varios estilos unidos con "y"/"and"/"," → una action genre_playlist por estilo.
+    Counts: repartí el total (default ~5–8) de forma orgánica (ej. 5+5 o 6+4),
+    el bot mezcla al expandir.
+  * Ejemplo pedido: "nu-metal como limp bizkit y rock de principios de los 2000
+    como soundtrack de tony hawk pro skater 4"
+    → actions: [
+        {{"type":"genre_playlist","genre":"nu-metal","count":5,"hints":"Limp Bizkit"}},
+        {{"type":"genre_playlist","genre":"rock","count":5,
+          "hints":"Tony Hawk Pro Skater 4 soundtrack early 2000s"}}
+      ]
+- FIDELIDAD AL TÍTULO (solo si piden canciones concretas, no estilos):
   * Si el usuario nombra un tema, copiá ESE título (corregí typos obvios: mountaind→mountain,
     "mi mind"→"my mind"). NUNCA lo reemplaces por otro hit del mismo artista
     (ej. NO cambiar "My Mind Is a Mountain" por "My Own Summer").
@@ -296,6 +316,11 @@ def heuristic_plan(message: str, *, auto_enabled: bool) -> RequestPlan:
             source="heuristic",
         )
 
+    # Multi-style: "nu-metal como X y rock como Y" / "tipo Limp Bizkit"
+    style_plan = _heuristic_style_mix(text)
+    if style_plan is not None:
+        return style_plan
+
     # strip leading "pon" / "play"
     query = re.sub(r"^(pon(?:me)?|play|reproduce|toca)\s+", "", text, flags=re.I).strip()
     position = "front" if re.search(r"\b(ahora|ya|ya mismo|al frente|playnext)\b", lower) else "end"
@@ -308,6 +333,102 @@ def heuristic_plan(message: str, *, auto_enabled: bool) -> RequestPlan:
         return RequestPlan(reply="No entendí el pedido.", actions=[], source="heuristic")
     return RequestPlan(
         reply=f"Encolar: {query}" if query else "OK",
+        actions=actions,
+        source="heuristic",
+    )
+
+
+# Genre-ish tokens used to detect style requests vs concrete song titles.
+_STYLE_GENRE_WORDS = (
+    r"nu[\s\-]?metal|metal|rock|punk|pop|indie|hip[\s\-]?hop|rap|trap|techno|house|"
+    r"edm|electronic|jazz|blues|reggae|reggaeton|latin|synthwave|ska|grunge|"
+    r"hardcore|emo|shoegaze|folk|country|disco|funk|soul|r&b|rb"
+)
+_STYLE_ANCHOR_RE = re.compile(
+    r"(?P<head>(?:" + _STYLE_GENRE_WORDS + r")[\w\s\-]*?)\s+"
+    r"(?:como|tipo|estilo|similar\s+a|parecido\s+a|soundtrack\s+de|ost\s+de)\s+"
+    r"(?P<anchor>.+?)(?=\s+(?:y|and|,)\s+(?:" + _STYLE_GENRE_WORDS + r")\b|$)",
+    re.I | re.S,
+)
+
+
+def _heuristic_style_mix(text: str) -> RequestPlan | None:
+    """Parse multi-vibe requests into genre_playlist actions with hints.
+
+    Example: "nu-metal como limp bizkit y rock ... tony hawk" → 2 genre_playlists.
+    Returns None if the message does not look like a style mix.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    # Concrete "Artist - Title" is not a style mix
+    if " - " in raw and not re.search(r"\b(como|tipo|estilo)\b", raw, re.I):
+        return None
+
+    matches = list(_STYLE_ANCHOR_RE.finditer(raw))
+    if not matches:
+        # Single style without "y": "pon nu-metal como limp bizkit"
+        m1 = re.search(
+            r"(?P<head>(?:" + _STYLE_GENRE_WORDS + r")[\w\s\-]*)\s+"
+            r"(?:como|tipo|estilo|similar\s+a|parecido\s+a|soundtrack\s+de)\s+"
+            r"(?P<anchor>.+)$",
+            raw,
+            re.I | re.S,
+        )
+        if not m1:
+            return None
+        matches = [m1]
+
+    # Need at least one genre+anchor; multi-style if 2+ or "y" between genres
+    actions: list[dict[str, Any]] = []
+    n = len(matches)
+    default_each = max(3, min(5, REQUEST_MAX_TRACKS_PER_PLAN // max(n, 1)))
+    # Balance to budget
+    budget = min(REQUEST_MAX_TRACKS_PER_PLAN, default_each * n)
+    base = max(1, budget // n)
+    rem = budget - base * n
+
+    for i, m in enumerate(matches):
+        head = re.sub(r"\s+", " ", (m.group("head") or "").strip(" ,."))
+        anchor = re.sub(r"\s+", " ", (m.group("anchor") or "").strip(" ,."))
+        # Drop leading verbs
+        head = re.sub(
+            r"^(?:pon(?:me)?|dame|quiero|arma|play|reproduce|toca)\s+",
+            "",
+            head,
+            flags=re.I,
+        ).strip()
+        if not head:
+            continue
+        # genre = first genre-ish words of head
+        gm = re.match(r"(?i)(" + _STYLE_GENRE_WORDS + r")(?:\s+\w+){0,3}", head)
+        genre = (gm.group(0) if gm else head).strip()
+        # Keep era words in hints too
+        era = ""
+        if re.search(r"2000|90s|90'|ochenta|noventa|early|principios|finales", head, re.I):
+            era = re.sub(
+                r"(?i)(" + _STYLE_GENRE_WORDS + r")",
+                " ",
+                head,
+            )
+            era = re.sub(r"\s+", " ", era).strip()
+        hints = anchor
+        if era:
+            hints = f"{anchor} {era}".strip()
+        count = base + (1 if i < rem else 0)
+        actions.append({
+            "type": "genre_playlist",
+            "genre": genre,
+            "count": count,
+            "hints": hints,
+        })
+
+    if not actions:
+        return None
+    # Require style signal (como/tipo) — already matched
+    labels = " + ".join(f"{a['genre']} ({a['hints'][:28]})" for a in actions)
+    return RequestPlan(
+        reply=f"Mezcla de estilos: {labels}.",
         actions=actions,
         source="heuristic",
     )
@@ -413,6 +534,167 @@ async def plan_from_llm(message: str, snapshot: dict, *, auto_enabled: bool, use
     return None
 
 
+def is_concrete_artist_title(query: str) -> bool:
+    """True for 'Artist - Title' song lines (not style blobs)."""
+    q = (query or "").strip()
+    if not q or len(q) < 4:
+        return False
+    if re.search(r"\b(soundtrack|playlist|essentials|mix|como|tipo|estilo)\b", q, re.I):
+        return False
+    if re.search(r"\s[–-]\s", q):
+        left, right = re.split(r"\s[–-]\s", q, maxsplit=1)
+        left, right = left.strip(), right.strip()
+        if len(left) >= 2 and len(right) >= 2:
+            # Reject "nu-metal - playlist" style
+            if re.fullmatch(r"(?i)(" + _STYLE_GENRE_WORDS + r")", left.strip()):
+                return False
+            return True
+    return False
+
+
+def is_style_blob_query(query: str) -> bool:
+    """True when an enqueue query is a vibe/style phrase, not a song title."""
+    q = (query or "").strip()
+    if not q:
+        return False
+    if is_concrete_artist_title(q):
+        return False
+    if re.search(
+        r"soundtrack|ost\b|playlist|essentials|early\s*2000|principios|finales|"
+        r"\b2000s\b|\b90s\b|nu[\s\-]?metal|skate|video\s*game",
+        q,
+        re.I,
+    ):
+        return True
+    if re.search(r"\b(" + _STYLE_GENRE_WORDS + r")\b", q, re.I):
+        return True
+    # Bare artist / game name without a song title separator
+    if " - " not in q and " – " not in q and 1 <= len(q.split()) <= 8:
+        return True
+    return False
+
+
+def split_style_blob(query: str) -> tuple[str, str]:
+    """Split a style blob into (genre, hints) for genre_playlist expansion."""
+    raw = re.sub(r"\s+", " ", (query or "").strip())
+    genre_match = re.search(r"(?i)(" + _STYLE_GENRE_WORDS + r")(?:\s+\w+){0,2}", raw)
+    genre = (genre_match.group(0) if genre_match else "rock").strip()
+    hints = re.sub(r"(?i)(" + _STYLE_GENRE_WORDS + r")", " ", raw)
+    hints = re.sub(
+        r"(?i)\b(playlist|essentials|mix|songs?|music|tema[s]?)\b",
+        " ",
+        hints,
+    )
+    hints = re.sub(r"\s+", " ", hints).strip(" ,.-")
+    return genre, hints
+
+
+def _looks_like_collapsed_style_enqueue(plan: RequestPlan, message: str) -> bool:
+    """True when the model stuffed style vibes into enqueue instead of genre_playlist."""
+    if not plan.actions:
+        return False
+    enqueues = [a for a in plan.actions if a.get("type") == "enqueue"]
+    genres = [a for a in plan.actions if a.get("type") == "genre_playlist"]
+    if genres:
+        return False
+    if not enqueues:
+        return False
+    queries: list[str] = []
+    for e in enqueues:
+        queries.extend(str(q) for q in (e.get("queries") or []) if str(q).strip())
+    if not queries:
+        return False
+    # All / most queries are style blobs (e.g. "Limp Bizkit nu-metal")
+    style_n = sum(1 for q in queries if is_style_blob_query(q))
+    if style_n == 0:
+        return False
+    if style_n == len(queries):
+        return True
+    msg = (message or "").lower()
+    if re.search(r"\b(como|tipo|estilo|soundtrack|playlist|mezcla)\b", msg):
+        return style_n >= 1
+    return False
+
+
+def style_blobs_to_genre_actions(
+    queries: list[str],
+    *,
+    default_count: int = 5,
+) -> list[dict[str, Any]]:
+    """Turn style-like enqueue lines into genre_playlist actions with real counts."""
+    blobs = [q for q in queries if is_style_blob_query(q)]
+    if not blobs:
+        return []
+    n = len(blobs)
+    budget = min(REQUEST_MAX_TRACKS_PER_PLAN, max(default_count, 4) * n)
+    base = max(3, budget // n)
+    rem = budget - base * n
+    actions: list[dict[str, Any]] = []
+    for i, blob in enumerate(blobs):
+        genre, hints = split_style_blob(blob)
+        count = base + (1 if i < rem else 0)
+        count = max(3, min(count, REQUEST_MAX_TRACKS_PER_PLAN))
+        actions.append({
+            "type": "genre_playlist",
+            "genre": genre,
+            "count": count,
+            "hints": hints or blob,
+        })
+    return actions
+
+
+def repair_style_plan_if_collapsed(plan: RequestPlan, message: str) -> RequestPlan:
+    """Replace style-blob enqueues with multi genre_playlist (count ≥ 3 each)."""
+    if not _looks_like_collapsed_style_enqueue(plan, message):
+        # Also bump tiny genre counts when hints present (LLM put count=1)
+        bumped = False
+        new_actions: list[dict[str, Any]] = []
+        for a in plan.actions:
+            if a.get("type") == "genre_playlist" and a.get("hints"):
+                try:
+                    c = int(a.get("count") or 1)
+                except (TypeError, ValueError):
+                    c = 1
+                if c < 3:
+                    a = dict(a)
+                    a["count"] = 5
+                    bumped = True
+            new_actions.append(a)
+        if bumped:
+            return RequestPlan(
+                reply=plan.reply,
+                actions=new_actions,
+                source=plan.source,
+                model=plan.model,
+            )
+        return plan
+
+    fixed = _heuristic_style_mix(message)
+    if fixed is not None and fixed.actions:
+        fixed.model = plan.model
+        if plan.reply and len(plan.reply) > 8:
+            fixed.reply = plan.reply
+        return fixed
+
+    # Fallback: convert enqueue style blobs → genre_playlist×N
+    queries: list[str] = []
+    other: list[dict[str, Any]] = []
+    for a in plan.actions:
+        if a.get("type") == "enqueue":
+            queries.extend(str(q) for q in (a.get("queries") or []) if str(q).strip())
+        else:
+            other.append(a)
+    genre_actions = style_blobs_to_genre_actions(queries, default_count=5)
+    if not genre_actions:
+        return plan
+    return RequestPlan(
+        reply=plan.reply or "Mezcla de estilos.",
+        actions=other + genre_actions,
+        source=plan.source,
+        model=plan.model,
+    )
+
+
 async def build_request_plan(
     message: str,
     snapshot: dict,
@@ -432,6 +714,15 @@ async def build_request_plan(
     )
     if llm_plan is None:
         llm_plan = heuristic_plan(message, auto_enabled=auto_enabled)
+    else:
+        # LLM often collapses "nu-metal como X y rock como Y" into one enqueue.
+        repaired = repair_style_plan_if_collapsed(llm_plan, message)
+        if repaired is not llm_plan:
+            logger.info(
+                "request_agent: repaired collapsed style plan → %s",
+                [a.get("type") for a in repaired.actions],
+            )
+            llm_plan = repaired
 
     return validate_and_cap_plan(llm_plan, user_slots_left=user_slots_left)
 
@@ -466,14 +757,23 @@ def summarize_actions(plan: RequestPlan) -> str:
 
 
 def planned_track_labels(plan: RequestPlan) -> list[str]:
-    """Labels for embed lines (queries / genre placeholders) before resolve."""
+    """Labels for embed lines.
+
+    Prefer concrete ``Artist - Title`` queries (after genre materialization).
+    Genre placeholders are a last resort only if expansion has not run yet.
+    """
     labels: list[str] = []
     for a in plan.actions:
         if a["type"] == "enqueue":
             labels.extend(a.get("queries") or [])
         elif a["type"] == "genre_playlist":
-            genre = a.get("genre") or "genre"
-            count = int(a.get("count") or 0)
-            for i in range(count):
-                labels.append(f"{genre} #{i + 1}")
+            # Prefer pre-resolved queries attached to the action when present
+            pre = [str(q).strip() for q in (a.get("queries") or []) if str(q).strip()]
+            if pre:
+                labels.extend(pre)
+            else:
+                genre = a.get("genre") or "genre"
+                count = int(a.get("count") or 0)
+                for i in range(count):
+                    labels.append(f"{genre} #{i + 1}")
     return labels[:REQUEST_MAX_TRACKS_PER_PLAN]

@@ -12,21 +12,33 @@ from src.radio_browser import top_stations
 from src.config import (
     DJ_ANNOUNCER_ENABLED,
     DJ_FUN_FACT_INTERVAL_TRACKS,
-    FFMPEG_LOCAL_OPTIONS,
-    FFMPEG_OPTIONS,
     RADIO_QUEUE_REFILL_THRESHOLD,
     RADIO_QUEUE_TARGET_SIZE,
     RADIO_REQUESTER_LABEL,
+    ffmpeg_options_for_url,
 )
 from src.dj_announcer import get_buenos_aires_hour
-from src.youtube import search_youtube, is_youtube_rate_limited
+from src.youtube import (
+    is_audio_only_format,
+    is_media_forbidden_error,
+    is_youtube_rate_limited,
+    refresh_playback_url,
+    search_youtube,
+)
 from src.library import resolve_local_track, record_play, enqueue_download
 from src.bot_instance import bot
 
 logger = logging.getLogger(__name__)
 
 PLAYER_REFRESH_INTERVAL = 4.0
-PLAYER_EMBED_RECREATE_INTERVAL_SEC = 60.0
+# Full delete+repost is only for explicit UX (buttons / !play). Timed recreates
+# used to spam the channel whenever Discord PATCH failed (503) or delete failed.
+PLAYER_EMBED_RECREATE_INTERVAL_SEC = 0  # 0 = never auto-recreate in the refresh loop
+# After Discord 5xx / upstream blips, pause embed HTTP so the 4s refresh loop
+# and concurrent play_next/enrich callers do not hammer the API or flood logs.
+_DISCORD_PLAYER_HTTP_COOLDOWN_SEC = 30.0
+_discord_player_http_cooldown_until: float = 0.0
+_discord_player_http_cooldown_logged: bool = False
 
 
 @dataclass
@@ -67,6 +79,16 @@ _sessions: dict[int, GuildPlaybackSession] = {}
 
 def guild_session(guild_id: int) -> GuildPlaybackSession:
     return _sessions.setdefault(guild_id, GuildPlaybackSession())
+
+
+def iter_guild_sessions() -> list[GuildPlaybackSession]:
+    """Snapshot of active playback sessions (for library reclaim protection)."""
+    return list(_sessions.values())
+
+
+def iter_guild_session_items() -> list[tuple[int, GuildPlaybackSession]]:
+    """(guild_id, session) pairs for refresh/reclaim helpers."""
+    return list(_sessions.items())
 
 
 class _SessionField:
@@ -458,7 +480,12 @@ async def _player_refresh_loop(guild_id: int):
             if not guild or channel is None or not active and not (vc and (vc.is_playing() or vc.is_paused())):
                 break
             try:
-                if session.embed_recreate_due():
+                # Always PATCH the same message. Recreate only if explicitly enabled
+                # and due — never on transient Discord errors (see update_player_embed).
+                if (
+                    PLAYER_EMBED_RECREATE_INTERVAL_SEC > 0
+                    and session.embed_recreate_due()
+                ):
                     await refresh_player_embed_fresh(guild, channel)
                 else:
                     await update_player_embed(guild, channel)
@@ -475,6 +502,29 @@ def _ensure_player_refresh(guild: discord.Guild, channel) -> None:
     if task and not task.done():
         return
     session.player_refresh_task = asyncio.create_task(_player_refresh_loop(guild.id))
+
+
+async def _safe_player_ack(
+    interaction: discord.Interaction,
+    *,
+    ephemeral_message: str | None = None,
+) -> bool:
+    """Respond within Discord's 3s window; return False if the token already died.
+
+    Avoids the red 'This interaction failed' when the gateway is flaky or the
+    event loop was busy — callers still run the side-effect when possible.
+    """
+    try:
+        if interaction.response.is_done():
+            return True
+        if ephemeral_message is not None:
+            await interaction.response.send_message(ephemeral_message, ephemeral=True)
+        else:
+            await interaction.response.defer()
+        return True
+    except (discord.NotFound, discord.HTTPException) as exc:
+        logger.warning("PlayerView: interaction ack failed: %s", exc)
+        return False
 
 
 class PlayerView(discord.ui.View):
@@ -497,7 +547,9 @@ class PlayerView(discord.ui.View):
     async def toggle_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         guild, gid = _resolve_interaction_guild(interaction, self.guild_id)
         if not guild:
-            await interaction.response.send_message("No pude encontrar este servidor.", ephemeral=True)
+            await _safe_player_ack(
+                interaction, ephemeral_message="No pude encontrar este servidor."
+            )
             return
         self.guild_id = gid
         session = guild_session(gid)
@@ -508,28 +560,38 @@ class PlayerView(discord.ui.View):
         elif vc and vc.is_paused():
             vc.resume()
             session.paused = False
-        await interaction.response.defer()
-        await refresh_player_embed_fresh(guild, interaction.channel)
+        if not await _safe_player_ack(interaction):
+            return
+        try:
+            await update_player_embed(guild, interaction.channel)
+        except Exception:
+            logger.exception("PlayerView.toggle: embed refresh failed")
 
     @discord.ui.button(label="\u23ed Saltar", style=discord.ButtonStyle.primary, row=0, custom_id="player_skip")
     async def skip_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         guild, gid = _resolve_interaction_guild(interaction, self.guild_id)
         if not guild:
-            await interaction.response.send_message("No pude encontrar este servidor.", ephemeral=True)
+            await _safe_player_ack(
+                interaction, ephemeral_message="No pude encontrar este servidor."
+            )
             return
         self.guild_id = gid
         vc = guild.voice_client
         if vc and (vc.is_playing() or vc.is_paused()):
             vc.stop()
-            await interaction.response.defer()
+            await _safe_player_ack(interaction)
         else:
-            await interaction.response.send_message("Nada para saltar ahora mismo.", ephemeral=True)
+            await _safe_player_ack(
+                interaction, ephemeral_message="Nada para saltar ahora mismo."
+            )
 
     @discord.ui.button(label="\u23f9 Detener", style=discord.ButtonStyle.danger, row=0, custom_id="player_stop")
     async def stop_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         guild, gid = _resolve_interaction_guild(interaction, self.guild_id)
         if not guild:
-            await interaction.response.send_message("No pude encontrar este servidor.", ephemeral=True)
+            await _safe_player_ack(
+                interaction, ephemeral_message="No pude encontrar este servidor."
+            )
             return
         self.guild_id = gid
         stop_fm_recognition(gid)
@@ -538,14 +600,20 @@ class PlayerView(discord.ui.View):
         if vc:
             vc.stop()
             await vc.disconnect()
-        await interaction.response.defer()
-        await refresh_player_embed_fresh(guild, interaction.channel)
+        if not await _safe_player_ack(interaction):
+            return
+        try:
+            await update_player_embed(guild, interaction.channel)
+        except Exception:
+            logger.exception("PlayerView.stop: embed refresh failed")
 
     @discord.ui.button(label="⇄", style=discord.ButtonStyle.secondary, row=0, custom_id="player_shuffle")
     async def shuffle_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         guild, gid = _resolve_interaction_guild(interaction, self.guild_id)
         if not guild:
-            await interaction.response.send_message("No pude encontrar este servidor.", ephemeral=True)
+            await _safe_player_ack(
+                interaction, ephemeral_message="No pude encontrar este servidor."
+            )
             return
         self.guild_id = gid
         session = guild_session(gid)
@@ -553,8 +621,12 @@ class PlayerView(discord.ui.View):
             items = list(session.queue)
             random.shuffle(items)
             session.queue = collections.deque(items)
-        await interaction.response.defer()
-        await refresh_player_embed_fresh(guild, interaction.channel)
+        if not await _safe_player_ack(interaction):
+            return
+        try:
+            await update_player_embed(guild, interaction.channel)
+        except Exception:
+            logger.exception("PlayerView.shuffle: embed refresh failed")
 
     @discord.ui.button(label="≡", style=discord.ButtonStyle.secondary, row=0, custom_id="player_queue")
     async def queue_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -645,17 +717,23 @@ class PlayerView(discord.ui.View):
     async def radio_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         guild, gid = _resolve_interaction_guild(interaction, self.guild_id)
         if not guild:
-            await interaction.response.send_message("No pude encontrar este servidor.", ephemeral=True)
+            await _safe_player_ack(
+                interaction, ephemeral_message="No pude encontrar este servidor."
+            )
             return
         self.guild_id = gid
         from src import radio as _radio
         was_active = _radio.is_radio_active(gid)
         _radio.set_radio_active(gid, not was_active)
-        await interaction.response.defer()
+        if not await _safe_player_ack(interaction):
+            return
         if not was_active:
             vc = guild.voice_client
             asyncio.ensure_future(start_radio_with_welcome(guild, vc, interaction.channel))
-        await refresh_player_embed_fresh(guild, interaction.channel)
+        try:
+            await update_player_embed(guild, interaction.channel)
+        except Exception:
+            logger.exception("PlayerView.radio: embed refresh failed")
 
     @discord.ui.button(label="\U0001f3ad Mood", style=discord.ButtonStyle.secondary, row=1, custom_id="player_mood")
     async def mood_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -726,62 +804,225 @@ class PlayerView(discord.ui.View):
         )
 
 
-async def update_player_embed(guild: discord.Guild, channel):
+def _discord_http_status(exc: BaseException) -> int | None:
+    status = getattr(exc, "status", None)
+    if status is not None:
+        try:
+            return int(status)
+        except (TypeError, ValueError):
+            pass
+    response = getattr(exc, "response", None)
+    if response is not None:
+        status = getattr(response, "status", None)
+        if status is not None:
+            try:
+                return int(status)
+            except (TypeError, ValueError):
+                pass
+    return None
+
+
+def _is_transient_discord_error(exc: BaseException) -> bool:
+    """5xx / gateway blips — retry later; do not orphan a new player message."""
+    status = _discord_http_status(exc)
+    if status is not None and status >= 500:
+        return True
+    msg = str(exc).lower()
+    return any(
+        token in msg
+        for token in (
+            "500",
+            "502",
+            "503",
+            "504",
+            "upstream connect",
+            "service unavailable",
+            "connection reset",
+            "connection termination",
+            "timed out",
+            "timeout",
+        )
+    )
+
+
+def _is_unknown_message_error(exc: BaseException) -> bool:
+    """Message was deleted or never existed — safe to POST a replacement."""
+    code = getattr(exc, "code", None)
+    if code == 10008:
+        return True
+    msg = str(exc).lower()
+    return "10008" in msg or "unknown message" in msg
+
+
+def _player_http_on_cooldown() -> bool:
+    return time.time() < _discord_player_http_cooldown_until
+
+
+def _mark_player_http_cooldown(exc: BaseException | None = None) -> None:
+    """Skip embed POST/PATCH for a while after Discord is unhealthy."""
+    global _discord_player_http_cooldown_until, _discord_player_http_cooldown_logged
+    until = time.time() + _DISCORD_PLAYER_HTTP_COOLDOWN_SEC
+    # Extend, don't shrink, if already cooling down.
+    if until > _discord_player_http_cooldown_until:
+        _discord_player_http_cooldown_until = until
+    if not _discord_player_http_cooldown_logged:
+        _discord_player_http_cooldown_logged = True
+        logger.warning(
+            "player embed: Discord transient error — pausing embed HTTP for %.0fs (%s)",
+            _DISCORD_PLAYER_HTTP_COOLDOWN_SEC,
+            exc or "cooldown",
+        )
+
+
+def _clear_player_http_cooldown() -> None:
+    global _discord_player_http_cooldown_until, _discord_player_http_cooldown_logged
+    _discord_player_http_cooldown_until = 0.0
+    _discord_player_http_cooldown_logged = False
+
+
+async def _patch_player_message(old: discord.Message, payload: dict) -> discord.Message:
     from discord.http import Route
+
+    route = Route(
+        "PATCH",
+        "/channels/{channel_id}/messages/{message_id}",
+        channel_id=old.channel.id,
+        message_id=old.id,
+    )
+    data = await bot.http.request(route, json=payload)
+    return discord.Message(state=bot._connection, channel=old.channel, data=data)
+
+
+async def _post_player_message(channel, payload: dict) -> discord.Message:
+    from discord.http import Route
+
+    route = Route("POST", "/channels/{channel_id}/messages", channel_id=channel.id)
+    data = await bot.http.request(route, json=payload)
+    return discord.Message(state=bot._connection, channel=channel, data=data)
+
+
+async def _delete_player_message_quiet(msg: discord.Message | None) -> None:
+    if msg is None:
+        return
+    try:
+        await msg.delete()
+    except Exception as exc:
+        logger.debug("player embed: delete failed id=%s: %s", getattr(msg, "id", "?"), exc)
+
+
+async def update_player_embed(guild: discord.Guild, channel):
+    """Update the single player message in-place. Never spam on Discord blips.
+
+    - Prefer PATCH of ``session.player_message``.
+    - Transient 5xx → keep the existing message and cool down embed HTTP.
+    - Unknown message → POST one replacement.
+    - Only when there is no tracked message do we POST without deleting.
+    """
     session = guild_session(guild.id)
     session.player_channel = channel
     _ensure_player_refresh(guild, channel)
 
+    if _player_http_on_cooldown():
+        return
+
     async with session.player_update_lock:
+        if _player_http_on_cooldown():
+            return
         payload = _build_v2_payload(guild.id)
         old = session.player_message
 
-        if old:
+        if old is not None:
             try:
-                route = Route(
-                    "PATCH",
-                    "/channels/{channel_id}/messages/{message_id}",
-                    channel_id=old.channel.id,
-                    message_id=old.id,
-                )
-                data = await bot.http.request(route, json=payload)
-                msg = discord.Message(state=bot._connection, channel=old.channel, data=data)
-                session.player_message = msg
+                session.player_message = await _patch_player_message(old, payload)
+                _clear_player_http_cooldown()
                 return
-            except Exception:
-                logger.debug("update_player_embed: patch failed for guild=%s; creating fresh message", guild.id)
+            except Exception as exc:
+                if _is_transient_discord_error(exc):
+                    _mark_player_http_cooldown(exc)
+                    return
+                if _is_unknown_message_error(exc):
+                    logger.info(
+                        "update_player_embed: old message gone guild=%s — posting replacement",
+                        guild.id,
+                    )
+                else:
+                    logger.warning(
+                        "update_player_embed: patch failed guild=%s — posting replacement: %s",
+                        guild.id,
+                        exc,
+                    )
+                session.player_message = None
+                # Best-effort cleanup so a half-dead message does not linger.
+                await _delete_player_message_quiet(old)
 
-        route = Route("POST", "/channels/{channel_id}/messages", channel_id=channel.id)
-        data = await bot.http.request(route, json=payload)
-        msg = discord.Message(state=bot._connection, channel=channel, data=data)
-        session.player_message = msg
+        try:
+            session.player_message = await _post_player_message(channel, payload)
+            _clear_player_http_cooldown()
+        except Exception as exc:
+            if _is_transient_discord_error(exc):
+                _mark_player_http_cooldown(exc)
+            else:
+                logger.warning(
+                    "update_player_embed: post failed guild=%s: %s",
+                    guild.id,
+                    exc,
+                )
 
 
 async def refresh_player_embed_fresh(guild: discord.Guild, channel):
-    from discord.http import Route
+    """Repost the player at channel bottom (post new, then delete old).
+
+    Order is post-then-delete so a failed POST never leaves the channel without
+    a player *and* never stacks orphans when Discord is flaky.
+
+    On Discord 5xx, falls back to in-place update (or no-op during cooldown)
+    instead of retry-storming POSTs every few seconds.
+    """
     session = guild_session(guild.id)
     session.player_channel = channel
     _ensure_player_refresh(guild, channel)
 
-    async with session.player_update_lock:
-        old = session.player_message
-        if old:
-            try:
-                await old.delete()
-            except Exception as exc:
-                logger.debug("refresh_player_embed_fresh: delete failed for guild=%s: %s", guild.id, exc)
-            session.player_message = None
+    if _player_http_on_cooldown():
+        return
 
+    async with session.player_update_lock:
+        if _player_http_on_cooldown():
+            return
         payload = _build_v2_payload(guild.id)
+        old = session.player_message
         try:
-            route = Route("POST", "/channels/{channel_id}/messages", channel_id=channel.id)
-            data = await bot.http.request(route, json=payload)
-            msg = discord.Message(state=bot._connection, channel=channel, data=data)
-            session.player_message = msg
-            session.player_embed_recreated_at = time.time()
-            logger.debug("refresh_player_embed_fresh: recreated embed for guild=%s", guild.id)
+            msg = await _post_player_message(channel, payload)
         except Exception as exc:
-            logger.error("refresh_player_embed_fresh: failed to create new message for guild=%s: %s", guild.id, exc)
+            if _is_transient_discord_error(exc):
+                _mark_player_http_cooldown(exc)
+                # Prefer keeping / patching the old message over a POST storm.
+                if old is not None:
+                    try:
+                        session.player_message = await _patch_player_message(old, payload)
+                        _clear_player_http_cooldown()
+                    except Exception as patch_exc:
+                        if _is_transient_discord_error(patch_exc):
+                            _mark_player_http_cooldown(patch_exc)
+                        else:
+                            logger.warning(
+                                "refresh_player_embed_fresh: patch fallback failed guild=%s: %s",
+                                guild.id,
+                                patch_exc,
+                            )
+                return
+            logger.warning(
+                "refresh_player_embed_fresh: post failed guild=%s — keeping previous: %s",
+                guild.id,
+                exc,
+            )
+            return
+
+        _clear_player_http_cooldown()
+        session.player_message = msg
+        session.player_embed_recreated_at = time.time()
+        if old is not None and getattr(old, "id", None) != msg.id:
+            await _delete_player_message_quiet(old)
+        logger.debug("refresh_player_embed_fresh: recreated embed for guild=%s", guild.id)
 
 
 def _cancel_guild_prefetch(guild_id: int) -> None:
@@ -827,12 +1068,34 @@ async def _resolve_url(track: dict) -> dict | None:
     if local:
         return local
 
-    if track.get("url") and not is_youtube_rate_limited():
+    if is_audio_only_format(track) and not is_youtube_rate_limited():
         logger.info(
             "playback: usando stream remoto de YT para '%s' (no había copia local en librería para este tid/video_id)",
             track.get("title", "?"),
         )
         return track
+
+    # SABR leftover (itag 18 / video/mp4) 403s in ffmpeg — download+remux instead.
+    if track.get("url") and not is_audio_only_format(track):
+        logger.info(
+            "playback: discarding non-audio YT url for '%s' (vcodec=%s)",
+            track.get("title", "?"),
+            track.get("vcodec") or "?",
+        )
+        track["url"] = None
+
+    video_ref = track.get("video_id") or track.get("webpage_url")
+    if video_ref and not is_audio_only_format(track):
+        try:
+            from src.library import download_now
+
+            local_path = await download_now(track, video_ref)
+            if local_path:
+                local = resolve_local_track(track)
+                if local:
+                    return local
+        except Exception as exc:
+            logger.warning("playback: download-before-stream failed: %s", exc)
 
     if is_youtube_rate_limited():
         return None
@@ -844,18 +1107,78 @@ async def _resolve_url(track: dict) -> dict | None:
         return None
     if not yt_info:
         return None
-    if not yt_info.get("url"):
-        local = resolve_local_track(track)
-        if local:
-            return local
-        return None
-    track["url"] = yt_info["url"]
-    track["title"] = yt_info["title"]
     if yt_info.get("video_id"):
         track["video_id"] = yt_info["video_id"]
     if yt_info.get("webpage_url"):
         track["webpage_url"] = yt_info["webpage_url"]
-    return track
+    if yt_info.get("http_headers"):
+        track["http_headers"] = yt_info["http_headers"]
+    if yt_info.get("title"):
+        track["title"] = yt_info["title"]
+    if is_audio_only_format(yt_info):
+        track["url"] = yt_info["url"]
+        if yt_info.get("vcodec"):
+            track["vcodec"] = yt_info["vcodec"]
+        return track
+    local = resolve_local_track(track)
+    if local:
+        return local
+    try:
+        from src.library import download_now
+
+        local_path = await download_now(
+            track, track.get("video_id") or track.get("webpage_url")
+        )
+        if local_path:
+            local = resolve_local_track(track)
+            if local:
+                return local
+    except Exception as exc:
+        logger.warning("playback: download after search failed: %s", exc)
+    return None
+
+
+_STREAM_RETRY_PATTERNS = (
+    "ffmpeg exited with code 8",
+    "error opening input",
+    "invalid data found when processing input",
+)
+
+
+def _is_forbidden_stream_error(error: object) -> bool:
+    """True when the remote stream died immediately (403 or ffmpeg input fail).
+
+    discord.py's after() often reports only ``FFmpeg exited with code 8`` and
+    drops the 403 text that went to the process stderr.
+    """
+    msg = str(error or "")
+    if is_media_forbidden_error(msg):
+        return True
+    lower = msg.lower()
+    return any(pat in lower for pat in _STREAM_RETRY_PATTERNS)
+
+
+async def _requeue_fresh_stream(session: GuildPlaybackSession, track: dict) -> bool:
+    """After a remote 403, mint a new URL and put the track back at the front."""
+    if track.get("local") or track.get("is_radio_stream") or track.get("_yt_stream_retried"):
+        return False
+    track["_yt_stream_retried"] = True
+    try:
+        refreshed = await refresh_playback_url(track)
+    except Exception as exc:
+        logger.warning("playback: stream-url refresh failed: %s", exc)
+        return False
+    if not refreshed or not refreshed.get("url"):
+        return False
+    for key in ("url", "http_headers", "acodec", "abr", "title", "webpage_url", "video_id"):
+        if refreshed.get(key) is not None:
+            track[key] = refreshed[key]
+    session.queue.appendleft(track)
+    logger.warning(
+        "playback: remote 403, retrying '%s' with refreshed URL",
+        track.get("title", "?"),
+    )
+    return True
 
 
 async def _prefetch_dj_audio_for_up_next(guild_id: int, next_track: dict) -> None:
@@ -1185,7 +1508,13 @@ async def play_next(guild: discord.Guild, vc: discord.VoiceClient, text_channel)
         else:
             dj_file = await _resolve_dj_audio_before_track(guild.id, track, prefetched_dj)
 
-        ffmpeg_opts = dict(FFMPEG_LOCAL_OPTIONS if track.get("local") else FFMPEG_OPTIONS)
+        yt_headers = None
+        if not track.get("local") and not track.get("is_radio_stream"):
+            yt_headers = track.get("http_headers") or {}
+        ffmpeg_opts = ffmpeg_options_for_url(
+            local=bool(track.get("local")),
+            headers=yt_headers,
+        )
         if track.get("is_radio_stream"):
             url = track.get("url", "")
             if ".m3u8" in url or "playlist" in url or "/live/" in url.lower():
@@ -1206,6 +1535,9 @@ async def play_next(guild: discord.Guild, vc: discord.VoiceClient, text_channel)
                 track.get("abr", "?"),
             )
         except Exception as e:
+            if _is_forbidden_stream_error(e) and await _requeue_fresh_stream(session, track):
+                asyncio.create_task(play_next(guild, vc, text_channel))
+                return
             logger.warning(f"play_next: video no disponible '{track['title']}': {e}, saltando...")
             await maybe_notify_rate_limited(guild.id, text_channel)
             from src.youtube import _url_cache
@@ -1225,8 +1557,24 @@ async def play_next(guild: discord.Guild, vc: discord.VoiceClient, text_channel)
 
         def after(error):
             if error:
-                logger.error(f"Error en reproduccion: {error}")
-            asyncio.run_coroutine_threadsafe(play_next(guild, vc, text_channel), bot.loop)
+                # Stream cuts (TLS EOF / premature end) are common on remote YT;
+                # advance queue instead of leaving the bot silent.
+                logger.warning("Error en reproduccion (avanzando): %s", error)
+
+            async def _continue():
+                try:
+                    if error and _is_forbidden_stream_error(error):
+                        await _requeue_fresh_stream(session, track)
+                    await play_next(guild, vc, text_channel)
+                except Exception:
+                    logger.exception("play_next failed after track end; retrying once")
+                    try:
+                        await asyncio.sleep(0.5)
+                        await play_next(guild, vc, text_channel)
+                    except Exception:
+                        logger.exception("play_next retry failed")
+
+            asyncio.run_coroutine_threadsafe(_continue(), bot.loop)
 
         if dj_file:
             from src.dj_announcer import (
@@ -1410,11 +1758,16 @@ async def start_radio_with_welcome(
 
 
 async def _update_status(guild: discord.Guild, title: str | None):
+    """Best-effort presence + voice-channel status. Never raise (playback must continue)."""
     activity = (
         discord.Activity(type=discord.ActivityType.listening, name=title)
         if title else None
     )
-    await bot.change_presence(activity=activity)
+    try:
+        await bot.change_presence(activity=activity)
+    except Exception as exc:
+        # Transient Discord blips (5xx / disconnect) must not abort play_next.
+        _log_status_failure("change_presence", exc)
 
     # discord.py 2.3 has no voice-status API — raw HTTP route required
     vc = guild.voice_client
@@ -1431,7 +1784,21 @@ async def _update_status(guild: discord.Guild, title: str | None):
         await bot.http.request(route, json={"status": status_text})
         logger.info("_update_status: estado del canal actualizado correctamente")
     except Exception as e:
-        if "403" in str(e):
-            logger.warning(f"_update_status: permisos insuficientes para actualizar estado del canal")
-        else:
-            logger.error(f"_update_status: error al actualizar estado del canal de voz: {e}", exc_info=True)
+        _log_status_failure("voice-status", e)
+
+
+def _log_status_failure(where: str, exc: BaseException) -> None:
+    msg = str(exc)
+    # 5xx / gateway blips are noise; 403 is a perms misconfig.
+    if "403" in msg or "Missing Permissions" in msg:
+        logger.warning("_update_status: permisos insuficientes (%s): %s", where, exc)
+        return
+    if any(code in msg for code in ("500", "502", "503", "504", "upstream connect", "Service Unavailable")):
+        logger.warning("_update_status: Discord transient error (%s): %s", where, exc)
+        return
+    if isinstance(exc, (discord.DiscordServerError, discord.HTTPException)):
+        status = getattr(exc, "status", None) or getattr(getattr(exc, "response", None), "status", None)
+        if status and int(status) >= 500:
+            logger.warning("_update_status: Discord %s (%s): %s", status, where, exc)
+            return
+    logger.warning("_update_status: error (%s): %s", where, exc)
