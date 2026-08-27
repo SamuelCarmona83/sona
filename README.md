@@ -67,7 +67,7 @@ Check `GET /api/health` → `"ui":"vue"`. Prefer `/`, not `/web/explorer.html`.
 ### Local development
 
 ```bash
-python3 -m venv venv
+python3.12 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 
@@ -75,6 +75,8 @@ cp .env.example .env   # configure credentials
 export BOT_TOKEN="..."
 ./run.sh
 ```
+
+`./run.sh` validates Python (3.12+), installs dependencies in fail-fast mode, and aborts if required credentials are missing.
 
 Serve the explorer without Docker:
 

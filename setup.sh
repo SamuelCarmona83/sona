@@ -1,4 +1,6 @@
-#!/bin/bash
+#!/usr/bin/env bash
+
+set -euo pipefail
 
 # Script de configuración para Spoty Scanner
 
@@ -13,11 +15,47 @@ YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0m' # No Color
 
+upsert_env_var() {
+    local file="$1"
+    local key="$2"
+    local raw_value="$3"
+    local escaped_value="${raw_value//\\/\\\\}"
+    escaped_value="${escaped_value//\"/\\\"}"
+
+    local tmp
+    tmp="$(mktemp)"
+    awk -v k="$key" -v v="$escaped_value" '
+        BEGIN { updated = 0 }
+        $0 ~ "^(export[[:space:]]+)?" k "=" {
+            if (!updated) {
+                print k "=\"" v "\""
+                updated = 1
+            }
+            next
+        }
+        { print }
+        END {
+            if (!updated) {
+                print k "=\"" v "\""
+            }
+        }
+    ' "$file" > "$tmp"
+    mv "$tmp" "$file"
+}
+
 echo -e "${BLUE}Este script te ayudará a configurar las credenciales de Spotify API.${NC}"
 echo ""
 
+# Cargar .env existente para detectar configuración previa
+if [ -f ".env" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    source .env
+    set +a
+fi
+
 # Verificar si las variables ya están configuradas
-if [ ! -z "$SPOTIFY_CLIENT_ID" ] && [ ! -z "$SPOTIFY_CLIENT_SECRET" ]; then
+if [ -n "${SPOTIFY_CLIENT_ID:-}" ] && [ -n "${SPOTIFY_CLIENT_SECRET:-}" ]; then
     echo -e "${GREEN}✅ Las credenciales ya están configuradas en el entorno.${NC}"
     echo "CLIENT_ID: $SPOTIFY_CLIENT_ID"
     echo "CLIENT_SECRET: [oculto]"
@@ -64,21 +102,30 @@ echo -e "${BLUE}Redirect URI (presiona Enter para usar el predeterminado):${NC}"
 echo "Predeterminado: $redirect_uri"
 read -p "> " custom_redirect_uri
 
-if [ ! -z "$custom_redirect_uri" ]; then
+if [ -n "$custom_redirect_uri" ]; then
     redirect_uri="$custom_redirect_uri"
 fi
 
-# Guardar en archivo .env
-echo "# Credenciales de Spotify API" > .env
-echo "export SPOTIFY_CLIENT_ID=\"$client_id\"" >> .env
-echo "export SPOTIFY_CLIENT_SECRET=\"$client_secret\"" >> .env
-echo "export SPOTIFY_REDIRECT_URI=\"$redirect_uri\"" >> .env
+# Guardar en archivo .env sin sobrescribir otras variables
+if [ ! -f ".env" ]; then
+    touch .env
+fi
 
-# Cargar las variables en la sesión actual
-source .env
+backup_file=".env.bak.$(date +%Y%m%d%H%M%S)"
+cp .env "$backup_file"
+
+upsert_env_var ".env" "SPOTIFY_CLIENT_ID" "$client_id"
+upsert_env_var ".env" "SPOTIFY_CLIENT_SECRET" "$client_secret"
+upsert_env_var ".env" "SPOTIFY_REDIRECT_URI" "$redirect_uri"
+
+# Cargar en la sesión actual
+export SPOTIFY_CLIENT_ID="$client_id"
+export SPOTIFY_CLIENT_SECRET="$client_secret"
+export SPOTIFY_REDIRECT_URI="$redirect_uri"
 
 echo ""
 echo -e "${GREEN}✅ Credenciales configuradas correctamente!${NC}"
+echo -e "${BLUE}🗂️ Backup del .env previo: ${backup_file}${NC}"
 echo ""
 echo -e "${BLUE}Para usar estas credenciales en futuras sesiones, ejecuta:${NC}"
 echo "source .env"
